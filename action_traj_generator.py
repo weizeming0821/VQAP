@@ -674,7 +674,7 @@ def run(i, lock, task_index, variation_count, results, file_lock, tasks, args,
 
 def parse_args():
     parser = argparse.ArgumentParser(description='RLBench 数据集生成器')
-    parser.add_argument('--save_path', type=str, default='./demos_all_0323', help='演示数据的保存路径')
+    parser.add_argument('--save_path', type=str, default='./demos_all_0324', help='演示数据的保存路径')
     parser.add_argument('--tasks', nargs='*', default=[], help='要采集的任务列表，不填则采集所有任务')
     parser.add_argument('--image_size', nargs=2, type=int, default=[128, 128], help='保存图像的分辨率')
     parser.add_argument('--renderer', type=str, choices=['opengl', 'opengl3'], default='opengl3', help='渲染器类型，opengl 无阴影但速度更快')
