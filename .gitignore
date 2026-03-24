@@ -1,0 +1,7 @@
+.vscode
+*.pyc
+
+log
+demos_subphase
+
+test*
