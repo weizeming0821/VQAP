@@ -24,7 +24,7 @@ def load_fixed_phase_config(csv_path):
         print(f'[Warning] Fixed phase config not found: {csv_path}')
         return config
 
-    with open(csv_path, 'r', encoding='utf-8') as f:
+    with open(csv_path, 'r', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
         for row in reader:
             task_name = row.get('task_name', '').strip()

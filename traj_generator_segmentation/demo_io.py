@@ -170,6 +170,10 @@ def process_demo_in_memory(demo, out_ep_path, descriptions,
     keyframe_inds, debug_info, num_phases = extract_keyframes(
         demo, signals=signals, min_phase_len=min_phase_len)
 
+    valid = (fixed_phase_num is None) or (num_phases == fixed_phase_num)
+    if not valid:
+        return [], num_phases, False
+
     kept_segments = debug_info.get('trace', {}).get('stage3_kept_segments', None)
     if kept_segments:
         phase_ranges = [(int(seg['start']), int(seg['end']), int(seg['keyframe']))
@@ -230,5 +234,4 @@ def process_demo_in_memory(demo, out_ep_path, descriptions,
     save_phase_metadata(out_ep_path, demo, phase_info, keyframe_inds,
                         descriptions, debug_info, save_mode)
 
-    valid = (fixed_phase_num is None) or (num_phases == fixed_phase_num)
     return phase_info, num_phases, valid
