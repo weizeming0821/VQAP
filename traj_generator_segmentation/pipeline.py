@@ -345,6 +345,7 @@ def run_worker(i, lock, task_index, variation_count, results, file_lock, tasks, 
 
                     if not valid and expected_phase_num is not None:
                         # 阶段数不匹配，需要重新采集
+                        print(f'[INFO] process-{i} phase count mismatch, will retry: got {num_phases}, expected {expected_phase_num}, retry_count={retry_count + 1}/{max_retries}', flush=True)
                         phase_invalid_count += 1
                         retry_count += 1
                         append_log(log_path, log_lock, 'WARN',
