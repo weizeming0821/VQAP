@@ -2,6 +2,7 @@
 *.pyc
 
 log
-demos_subphase/
+*demos*/
+*.zip
 
 test*
