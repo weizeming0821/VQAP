@@ -4,5 +4,6 @@
 log
 *demos*/
 *.zip
+RLBench/
 
 test*
