@@ -81,7 +81,7 @@ RUN_PRINT_SENSOR_VALUES = False
 # ─────────────────────────────────────────────────────────────────────────────
 
 # 默认图像分辨率
-DEFAULT_IMAGE_SIZE = [128, 128]
+DEFAULT_IMAGE_SIZE = [256, 256]
 # 默认渲染器
 DEFAULT_RENDERER = 'opengl3'
 # 默认进程数
