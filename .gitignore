@@ -1,7 +1,8 @@
 .vscode
 *.pyc
 
-log
-demos_subphase/
-
+log/
+*demos*/
 test*
+
+*.zip
