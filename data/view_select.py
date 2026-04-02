@@ -1,77 +1,108 @@
-import cv2
+from typing import Dict, List, Sequence
+
 import torch
-import numpy as np
 from PIL import Image
 
-# ----------------------
-# 1. 加载 DINOv2 模型
-# ----------------------
-device = "cuda" if torch.cuda.is_available() else "cpu"
-dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14').to(device)
-dinov2.eval()
+class View_Selector:
+    """基于官方冻结 DINOv2 的视角信息量评估器。
 
-# 图像预处理（DINOv2 官方标准）
-def preprocess(img_path):
-    img = Image.open(img_path).convert("RGB")
-    # DINOv2 不需要强行 resize 到很小，但保持长边统一更稳定
-    transform = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_transform')
-    return transform(img).unsqueeze(0).to(device)
-
-# ----------------------
-# 2. 计算两帧变化分数
-# 分数越大 = 画面变化越大 = 视角越好
-# ----------------------
-def compute_difference_score(img_start_path, img_end_path):
-    with torch.no_grad():
-        feat_start = dinov2(preprocess(img_start_path))  # 提取初始帧特征
-        feat_end = dinov2(preprocess(img_end_path))     # 提取结束帧特征
-
-        # 归一化特征（DINOv2 特征必须归一化）
-        feat_start = torch.nn.functional.normalize(feat_start, dim=-1)
-        feat_end = torch.nn.functional.normalize(feat_end, dim=-1)
-
-        # 余弦距离 = 1 - 余弦相似度
-        cos_sim = (feat_start @ feat_end.T).item()
-        score = 1 - cos_sim
-
-    return score
-
-# ----------------------
-# 3. 输入多视角，自动选最优视角
-# ----------------------
-def select_best_view(view_dict):
+    设计目标：
+    1. 用于视角选择的 DINOv2 永久冻结，仅参与特征提取。
+    2. 与后续微调用 DINOv2 隔离，避免共享同一个模型实例。
     """
-    view_dict = {
-        "view_1": ("start1.jpg", "end1.jpg"),
-        "view_2": ("start2.jpg", "end2.jpg"),
-        ...
-    }
-    """
-    scores = {}
-    for view_name, (start, end) in view_dict.items():
-        s = compute_difference_score(start, end)
-        scores[view_name] = s
-        print(f"{view_name} 变化分数: {s:.4f}")
 
-    # 选分数最大的视角
-    best_view = max(scores, key=scores.get)
-    best_score = scores[best_view]
-    return best_view, best_score, scores
+    def __init__(
+        self,
+        model_name: str = "dinov2_vits14",
+        repo: str = "facebookresearch/dinov2",
+        device: str = None,
+    ):
+        self.repo = repo
+        self.model_name = model_name
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-# ----------------------
-# 4. 使用示例
-# ----------------------
-if __name__ == "__main__":
-    # 你只需要改这里！填入你的多视角始末帧
-    multi_views = {
-        "view_front": ("view1_start.png", "view1_end.png"),
-        "view_side": ("view2_start.png", "view2_end.png"),
-        "view_top": ("view3_start.png", "view3_end.png"),
-        "view_back": ("view4_start.png", "view4_end.png"),  # 遮挡大 → 分数低
-    }
+        # 视角选择专用模型：始终加载官方权重并永久冻结。
+        self.selection_model = torch.hub.load(self.repo, self.model_name).to(self.device)
+        self.selection_model.eval()
+        for param in self.selection_model.parameters():
+            param.requires_grad = False
 
-    best_view, best_score, all_scores = select_best_view(multi_views)
+        # 与模型名称绑定的官方预处理。
+        self.transform = torch.hub.load(self.repo, f"{self.model_name}_transform")
 
-    print("\n==== 结果 ====")
-    print(f"最优视角: {best_view}")
-    print(f"最大变化分数: {best_score:.4f}")
+    def build_finetune_model(self) -> torch.nn.Module:
+        """返回一个新的 DINOv2 实例用于微调。
+
+        注意：该返回值与 self.selection_model 不是同一个对象，
+        可以安全设置为 train 模式并打开梯度。
+        """
+        finetune_model = torch.hub.load(self.repo, self.model_name).to(self.device)
+        finetune_model.train()
+        for param in finetune_model.parameters():
+            param.requires_grad = True
+        return finetune_model
+
+    def get_feature(self, img_path: str) -> torch.Tensor:
+        """提取图像归一化特征，输出 shape 为 [1, D]。"""
+        with Image.open(img_path) as img:
+            img = img.convert("RGB")
+
+        with torch.no_grad():
+            x = self.transform(img).unsqueeze(0).to(self.device)
+            feat = self.selection_model(x)
+            feat = torch.nn.functional.normalize(feat, dim=-1)
+        return feat
+
+    def compute_change_score(self, start_path: str, end_path: str) -> float:
+        """计算起始帧与末帧变化分数：score = 1 - cosine_similarity。
+
+        分数越大表示视觉变化越明显，通常携带更多任务信息。
+        """
+        f1 = self.get_feature(start_path)
+        f2 = self.get_feature(end_path)
+        sim = torch.cosine_similarity(f1, f2, dim=-1).item()
+        return float(1.0 - sim)
+
+    def compute_change_scores(
+        self,
+        start_paths: Sequence[str],
+        end_paths: Sequence[str],
+    ) -> List[float]:
+        """批量计算多个视角的变化分数。"""
+        if len(start_paths) != len(end_paths):
+            raise ValueError("start_paths 与 end_paths 长度必须一致")
+
+        scores: List[float] = []
+        for start_path, end_path in zip(start_paths, end_paths):
+            scores.append(self.compute_change_score(start_path, end_path))
+        return scores
+
+    def select_best_view(
+        self,
+        start_paths: Sequence[str],
+        end_paths: Sequence[str],
+    ) -> Dict[str, object]:
+        """从多视角中选择变化最大的视角。
+
+        返回字段：
+        - best_index: 最优视角下标
+        - best_start_path / best_end_path: 最优视角的起始帧和末帧路径
+        - best_score: 最优变化分数
+        - all_scores: 全部视角分数
+        """
+        scores = self.compute_change_scores(start_paths, end_paths)
+        if len(scores) == 0:
+            raise ValueError("视角列表不能为空")
+
+        best_index = max(range(len(scores)), key=lambda i: scores[i])
+        return {
+            "best_index": best_index,
+            "best_start_path": start_paths[best_index],
+            "best_end_path": end_paths[best_index],
+            "best_score": scores[best_index],
+            "all_scores": scores,
+        }
+
+
+ViewSelector = View_Selector
+
