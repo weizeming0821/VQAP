@@ -1,8 +1,11 @@
 .vscode
 *.pyc
 
-log/
+log
 *demos*/
+*.zip
+RLBench/
+
 test*
 
 *.zip
