@@ -5,7 +5,5 @@ log
 *demos*/
 *.zip
 RLBench/
-
 test*
-
-*.zip
+Action_Primitive_Dataset_v0/
