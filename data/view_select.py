@@ -32,12 +32,14 @@ SUPPORTED_DINOV2_MODELS = {
 
 输出：
     select_best_view:
-        返回按变化分数从高到低排序的列表，长度由 top_k 决定。
+        返回按变化分数从高到低排序的列表，列表长度为 min(top_k, 可用视角数)。
         每个元素包含：
-            best_view: 视角名称。
-            best_start_path: 该视角起始帧图像路径。
-            best_end_path: 该视角末帧图像路径。
-            best_score: 该视角的变化分数，分数越大表示视觉变化越明显。
+            best_view: str，视角名称。
+            best_start_image: torch.Tensor，起始帧经过 transforms 处理后的图像张量，形状为 [3, H, W]。
+                其中 H = W = input_size，默认情况下为 [3, 224, 224]。
+            best_end_image: torch.Tensor，末帧经过 transforms 处理后的图像张量，形状为 [3, H, W]。
+                其中 H = W = input_size，默认情况下为 [3, 224, 224]。
+            best_score: float，当前视角的变化分数，范围通常为 [0, 2]，分数越大表示视觉变化越明显。
 """
 class View_Selector:
     def __init__(
@@ -106,6 +108,13 @@ class View_Selector:
         if not path.is_file():
             raise FileNotFoundError(f"Image file does not exist: {path}")
         return path
+
+    """根据图像路径读取图片并执行 DINOv2 预处理。"""
+    def _load_transformed_image(self, img_path: str) -> torch.Tensor:
+        image_path = self._validate_image_path(img_path)
+        with Image.open(image_path) as img:
+            img = img.convert("RGB")
+            return self.transform(img)
 
     """校验多视角起止帧列表的长度和命名是否一致。"""
     def _validate_pairs(
@@ -200,8 +209,8 @@ class View_Selector:
             selected_views.append(
                 {
                     "best_view": selected_view["view_name"],
-                    "best_start_path": selected_view["start_path"],
-                    "best_end_path": selected_view["end_path"],
+                    "best_start_image": self._load_transformed_image(selected_view["start_path"]),
+                    "best_end_image": self._load_transformed_image(selected_view["end_path"]),
                     "best_score": float(selected_view["score"])
                 }
             )
