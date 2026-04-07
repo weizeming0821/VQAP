@@ -1,0 +1,2 @@
+# 全局配置
+tensor_dtype: float32
