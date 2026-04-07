@@ -1,108 +1,218 @@
-from typing import Dict, List, Sequence
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence
 
 import torch
 from PIL import Image
 
+from utils import build_dinov2_transform
+
+
+SUPPORTED_DINOV2_MODELS = {
+    "dinov2_vits14",
+    "dinov2_vitb14",
+    "dinov2_vitl14",
+    "dinov2_vitg14",
+    "dinov2_vits14_reg",
+    "dinov2_vitb14_reg",
+    "dinov2_vitl14_reg",
+    "dinov2_vitg14_reg",
+}
+
+"""基于冻结 DINOv2 的视角信息量评估器。
+    Input:
+        __init__:
+            model_name: DINOv2 模型名称，必须是 SUPPORTED_DINOV2_MODELS 中的一个。
+            repo: torch.hub 模型仓库地址，默认为官方 DINOv2 仓库。
+            device: 运行设备，默认为自动选择 CUDA（如果可用）或 CPU。
+            input_size: 输入图像尺寸，必须是 14 的倍数，默认为 224。
+    Output:
+        select_best_view:
+            best_index: 最佳视角的索引位置。
+            best_view: 最佳视角的名称（如果提供了 view_names）。
+            best_start_path: 最佳视角起始帧的图像路径。 
+            best_end_path: 最佳视角末帧的图像路径。
+            best_score: 最佳视角的变化分数，范围 [0, 1]，分数越大表示变化越明显。
+            all_scores: 所有视角的变化分数列表，顺序与输入视角列表一致。
+            scored_views: 包含每个视角详细信息的列表，每个元素是一个字典，包含 index、view
+"""
 class View_Selector:
-    """基于官方冻结 DINOv2 的视角信息量评估器。
-
-    设计目标：
-    1. 用于视角选择的 DINOv2 永久冻结，仅参与特征提取。
-    2. 与后续微调用 DINOv2 隔离，避免共享同一个模型实例。
-    """
-
     def __init__(
         self,
-        model_name: str = "dinov2_vits14",
+        model_name: str = "dinov2_vits14_reg",
         repo: str = "facebookresearch/dinov2",
-        device: str = None,
-    ):
+        device: Optional[str] = None,
+        input_size: int = 224,
+    ) -> None:
         self.repo = repo
         self.model_name = model_name
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.input_size = input_size
+        self.selection_model = None
+        self.transform = None
+        self._validate_model_config()
 
-        # 视角选择专用模型：始终加载官方权重并永久冻结。
-        self.selection_model = torch.hub.load(self.repo, self.model_name).to(self.device)
-        self.selection_model.eval()
-        for param in self.selection_model.parameters():
-            param.requires_grad = False
+    """在初始化阶段校验模型配置，当前仅接受官方 DINOv2 系列。"""
+    def _validate_model_config(self) -> None:
 
-        # 与模型名称绑定的官方预处理。
-        self.transform = torch.hub.load(self.repo, f"{self.model_name}_transform")
+        if self.repo != "facebookresearch/dinov2":
+            raise ValueError(
+                "View_Selector currently only supports the official DINOv2 hub repo: "
+                "facebookresearch/dinov2"
+            )
+        
+        # 目前仅支持 DINOv2 的 ViT 模型
+        if self.model_name not in SUPPORTED_DINOV2_MODELS:
+            supported_models = ", ".join(sorted(SUPPORTED_DINOV2_MODELS))
+            raise ValueError(
+                "Unsupported model_name for View_Selector. "
+                f"Only DINOv2 models are supported. Got: {self.model_name}. "
+                f"Supported models: {supported_models}"
+            )
 
-    def build_finetune_model(self) -> torch.nn.Module:
-        """返回一个新的 DINOv2 实例用于微调。
+        # DINOv2 的 ViT 模型要求输入尺寸必须是 14 的倍数，且通常为 224
+        if self.input_size <= 0:
+            raise ValueError("input_size must be a positive integer")
+        if self.input_size % 14 != 0:
+            raise ValueError("input_size must be a multiple of 14 for DINOv2 models")
 
-        注意：该返回值与 self.selection_model 不是同一个对象，
-        可以安全设置为 train 模式并打开梯度。
-        """
-        finetune_model = torch.hub.load(self.repo, self.model_name).to(self.device)
-        finetune_model.train()
-        for param in finetune_model.parameters():
-            param.requires_grad = True
-        return finetune_model
+    """首次使用时加载官方权重，并永久冻结参数。"""
+    def _ensure_model_loaded(self) -> None:
+        if self.selection_model is not None and self.transform is not None:
+            return
 
+        try:
+            self.selection_model = torch.hub.load(self.repo, self.model_name).to(self.device)
+            self.selection_model.eval()
+            for param in self.selection_model.parameters():
+                param.requires_grad = False
+
+            self.transform = build_dinov2_transform(self.input_size)
+        except Exception as exc:
+            self.selection_model = None
+            self.transform = None
+            raise RuntimeError(
+                "Failed to load DINOv2 view selection model from torch.hub. "
+                "Please check network access, local torch.hub cache, and model name settings. "
+                f"repo={self.repo}, model={self.model_name}"
+            ) from exc
+
+    """校验图像路径是否存在，并返回规范化后的绝对路径。"""
+    def _validate_image_path(self, img_path: str) -> Path:
+        path = Path(img_path).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Image file does not exist: {path}")
+        return path
+
+    """校验多视角起止帧列表的长度和命名是否一致。"""
+    def _validate_pairs(
+        self,
+        start_paths: Sequence[str],
+        end_paths: Sequence[str],
+        view_names: Optional[Sequence[str]] = None,
+    ) -> None:
+        if len(start_paths) == 0:
+            raise ValueError("视角列表不能为空")
+        if len(start_paths) != len(end_paths):
+            raise ValueError("start_paths 与 end_paths 长度必须一致")
+        if view_names is not None and len(view_names) != len(start_paths):
+            raise ValueError("view_names 长度必须与图像路径数量一致")
+
+    """提取图像的归一化全局语义特征，输出形状为 [1, D]。"""
     def get_feature(self, img_path: str) -> torch.Tensor:
-        """提取图像归一化特征，输出 shape 为 [1, D]。"""
-        with Image.open(img_path) as img:
+        self._ensure_model_loaded()
+        image_path = self._validate_image_path(img_path)
+
+        with Image.open(image_path) as img:
             img = img.convert("RGB")
 
         with torch.no_grad():
             x = self.transform(img).unsqueeze(0).to(self.device)
-            feat = self.selection_model(x)
+            features = self.selection_model.forward_features(x)
+            if isinstance(features, dict) and "x_norm_clstoken" in features:
+                feat = features["x_norm_clstoken"]
+            else:
+                feat = self.selection_model(x)
             feat = torch.nn.functional.normalize(feat, dim=-1)
         return feat
 
+    """计算起始帧与末帧的变化分数，分数越大表示视觉变化越明显。"""
     def compute_change_score(self, start_path: str, end_path: str) -> float:
-        """计算起始帧与末帧变化分数：score = 1 - cosine_similarity。
-
-        分数越大表示视觉变化越明显，通常携带更多任务信息。
-        """
         f1 = self.get_feature(start_path)
         f2 = self.get_feature(end_path)
         sim = torch.cosine_similarity(f1, f2, dim=-1).item()
         return float(1.0 - sim)
 
+    """批量计算多个视角对应起止帧的变化分数。"""
     def compute_change_scores(
         self,
         start_paths: Sequence[str],
         end_paths: Sequence[str],
     ) -> List[float]:
-        """批量计算多个视角的变化分数。"""
-        if len(start_paths) != len(end_paths):
-            raise ValueError("start_paths 与 end_paths 长度必须一致")
+        self._validate_pairs(start_paths, end_paths)
 
         scores: List[float] = []
         for start_path, end_path in zip(start_paths, end_paths):
             scores.append(self.compute_change_score(start_path, end_path))
         return scores
 
+    """从多视角中选择变化分数最高的视角，并返回详细结果。"""
     def select_best_view(
         self,
         start_paths: Sequence[str],
         end_paths: Sequence[str],
+        view_names: Optional[Sequence[str]] = None,
     ) -> Dict[str, object]:
-        """从多视角中选择变化最大的视角。
-
-        返回字段：
-        - best_index: 最优视角下标
-        - best_start_path / best_end_path: 最优视角的起始帧和末帧路径
-        - best_score: 最优变化分数
-        - all_scores: 全部视角分数
-        """
+        self._validate_pairs(start_paths, end_paths, view_names)
         scores = self.compute_change_scores(start_paths, end_paths)
-        if len(scores) == 0:
-            raise ValueError("视角列表不能为空")
 
         best_index = max(range(len(scores)), key=lambda i: scores[i])
+        resolved_view_names = list(view_names) if view_names is not None else [None] * len(scores)
+        scored_views: List[Dict[str, object]] = []
+        for index, (view_name, start_path, end_path, score) in enumerate(
+            zip(resolved_view_names, start_paths, end_paths, scores)
+        ):
+            scored_views.append(
+                {
+                    "index": index,
+                    "view_name": view_name,
+                    "start_path": start_path,
+                    "end_path": end_path,
+                    "score": score,
+                }
+            )
+
         return {
             "best_index": best_index,
+            "best_view": resolved_view_names[best_index],
             "best_start_path": start_paths[best_index],
             "best_end_path": end_paths[best_index],
             "best_score": scores[best_index],
             "all_scores": scores,
+            "scored_views": scored_views,
         }
 
 
 ViewSelector = View_Selector
 
+
+# 简单测试
+if __name__ == "__main__":
+    selector = View_Selector()
+    start_paths = ["Action_Primitive_Dataset_v0/approach/phase_0001/front_rgb/0.png", 
+                   "Action_Primitive_Dataset_v0/approach/phase_0001/left_shoulder_rgb/0.png",
+                   "Action_Primitive_Dataset_v0/approach/phase_0001/right_shoulder_rgb/0.png",
+                   "Action_Primitive_Dataset_v0/approach/phase_0001/overhead_rgb/0.png",
+                   "Action_Primitive_Dataset_v0/approach/phase_0001/wrist_rgb/0.png"]
+    end_paths = ["Action_Primitive_Dataset_v0/approach/phase_0001/front_rgb/60.png", 
+                 "Action_Primitive_Dataset_v0/approach/phase_0001/left_shoulder_rgb/60.png",
+                 "Action_Primitive_Dataset_v0/approach/phase_0001/right_shoulder_rgb/60.png",
+                 "Action_Primitive_Dataset_v0/approach/phase_0001/overhead_rgb/60.png",
+                 "Action_Primitive_Dataset_v0/approach/phase_0001/wrist_rgb/60.png"]
+    view_names = ["front", "left_shoulder", "right_shoulder", "overhead", "wrist"]
+
+    try:
+        result = selector.select_best_view(start_paths, end_paths, view_names)
+        print("Best view selection result:")
+        print(result)
+    except Exception as exc:
+        print(f"Error during view selection: {exc}")
