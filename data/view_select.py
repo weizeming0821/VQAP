@@ -5,9 +5,9 @@ import torch
 from PIL import Image
 
 try:
-    from .utils import build_dinov2_transform
+    from .utils import build_dinov2_transform, get_configured_tensor_dtype
 except ImportError:
-    from utils import build_dinov2_transform
+    from utils import build_dinov2_transform, get_configured_tensor_dtype
 
 
 SUPPORTED_DINOV2_MODELS = {
@@ -39,7 +39,8 @@ SUPPORTED_DINOV2_MODELS = {
                 其中 H = W = input_size，默认情况下为 [3, 224, 224]。
             best_end_image: torch.Tensor，末帧经过 transforms 处理后的图像张量，形状为 [3, H, W]。
                 其中 H = W = input_size，默认情况下为 [3, 224, 224]。
-            best_score: float，当前视角的变化分数，范围通常为 [0, 2]，分数越大表示视觉变化越明显。
+            best_score: torch.Tensor，0 维标量张量，dtype 由 config/utils.yaml 中的 tensor_dtype 控制。
+                分数越大表示视觉变化越明显。
 """
 class View_Selector:
     def __init__(
@@ -55,6 +56,7 @@ class View_Selector:
         self.input_size = input_size
         self.selection_model = None
         self.transform = None
+        self.tensor_dtype = get_configured_tensor_dtype()
         self._validate_model_config()
 
     """在初始化阶段校验模型配置，当前仅接受官方 DINOv2 系列。"""
@@ -114,7 +116,7 @@ class View_Selector:
         image_path = self._validate_image_path(img_path)
         with Image.open(image_path) as img:
             img = img.convert("RGB")
-            return self.transform(img)
+            return self.transform(img).to(dtype=self.tensor_dtype)
 
     """校验多视角起止帧列表的长度和命名是否一致。"""
     def _validate_pairs(
@@ -211,7 +213,7 @@ class View_Selector:
                     "best_view": selected_view["view_name"],
                     "best_start_image": self._load_transformed_image(selected_view["start_path"]),
                     "best_end_image": self._load_transformed_image(selected_view["end_path"]),
-                    "best_score": float(selected_view["score"])
+                    "best_score": torch.tensor(selected_view["score"], dtype=self.tensor_dtype)
                 }
             )
 
