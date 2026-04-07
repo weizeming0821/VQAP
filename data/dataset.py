@@ -32,13 +32,30 @@ LOW_DIM_FIELDS: List[str] = [
 IMAGE_SUFFIXES: Tuple[str, ...] = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 
 
+"""Action_Primitive_Dataset 类。
+
+输入：
+    __init__:
+		dataset_root: str，数据集根目录路径，需包含多个动作子目录，每个动作子目录下包含多个 phase 子目录。
+		views: Optional[Sequence[str]]，可选的视角名称列表，默认为 ALL_VIEWS 中的全部视角。
+		top_k: int，选择 top-k 个最优视角进行返回，默认为 1。
+		view_selector_kwargs: Optional[Dict[str, Any]]，传递给 ViewSelector 的额外参数字典。
+输出：
+    __getitem__:
+		action: str，动作标签。
+		trajectory_data: Dict[str, List[Any]]，按字段组织的轨迹数据字典，每个字段对应一个列表，长度等于轨迹帧数。
+		trajectory_length: int，轨迹的帧数。
+		selected_views: List[Dict[str, Any]]，长度为 top_k 的列表，每个元素包含以下键：
+			best_view: str，选定的视角名称。
+			best_start_image: torch.Tensor，首帧经过 transforms 处理后的图像张量，形状为 [3, H, W]。
+			best_end_image: torch.Tensor，末帧经过 transforms 处理后的图像张量，形状为 [3, H, W]。
+			best_score: torch.Tensor，0 维标量张量，dtype 由 config/utils.yaml 中的 tensor_dtype 控制，分数越大表示视觉变化越明显。
+"""
 class Action_Primitive_Dataset(Dataset):
 
-	"""初始化数据集根目录、可用视角和最优视角个数。"""
 	def __init__(
 		self,
 		dataset_root: str,
-		image_size: Optional[Tuple[int, int]] = None,
 		views: Optional[Sequence[str]] = None,
 		top_k: int = 1,
 		view_selector_kwargs: Optional[Dict[str, Any]] = None,
@@ -48,36 +65,12 @@ class Action_Primitive_Dataset(Dataset):
 		if not self.dataset_root.exists():
 			raise FileNotFoundError(f"Dataset root does not exist: {self.dataset_root}")
 
-		self.image_size = self._normalize_image_size(image_size)
 		self.views = list(views) if views is not None else list(ALL_VIEWS)
 		self.top_k = self._normalize_top_k(top_k)
 		self.view_selector_kwargs = dict(view_selector_kwargs or {})
 		self._view_selector: Optional[ViewSelector] = None
 		self.samples: List[Dict[str, Any]] = []
 		self.index_dataset()
-
-	"""检查 image size 合法性，并统一成 (width, height)。"""
-	def _normalize_image_size(
-		self,
-		image_size: Optional[Tuple[int, int]],
-	) -> Optional[Tuple[int, int]]:
-
-		if image_size is None:
-			return None
-
-		if isinstance(image_size, int):
-			if image_size <= 0:
-				raise ValueError("image_size must be positive")
-			return (image_size, image_size)
-
-		if isinstance(image_size, (list, tuple)) and len(image_size) == 2:
-			width = int(image_size[0])
-			height = int(image_size[1])
-			if width <= 0 or height <= 0:
-				raise ValueError("image_size values must be positive")
-			return (width, height)
-
-		raise ValueError("image_size must be None, int, or (width, height)")
 
 	"""检查 top_k 合法性，并统一成正整数。"""
 	def _normalize_top_k(self, top_k: int) -> int:
@@ -271,6 +264,7 @@ class Action_Primitive_Dataset(Dataset):
 
 ActionPrimitiveDataset = Action_Primitive_Dataset
 
+
 # 简单测试
 if __name__ == "__main__":
 	dataset = Action_Primitive_Dataset(dataset_root="Action_Primitive_Dataset_v0")
@@ -278,5 +272,10 @@ if __name__ == "__main__":
 	sample = dataset[0]
 	print(f"Sample 0 action: {sample['action']}")
 	print(f"Sample 0 trajectory length: {sample['trajectory_length']}")
+	print(f"Sample 0 trajectory data keys: {list(sample['trajectory_data'].keys())}")
+	for key, value in sample["trajectory_data"].items():
+		print(f"  {key}: {type(value)} with {len(value)} frames")
+		if len(value) > 0:
+			print(f"    First frame value: {value[0]}")
 	print(f"Sample 0 selected views: {sample['selected_views']}")
 
