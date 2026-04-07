@@ -4,7 +4,10 @@ from typing import Dict, List, Optional, Sequence
 import torch
 from PIL import Image
 
-from utils import build_dinov2_transform
+try:
+    from .utils import build_dinov2_transform
+except ImportError:
+    from utils import build_dinov2_transform
 
 
 SUPPORTED_DINOV2_MODELS = {
@@ -19,21 +22,22 @@ SUPPORTED_DINOV2_MODELS = {
 }
 
 """基于冻结 DINOv2 的视角信息量评估器。
-    Input:
-        __init__:
-            model_name: DINOv2 模型名称，必须是 SUPPORTED_DINOV2_MODELS 中的一个。
-            repo: torch.hub 模型仓库地址，默认为官方 DINOv2 仓库。
-            device: 运行设备，默认为自动选择 CUDA（如果可用）或 CPU。
-            input_size: 输入图像尺寸，必须是 14 的倍数，默认为 224。
-    Output:
-        select_best_view:
-            best_index: 最佳视角的索引位置。
-            best_view: 最佳视角的名称（如果提供了 view_names）。
-            best_start_path: 最佳视角起始帧的图像路径。 
-            best_end_path: 最佳视角末帧的图像路径。
-            best_score: 最佳视角的变化分数，范围 [0, 1]，分数越大表示变化越明显。
-            all_scores: 所有视角的变化分数列表，顺序与输入视角列表一致。
-            scored_views: 包含每个视角详细信息的列表，每个元素是一个字典，包含 index、view
+
+输入：
+    __init__:
+        model_name: DINOv2 模型名称，必须属于 SUPPORTED_DINOV2_MODELS。
+        repo: torch.hub 仓库地址，当前仅支持官方仓库 facebookresearch/dinov2。
+        device: 推理设备，默认自动选择 CUDA 或 CPU。
+        input_size: 输入图像尺寸，必须是 14 的倍数。
+
+输出：
+    select_best_view:
+        返回按变化分数从高到低排序的列表，长度由 top_k 决定。
+        每个元素包含：
+            best_view: 视角名称。
+            best_start_path: 该视角起始帧图像路径。
+            best_end_path: 该视角末帧图像路径。
+            best_score: 该视角的变化分数，分数越大表示视觉变化越明显。
 """
 class View_Selector:
     def __init__(
@@ -161,11 +165,19 @@ class View_Selector:
         start_paths: Sequence[str],
         end_paths: Sequence[str],
         view_names: Optional[Sequence[str]] = None,
-    ) -> Dict[str, object]:
+        top_k: int = 1,
+    ) -> List[Dict[str, object]]:
+        
+        # 基础检查
         self._validate_pairs(start_paths, end_paths, view_names)
+        if top_k <= 0:
+            raise ValueError("top_k must be a positive integer")
+
+        # 加载模型并计算分数
+        self._ensure_model_loaded()
         scores = self.compute_change_scores(start_paths, end_paths)
 
-        best_index = max(range(len(scores)), key=lambda i: scores[i])
+        # 打包结果
         resolved_view_names = list(view_names) if view_names is not None else [None] * len(scores)
         scored_views: List[Dict[str, object]] = []
         for index, (view_name, start_path, end_path, score) in enumerate(
@@ -181,15 +193,20 @@ class View_Selector:
                 }
             )
 
-        return {
-            "best_index": best_index,
-            "best_view": resolved_view_names[best_index],
-            "best_start_path": start_paths[best_index],
-            "best_end_path": end_paths[best_index],
-            "best_score": scores[best_index],
-            "all_scores": scores,
-            "scored_views": scored_views,
-        }
+        sorted_views = sorted(scored_views, key=lambda item: item["score"], reverse=True)
+        selected_count = min(top_k, len(sorted_views))
+        selected_views: List[Dict[str, object]] = []
+        for selected_view in sorted_views[:selected_count]:
+            selected_views.append(
+                {
+                    "best_view": selected_view["view_name"],
+                    "best_start_path": selected_view["start_path"],
+                    "best_end_path": selected_view["end_path"],
+                    "best_score": float(selected_view["score"])
+                }
+            )
+
+        return selected_views
 
 
 ViewSelector = View_Selector
