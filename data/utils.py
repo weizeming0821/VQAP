@@ -62,9 +62,6 @@ def build_dinov2_transform(input_size: int = 224) -> transforms.Compose:
 		]
 	)
 
-# """重写 Action_Primitive_Dataset 类的数据裁剪函数"""
-# def ActionPrimitiveDataset_collate_fn_(batch):
-# 	pass
-
-
-
+"""重写 Action_Primitive_Dataset 类的数据裁剪函数"""
+def ActionPrimitiveDataset_collate_fn(batch: Any) -> Any:
+    return batch

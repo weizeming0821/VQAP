@@ -21,7 +21,12 @@ traj_generator_segmentation/
 └── pipeline.py        # 主流水线
 
 traj_generator_segmentation.py  # 入口脚本
+config/
+└── traj_generator_segmentation.yaml  # 分割与采集配置
 ```
+
+说明：
+`traj_generator_segmentation/config.py` 现在负责从 `config/traj_generator_segmentation.yaml` 读取配置并导出兼容常量；日常调参请直接修改 YAML 文件。
 
 ### 使用方法
 
