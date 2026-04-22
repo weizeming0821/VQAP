@@ -473,7 +473,7 @@ def run_segmented_collection(args):
 
     check_and_make('./log')
     log_file = os.path.join('log',
-                            f'segment_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+                            f'traj_gen_seg_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
     with open(log_file, 'w', encoding='utf-8') as f:
         f.write(f'[{datetime.now()}] [INFO] start segmented collection\n')
         f.write(f'[{datetime.now()}] [INFO] args={vars(args)}\n')
