@@ -58,7 +58,7 @@ python traj_generator_segmentation.py --save_mode full
 | `--processes` | 8 | 并行进程数 |
 | `--min_phase_len` | 5 | 相邻关键帧最小帧距 |
 | `--save_mode` | `keyframe_only` | 保存模式 (`full`/`keyframe_only`) |
-| `--fixed_phase_csv` | `./TASK_FIXED_PHASE.csv` | 固定阶段数配置 |
+| `--fixed_phase_csv` | `./TASK_FIXED_PHASE_NUM.csv` | 固定阶段数配置 |
 
 ### 输出结构
 
@@ -80,4 +80,4 @@ output_path/
 
 ### 阶段数验证
 
-根据 `TASK_FIXED_PHASE.csv` 验证分割结果，阶段数不匹配时自动重试采集（最多 3 次）。
+根据 `TASK_FIXED_PHASE_NUM.csv` 验证分割结果，阶段数不匹配时自动重试采集（最多 3 次）。

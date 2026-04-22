@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""仅处理 TASK_FIXED_PHASE.csv 中任务的包装入口。"""
+"""仅处理 TASK_FIXED_PHASE_NUM.csv 中任务的包装入口。"""
 
 import argparse
 import csv
@@ -62,7 +62,7 @@ def _resolve_tasks_from_fixed_phase_csv(csv_path, requested_tasks):
 	valid_csv_tasks = sorted(task_name for task_name in csv_tasks if task_name in available_tasks)
 
 	if missing_tasks:
-		print('[Warn] These TASK_FIXED_PHASE.csv tasks are not available in RLBench and will be skipped:')
+		print('[Warn] These TASK_FIXED_PHASE_NUM.csv tasks are not available in RLBench and will be skipped:')
 		print('  ' + ', '.join(missing_tasks))
 
 	if requested_tasks:
@@ -72,19 +72,19 @@ def _resolve_tasks_from_fixed_phase_csv(csv_path, requested_tasks):
 
 		not_in_csv = sorted(task_name for task_name in requested_tasks if task_name not in csv_tasks)
 		if not_in_csv:
-			raise ValueError('Task(s) not listed in TASK_FIXED_PHASE.csv: ' + ', '.join(not_in_csv))
+			raise ValueError('Task(s) not listed in TASK_FIXED_PHASE_NUM.csv: ' + ', '.join(not_in_csv))
 
 		return resolved_csv_path, requested_tasks
 
 	if not valid_csv_tasks:
-		raise ValueError('No valid RLBench tasks remain after filtering TASK_FIXED_PHASE.csv')
+		raise ValueError('No valid RLBench tasks remain after filtering TASK_FIXED_PHASE_NUM.csv')
 
 	return resolved_csv_path, valid_csv_tasks
 
 
 def _parse_wrapper_args(argv):
 	parser = argparse.ArgumentParser(add_help=False)
-	parser.add_argument('--fixed_phase_csv', default='./TASK_FIXED_PHASE.csv')
+	parser.add_argument('--fixed_phase_csv', default='./TASK_FIXED_PHASE_NUM.csv')
 	parser.add_argument('--tasks', nargs='*', default=[])
 	return parser.parse_known_args(argv)
 

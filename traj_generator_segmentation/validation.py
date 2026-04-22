@@ -2,7 +2,7 @@
 """
 阶段数验证模块
 
-根据 TASK_FIXED_PHASE.csv 验证每个任务的分割结果是否符合要求。
+根据 TASK_FIXED_PHASE_NUM.csv 验证每个任务的分割结果是否符合要求。
 """
 
 import os

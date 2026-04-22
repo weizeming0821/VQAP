@@ -458,7 +458,7 @@ def parse_args():
     parser.add_argument('--save_mode', type=str, default='keyframe_only',
                         choices=['full', 'keyframe_only'],
                         help='保存模式')
-    parser.add_argument('--fixed_phase_csv', type=str, default='./TASK_FIXED_PHASE.csv',
+    parser.add_argument('--fixed_phase_csv', type=str, default='./TASK_FIXED_PHASE_NUM.csv',
                         help='固定阶段数配置文件路径')
     parser.add_argument('--debug', action='store_true',
                         help='开启调试模式')
