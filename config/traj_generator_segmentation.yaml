@@ -1,47 +1,51 @@
 # traj_generator_segmentation 配置
 
+# 信号检测配置
 signal_detection:
-  low_contact_force: 0.05
-  contact_persist: 3
-  boundary_interact_window: 2
-  mid_interact_run_thr: 3
-  open_force_delta_scale: 0.6
-  open_vel_scale: 0.5
-  open_hold_vel_scale: 0.25
-  open_hold_force_delta_scale: 0.08
-  interact_hold_gap_frames: 2
-  open_d_enter_persist: 2
-  open_after_release_d_cooldown: 8
-  closed_press_enter_persist: 2
-  gripper_open_thr: 0.5
+  low_contact_force: 0.05  # 推/按类任务的松散接触阈值；夹爪张开时若仍有轻微接触力，可据此判定为接触。
+  contact_persist: 3  # 接触信号需连续命中的最少帧数，用于抑制单帧噪声。
+  boundary_interact_window: 2  # 在段首段尾附近向内扩展多少帧来辅助交互判定。
+  mid_interact_run_thr: 3  # 首尾都未命中时，中间连续交互帧达到该阈值则视为有效交互段。
+  open_force_delta_scale: 0.6  # 开夹爪非夹持交互时，关节力矩变化阈值的缩放系数。
+  open_vel_scale: 0.5  # 开夹爪非夹持交互时，速度阈值的缩放系数。
+  open_hold_vel_scale: 0.25  # 帧级交互状态机中，张开夹爪维持交互所需的弱速度阈值缩放系数。
+  open_hold_force_delta_scale: 0.08  # 帧级交互状态机中，张开夹爪维持交互所需的弱受载阈值缩放系数。
+  interact_hold_gap_frames: 2  # 交互状态允许短暂丢失证据的最大帧数。
+  open_d_enter_persist: 2  # 开夹爪受载交互进入有效状态前，D 类证据需要连续命中的帧数。
+  open_after_release_d_cooldown: 8  # 开爪释放后，D 类证据进入冷却窗口的帧数，避免把惯性尖峰误判成交互。
+  closed_press_enter_persist: 2  # 闭夹爪非抓持下压进入有效状态前，E 类证据需要连续命中的帧数。
+  gripper_open_thr: 0.5  # gripper_open 的二值化阈值；大于该值判定为 open，否则判定为 closed。
 
+# 静止段配置
 static_segment:
-  static_pose_eps: 0.0005
-  static_rot_eps_rad: 0.05
-  static_run_drop_thr: 8
-  static_run_jitter_pose_scale: 2.5
-  static_run_jitter_rot_scale: 1.5
-  static_slow_motion_pose_scale: 4.0
-  static_slow_motion_rot_scale: 3.0
+  static_pose_eps: 0.0005  # 末端位置变化小于该阈值时，可视为近似静止，单位为米。
+  static_rot_eps_rad: 0.05  # 末端姿态变化小于该阈值时，可视为近似静止，单位为弧度。
+  static_run_drop_thr: 8  # 若一个分段中出现不小于该长度的连续静止帧，则整段可能被丢弃。
+  static_run_jitter_pose_scale: 2.5  # 计算静止 run 时，允许单帧位置抖动的放宽倍数。
+  static_run_jitter_rot_scale: 1.5  # 计算静止 run 时，允许单帧姿态抖动的放宽倍数。
+  static_slow_motion_pose_scale: 4.0  # 对慢运动兜底保留时，静止段首尾累计位移需超过该倍数阈值。
+  static_slow_motion_rot_scale: 3.0  # 对慢运动兜底保留时，静止段首尾累计姿态变化需超过该倍数阈值。
 
+# 运行配置
 runtime:
-  run_signals: null
-  run_min_phase_len: 5
-  run_show_seg_trace: true
-  run_debug_trace: false
-  run_trace_max_items: 120
-  run_dump_sensors: true
-  run_print_sensor_values: false
+  run_signals: null  # 显式指定启用的分割信号；设为 null 表示使用代码中的 ALL_SIGNALS。
+  run_min_phase_len: 5  # 相邻关键帧的最小帧距；小于该距离的候选关键帧会被合并。
+  run_show_seg_trace: true  # 是否在采集时打印每个 episode 的分割结果摘要。
+  run_debug_trace: false  # 是否输出更详细的交互判定调试信息。
+  run_trace_max_items: 120  # 调试追踪输出时，单项列表最多显示多少个元素；null 表示不限制。
+  run_dump_sensors: true  # 是否导出每帧传感器值相关信息。
+  run_print_sensor_values: false  # 是否在分割过程中同步打印每帧传感器值到终端。
 
+# 保存配置
 collection:
-  default_image_size: [256, 256]
-  default_renderer: opengl3
-  default_processes: 8
-  default_episodes_per_task: 100
-  default_variations: 5
-  default_arm_max_velocity: 1.0
-  default_arm_max_acceleration: 4.0
-  default_demo_timeout: 90
-  default_worker_stuck_timeout: 180
-  max_demo_attempts: 10
-  max_phase_validation_retries: 5
+  default_image_size: [256, 256]  # 默认保存图像分辨率，格式为 [width, height]。
+  default_renderer: opengl3  # 默认渲染后端，可选值需与 pipeline 中 argparse 的 choices 保持一致。
+  default_processes: 8  # 默认并行 worker 数。
+  default_episodes_per_task: 100  # 每个任务变体默认采集的 episode 数量。
+  default_variations: 5  # 每个任务默认采集的 variation 数量上限；-1 通常表示全部。
+  default_arm_max_velocity: 1.0  # 运动规划使用的默认最大手臂速度。
+  default_arm_max_acceleration: 4.0  # 运动规划使用的默认最大手臂加速度。
+  default_demo_timeout: 90  # 单条 demo 采集的默认软超时时间，单位为秒；0 表示不限时。
+  default_worker_stuck_timeout: 180  # worker 判定为卡住的默认超时时间，单位为秒。
+  max_demo_attempts: 10  # 单条 demo 采集失败时，允许重新尝试 get_demos 的最大次数。
+  max_phase_validation_retries: 5  # 阶段数验证不通过时，允许重新采集并重新分割的最大次数。
