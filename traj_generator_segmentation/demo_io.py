@@ -148,15 +148,15 @@ def save_subphase_demo_from_memory(phase_obs_all, out_path, image_obs=None,
 
 
 def save_phase_metadata(out_ep_path, demo, phase_info, keyframe_inds,
-                        descriptions, debug_info, save_mode='full'):
+                        debug_info, save_mode='full'):
     """保存 episode 层级的元数据"""
     ep_meta = {
         'total_frames': len(demo),
         'save_mode': save_mode,
         'num_phases': len(phase_info),
         'keyframe_inds': [int(p['keyframe_index']) for p in phase_info],
-        'task_descriptions': descriptions,
         'auto_thresholds': {k: float(v) for k, v in debug_info.get('thresholds', {}).items()},
+        'segmentation_trace': debug_info.get('trace', {}),
         'phases': phase_info,
     }
     with open(os.path.join(out_ep_path, 'phase_metadata.json'), 'w') as f:
@@ -232,6 +232,6 @@ def process_demo_in_memory(demo, out_ep_path, descriptions,
         })
 
     save_phase_metadata(out_ep_path, demo, phase_info, keyframe_inds,
-                        descriptions, debug_info, save_mode)
+                        debug_info, save_mode)
 
     return phase_info, num_phases, valid

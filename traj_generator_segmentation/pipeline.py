@@ -38,7 +38,7 @@ from .config import (
 from .signals import ALL_SIGNALS
 from .demo_io import process_demo_in_memory
 from .metadata import (
-    save_variation_metadata, save_descriptions, save_task_metadata, save_split_summary
+    save_variation_metadata, save_task_metadata, save_dataset_metadata
 )
 from .validation import load_fixed_phase_config, validate_phase_count
 
@@ -76,6 +76,76 @@ def estimate_total_episodes(task_files, args):
     if args.variations >= 0:
         return int(len(task_files) * args.variations * args.episodes_per_task)
     return int(len(task_files) * args.episodes_per_task)
+
+
+def summarize_collection(task_files, progress, variation_stats, started_at, finished_at):
+    """汇总本次生成任务的总体统计信息。"""
+    stat_values = list(variation_stats.values())
+    total_variations = len(stat_values)
+    success_variations = [s for s in stat_values if s.get('status') == 'completed']
+    failed_variations = [s for s in stat_values if s.get('status') != 'completed']
+
+    planned_demos = sum(int(s.get('planned_demos', 0)) for s in stat_values)
+    success_demos = sum(int(s.get('success_demos', 0)) for s in stat_values)
+    failed_demos = sum(int(s.get('failed_demos', 0)) for s in stat_values)
+    timeout_demos = sum(int(s.get('timeout_demos', 0)) for s in stat_values)
+    exception_demos = sum(int(s.get('failed_exception_demos', 0)) for s in stat_values)
+    phase_invalid_demos = sum(int(s.get('phase_invalid_demos', 0)) for s in stat_values)
+    phase_valid_demos = sum(int(s.get('phase_valid_demos', 0)) for s in stat_values)
+    duration_seconds = max(0.0, (finished_at - started_at).total_seconds())
+    episodes_per_minute = (success_demos / duration_seconds * 60.0) if duration_seconds > 0 else 0.0
+
+    failed_task_stats = {}
+    for stat in failed_variations:
+        task_name = stat.get('task_name')
+        if not task_name:
+            continue
+        item = failed_task_stats.setdefault(task_name, {
+            'failed_variations': 0,
+            'failed_demos': 0,
+            'timeout_demos': 0,
+            'failed_exception_demos': 0,
+            'phase_invalid_demos': 0,
+        })
+        item['failed_variations'] += 1
+        item['failed_demos'] += int(stat.get('failed_demos', 0))
+        item['timeout_demos'] += int(stat.get('timeout_demos', 0))
+        item['failed_exception_demos'] += int(stat.get('failed_exception_demos', 0))
+        item['phase_invalid_demos'] += int(stat.get('phase_invalid_demos', 0))
+
+    lines = [
+        '===== Segmented Collection Summary =====',
+        f'Started at: {started_at.strftime("%Y-%m-%d %H:%M:%S")}',
+        f'Finished at: {finished_at.strftime("%Y-%m-%d %H:%M:%S")}',
+        f'Total duration: {duration_seconds:.2f}s',
+        f'Generation speed: {episodes_per_minute:.2f} successful episodes/min',
+        f'Planned tasks: {len(task_files)}',
+        f'Processed variations: {total_variations}',
+        f'Success variations: {len(success_variations)} / {total_variations}',
+        f'Failed variations: {len(failed_variations)} / {total_variations}',
+        f'Planned demos: {planned_demos}',
+        f'Done demos: {int(progress.get("done_episodes", 0))}',
+        f'Success demos: {success_demos}',
+        f'Failed demos: {failed_demos}',
+        f'Timeout demos: {timeout_demos}',
+        f'Exception demos: {exception_demos}',
+        f'Phase invalid demos: {phase_invalid_demos}',
+        f'Phase valid demos: {phase_valid_demos}',
+        f'Phase valid rate: {phase_valid_demos} / {success_demos}',
+    ]
+
+    detail_lines = []
+    if failed_task_stats:
+        detail_lines.append('Failed task breakdown:')
+        for task_name in sorted(failed_task_stats.keys()):
+            item = failed_task_stats[task_name]
+            detail_lines.append(
+                f'  - task={task_name} failed_variations={item["failed_variations"]} '
+                f'failed_demos={item["failed_demos"]} timeout_demos={item["timeout_demos"]} '
+                f'exception_demos={item["failed_exception_demos"]} '
+                f'phase_invalid_demos={item["phase_invalid_demos"]}')
+
+    return lines, detail_lines
 
 
 def get_obs_config_dict(obs_config):
@@ -229,7 +299,6 @@ def run_worker(i, lock, task_index, variation_count, results, file_lock, tasks, 
             args.output_path, task_name,
             VARIATIONS_FOLDER % my_variation_count)
         check_and_make(variation_path)
-        save_descriptions(variation_path, descriptions)
 
         episodes_path = os.path.join(variation_path, EPISODES_FOLDER)
         check_and_make(episodes_path)
@@ -389,21 +458,6 @@ def run_worker(i, lock, task_index, variation_count, results, file_lock, tasks, 
                                 done_episodes=1, failed_episodes=1)
                 break
 
-        # 保存 variation 元数据
-        save_variation_metadata(variation_path, my_variation_count, descriptions, episode_stats)
-
-        # 保存 split_summary.json
-        episode_summaries = [
-            {
-                'episode': f'episode{stat["episode"]}',
-                'num_phases': stat['num_phases'],
-                'phases': stat['phases'],
-            }
-            for stat in episode_stats
-        ]
-        save_split_summary(variation_path, task_name, f'variation{my_variation_count}',
-                           descriptions, args.save_mode, signals, episode_summaries)
-
         failed_demos = timeout_count + failed_exc_count
         status = 'completed' if failed_demos == 0 and phase_invalid_count == 0 else 'partial_failed'
         variation_stats[var_key] = {
@@ -418,6 +472,16 @@ def run_worker(i, lock, task_index, variation_count, results, file_lock, tasks, 
             'failed_demos': int(failed_demos),
             'status': status,
         }
+
+        save_variation_metadata(
+            variation_path,
+            my_variation_count,
+            descriptions,
+            episode_stats,
+            args.save_mode,
+            signals,
+            generation_stats=variation_stats[var_key],
+        )
 
         worker_state[i] = {'status': 'idle', 'demo_index': -1, 'last_heartbeat': time.time()}
 
@@ -467,6 +531,7 @@ def parse_args():
 
 def run_segmented_collection(args):
     """运行分割后的演示采集流程。"""
+    started_at = datetime.now()
     if args.worker_stuck_timeout > 0 and args.demo_timeout > 0:
         if args.worker_stuck_timeout <= args.demo_timeout:
             args.worker_stuck_timeout = args.demo_timeout + 60
@@ -491,6 +556,7 @@ def run_segmented_collection(args):
         task_files = args.tasks
 
     tasks = [task_file_to_task_class(t) for t in task_files]
+    args.signals = sorted(set(RUN_SIGNALS) if RUN_SIGNALS else set(ALL_SIGNALS))
 
     manager = Manager()
     result_dict = manager.dict()
@@ -550,6 +616,8 @@ def run_segmented_collection(args):
     for p in processes:
         p.join()
 
+    finished_at = datetime.now()
+
     final_done = int(progress.get('done_episodes', 0))
     if final_done > last_done:
         bar.update(final_done - last_done)
@@ -570,6 +638,30 @@ def run_segmented_collection(args):
         if os.path.exists(task_path):
             save_task_metadata(task_path, task_name,
                                fixed_phase_num=fixed_phase_config.get(task_name))
+
+    progress_snapshot = dict(progress)
+    variation_stats_snapshot = dict(variation_stats)
+    save_dataset_metadata(
+        args.output_path,
+        started_at,
+        finished_at,
+        args,
+        task_names,
+        progress_snapshot,
+        variation_stats_snapshot,
+    )
+
+    summary_lines, detail_lines = summarize_collection(
+        task_files,
+        progress_snapshot,
+        variation_stats_snapshot,
+        started_at,
+        finished_at,
+    )
+    print('')
+    for line in summary_lines + detail_lines:
+        print(line)
+        append_log(log_file, log_lock, 'INFO', line)
 
     append_log(log_file, log_lock, 'INFO', 'collection done')
     print(f'[Info] Log saved: {log_file}')

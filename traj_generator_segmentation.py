@@ -14,12 +14,11 @@
 
 输出目录结构：
   output_path/
+    dataset_metadata.json
     task_name/
       task_metadata.json
       variationN/
         variation_metadata.json
-        split_summary.json
-        variation_descriptions.pkl
         episodes/
           episodeN/
             phase_metadata.json

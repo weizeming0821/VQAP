@@ -64,11 +64,11 @@ python traj_generator_segmentation.py --save_mode full
 
 ```
 output_path/
+  dataset_metadata.json
   task_name/
     task_metadata.json
     variationN/
       variation_metadata.json
-      split_summary.json
       episodes/
         episodeN/
           phase_metadata.json
@@ -77,6 +77,11 @@ output_path/
             front_rgb/*.png
             ...
 ```
+
+其中：
+- `dataset_metadata.json` 记录本次整体生成统计与关键运行参数。
+- `variation_metadata.json` 记录变体描述、variation 级统计以及每个 episode 的摘要索引。
+- `phase_metadata.json` 仅保留单个 episode 的分割细节，避免跨层重复记录 descriptions。
 
 ### 阶段数验证
 
