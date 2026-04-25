@@ -33,6 +33,7 @@ def save_variation_metadata(variation_path, variation_index, descriptions,
         episode_index = int(stat.get('episode', -1))
         episode_summaries.append({
             'episode': f'episode{episode_index}',
+            'requested_episode': int(stat.get('requested_episode', episode_index)),
             'num_phases': int(stat.get('num_phases', 0)),
             'phase_valid': bool(stat.get('phase_valid', True)),
             'phase_metadata_path': os.path.join('episodes', f'episode{episode_index}', 'phase_metadata.json'),
@@ -55,9 +56,11 @@ def save_variation_metadata(variation_path, variation_index, descriptions,
             'phase_valid_demos': int(generation_stats.get('phase_valid_demos', valid_episodes)),
             'timeout_demos': int(generation_stats.get('timeout_demos', 0)),
             'failed_exception_demos': int(generation_stats.get('failed_exception_demos', 0)),
+            'phase_invalid_attempts': int(generation_stats.get('phase_invalid_attempts', 0)),
             'phase_invalid_demos': int(generation_stats.get('phase_invalid_demos', 0)),
             'failed_demos': int(generation_stats.get('failed_demos', 0)),
         },
+        'failure_details': list(generation_stats.get('failure_details', [])),
         'episode_summaries': episode_summaries,
     }
 
@@ -130,9 +133,17 @@ def save_dataset_metadata(output_path, started_at, finished_at, args,
     os.makedirs(output_path, exist_ok=True)
 
     variation_values = list(variation_stats.values())
+    planned_episodes = sum(int(v.get('planned_demos', 0)) for v in variation_values)
+    success_episodes = sum(int(v.get('success_demos', 0)) for v in variation_values)
+    failed_episodes = sum(
+        int(v.get('failed_demos', 0)) + int(v.get('phase_invalid_demos', 0))
+        for v in variation_values)
+    timeout_episodes = sum(int(v.get('timeout_demos', 0)) for v in variation_values)
+    phase_invalid_attempts = sum(int(v.get('phase_invalid_attempts', 0)) for v in variation_values)
     phase_valid_episodes = sum(int(v.get('phase_valid_demos', 0)) for v in variation_values)
     phase_invalid_episodes = sum(int(v.get('phase_invalid_demos', 0)) for v in variation_values)
     total_variations = len(variation_values)
+    done_episodes = success_episodes + failed_episodes
 
     signals = list(args.signals) if getattr(args, 'signals', None) else []
     metadata = {
@@ -143,11 +154,12 @@ def save_dataset_metadata(output_path, started_at, finished_at, args,
         'tasks': task_names,
         'num_tasks': len(task_names),
         'num_variations': total_variations,
-        'planned_episodes': int(progress.get('planned_episodes', 0)),
-        'done_episodes': int(progress.get('done_episodes', 0)),
-        'success_episodes': int(progress.get('success_episodes', 0)),
-        'failed_episodes': int(progress.get('failed_episodes', 0)),
-        'timeout_episodes': int(progress.get('timeout_episodes', 0)),
+        'planned_episodes': planned_episodes,
+        'done_episodes': done_episodes,
+        'success_episodes': success_episodes,
+        'failed_episodes': failed_episodes,
+        'timeout_episodes': timeout_episodes,
+        'phase_invalid_attempts': phase_invalid_attempts,
         'phase_invalid_episodes': phase_invalid_episodes,
         'phase_valid_episodes': phase_valid_episodes,
         'config': {
