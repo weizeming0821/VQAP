@@ -194,15 +194,22 @@ def _append_job_logs(master_log_path, jobs):
         'Failed variations:',
         'Planned demos:',
         'Done demos:',
+        'Accounted demos:',
         'Success demos:',
         'Total failed demos:',
         'Timeout/exception failed demos:',
         'Timeout demos:',
+        'Demo timeout demos:',
+        'Watchdog timeout demos:',
         'Exception demos:',
         'Phase invalid demos:',
+        'Aborted demos:',
         'Phase invalid attempts:',
         'Phase valid demos:',
         'Phase valid rate:',
+        'Failed task breakdown:',
+        'Failed episode details:',
+        '- task=',
     )
 
     for job in jobs:

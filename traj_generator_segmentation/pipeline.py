@@ -181,6 +181,35 @@ def _get_failure_counter_field(failure_type):
     }.get(failure_type)
 
 
+def _new_failure_progress_deltas():
+    return {
+        'done_episodes': 0,
+        'failed_episodes': 0,
+        'demo_timeout_episodes': 0,
+        'watchdog_timeout_episodes': 0,
+        'exception_episodes': 0,
+        'phase_invalid_episodes': 0,
+        'aborted_episodes': 0,
+    }
+
+
+def _accumulate_failure_progress(progress_deltas, failure_type):
+    progress_deltas['done_episodes'] += 1
+    progress_deltas['failed_episodes'] += 1
+
+    counter_field = _get_failure_counter_field(failure_type)
+    if counter_field == 'demo_timeout_demos':
+        progress_deltas['demo_timeout_episodes'] += 1
+    elif counter_field == 'watchdog_timeout_demos':
+        progress_deltas['watchdog_timeout_episodes'] += 1
+    elif counter_field == 'exception_demos':
+        progress_deltas['exception_episodes'] += 1
+    elif counter_field == 'phase_invalid_demos':
+        progress_deltas['phase_invalid_episodes'] += 1
+    elif counter_field == 'aborted_demos':
+        progress_deltas['aborted_episodes'] += 1
+
+
 def _has_terminal_failure(current, requested_episode):
     for detail in current.get('failure_details', []):
         if int(detail.get('requested_episode', -1)) == int(requested_episode):
@@ -359,15 +388,7 @@ def _register_worker_abort_failures(worker_info, args, progress, progress_lock, 
     requested_episode = int(worker_info.get('demo_index', -1))
     planned_demos = int(args.episodes_per_task)
     recorded_details = []
-    progress_deltas = {
-        'done_episodes': 0,
-        'failed_episodes': 0,
-        'demo_timeout_episodes': 0,
-        'watchdog_timeout_episodes': 0,
-        'exception_episodes': 0,
-        'phase_invalid_episodes': 0,
-        'aborted_episodes': 0,
-    }
+    progress_deltas = _new_failure_progress_deltas()
 
     if task_name is None or variation_index < 0:
         return recorded_details
@@ -390,19 +411,7 @@ def _register_worker_abort_failures(worker_info, args, progress, progress_lock, 
         )
         if _record_variation_failure(
                 variation_stats, var_key, task_name, variation_index, planned_demos, primary_detail):
-            progress_deltas['done_episodes'] += 1
-            progress_deltas['failed_episodes'] += 1
-            counter_field = _get_failure_counter_field(failure_type)
-            if counter_field == 'demo_timeout_demos':
-                progress_deltas['demo_timeout_episodes'] += 1
-            elif counter_field == 'watchdog_timeout_demos':
-                progress_deltas['watchdog_timeout_episodes'] += 1
-            elif counter_field == 'exception_demos':
-                progress_deltas['exception_episodes'] += 1
-            elif counter_field == 'phase_invalid_demos':
-                progress_deltas['phase_invalid_episodes'] += 1
-            elif counter_field == 'aborted_demos':
-                progress_deltas['aborted_episodes'] += 1
+            _accumulate_failure_progress(progress_deltas, failure_type)
             recorded_details.append(primary_detail)
 
     start_abort_episode = max(requested_episode + 1, 0)
@@ -421,9 +430,7 @@ def _register_worker_abort_failures(worker_info, args, progress, progress_lock, 
         )
         if _record_variation_failure(
                 variation_stats, var_key, task_name, variation_index, planned_demos, abort_detail):
-            progress_deltas['done_episodes'] += 1
-            progress_deltas['failed_episodes'] += 1
-            progress_deltas['aborted_episodes'] += 1
+            _accumulate_failure_progress(progress_deltas, 'variation_aborted')
             recorded_details.append(abort_detail)
 
     if any(progress_deltas.values()):
@@ -1092,15 +1099,7 @@ def run_worker(i, lock, task_index, variation_count, results, file_lock, tasks, 
                         stage='generation',
                         disposition='failed',
                     )
-                progress_deltas = {
-                    'done_episodes': 0,
-                    'failed_episodes': 0,
-                    'demo_timeout_episodes': 0,
-                    'watchdog_timeout_episodes': 0,
-                    'exception_episodes': 0,
-                    'phase_invalid_episodes': 0,
-                    'aborted_episodes': 0,
-                }
+                progress_deltas = _new_failure_progress_deltas()
                 if _record_variation_failure(
                         variation_stats,
                         var_key,
@@ -1108,19 +1107,10 @@ def run_worker(i, lock, task_index, variation_count, results, file_lock, tasks, 
                         my_variation_count,
                         args.episodes_per_task,
                         episode_failure_detail):
-                    progress_deltas['done_episodes'] = 1
-                    progress_deltas['failed_episodes'] = 1
-                    counter_field = _get_failure_counter_field(episode_failure_detail.get('failure_type'))
-                    if counter_field == 'demo_timeout_demos':
-                        progress_deltas['demo_timeout_episodes'] = 1
-                    elif counter_field == 'watchdog_timeout_demos':
-                        progress_deltas['watchdog_timeout_episodes'] = 1
-                    elif counter_field == 'exception_demos':
-                        progress_deltas['exception_episodes'] = 1
-                    elif counter_field == 'phase_invalid_demos':
-                        progress_deltas['phase_invalid_episodes'] = 1
-                    elif counter_field == 'aborted_demos':
-                        progress_deltas['aborted_episodes'] = 1
+                    _accumulate_failure_progress(
+                        progress_deltas,
+                        episode_failure_detail.get('failure_type'),
+                    )
                 update_progress(progress, progress_lock, **progress_deltas)
                 episode_accounted = True
                 break
@@ -1153,13 +1143,9 @@ def run_worker(i, lock, task_index, variation_count, results, file_lock, tasks, 
                         my_variation_count,
                         args.episodes_per_task,
                         episode_failure_detail):
-                    update_progress(
-                        progress,
-                        progress_lock,
-                        done_episodes=1,
-                        failed_episodes=1,
-                        phase_invalid_episodes=1,
-                    )
+                    progress_deltas = _new_failure_progress_deltas()
+                    _accumulate_failure_progress(progress_deltas, 'phase_invalid')
+                    update_progress(progress, progress_lock, **progress_deltas)
 
         current_stats = _ensure_variation_stats(
             variation_stats,
