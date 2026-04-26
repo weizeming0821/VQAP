@@ -33,7 +33,6 @@ def save_variation_metadata(variation_path, variation_index, descriptions,
         episode_index = int(stat.get('episode', -1))
         episode_summaries.append({
             'episode': f'episode{episode_index}',
-            'requested_episode': int(stat.get('requested_episode', episode_index)),
             'num_phases': int(stat.get('num_phases', 0)),
             'phase_valid': bool(stat.get('phase_valid', True)),
             'phase_metadata_path': os.path.join('episodes', f'episode{episode_index}', 'phase_metadata.json'),
@@ -54,13 +53,14 @@ def save_variation_metadata(variation_path, variation_index, descriptions,
         'generation_stats': {
             'success_demos': int(generation_stats.get('success_demos', num_episodes)),
             'phase_valid_demos': int(generation_stats.get('phase_valid_demos', valid_episodes)),
-            'timeout_demos': int(generation_stats.get('timeout_demos', 0)),
-            'failed_exception_demos': int(generation_stats.get('failed_exception_demos', 0)),
+            'demo_timeout_demos': int(generation_stats.get('demo_timeout_demos', 0)),
+            'watchdog_timeout_demos': int(generation_stats.get('watchdog_timeout_demos', 0)),
+            'exception_demos': int(generation_stats.get('exception_demos', 0)),
             'phase_invalid_attempts': int(generation_stats.get('phase_invalid_attempts', 0)),
             'phase_invalid_demos': int(generation_stats.get('phase_invalid_demos', 0)),
+            'aborted_demos': int(generation_stats.get('aborted_demos', 0)),
             'failed_demos': int(generation_stats.get('failed_demos', 0)),
         },
-        'failure_details': list(generation_stats.get('failure_details', [])),
         'episode_summaries': episode_summaries,
     }
 
@@ -135,13 +135,14 @@ def save_dataset_metadata(output_path, started_at, finished_at, args,
     variation_values = list(variation_stats.values())
     planned_episodes = sum(int(v.get('planned_demos', 0)) for v in variation_values)
     success_episodes = sum(int(v.get('success_demos', 0)) for v in variation_values)
-    failed_episodes = sum(
-        int(v.get('failed_demos', 0)) + int(v.get('phase_invalid_demos', 0))
-        for v in variation_values)
-    timeout_episodes = sum(int(v.get('timeout_demos', 0)) for v in variation_values)
+    failed_episodes = sum(int(v.get('failed_demos', 0)) for v in variation_values)
+    demo_timeout_episodes = sum(int(v.get('demo_timeout_demos', 0)) for v in variation_values)
+    watchdog_timeout_episodes = sum(int(v.get('watchdog_timeout_demos', 0)) for v in variation_values)
+    exception_episodes = sum(int(v.get('exception_demos', 0)) for v in variation_values)
     phase_invalid_attempts = sum(int(v.get('phase_invalid_attempts', 0)) for v in variation_values)
     phase_valid_episodes = sum(int(v.get('phase_valid_demos', 0)) for v in variation_values)
     phase_invalid_episodes = sum(int(v.get('phase_invalid_demos', 0)) for v in variation_values)
+    aborted_episodes = sum(int(v.get('aborted_demos', 0)) for v in variation_values)
     total_variations = len(variation_values)
     done_episodes = success_episodes + failed_episodes
 
@@ -158,9 +159,13 @@ def save_dataset_metadata(output_path, started_at, finished_at, args,
         'done_episodes': done_episodes,
         'success_episodes': success_episodes,
         'failed_episodes': failed_episodes,
-        'timeout_episodes': timeout_episodes,
+        'timeout_episodes': demo_timeout_episodes + watchdog_timeout_episodes,
+        'demo_timeout_episodes': demo_timeout_episodes,
+        'watchdog_timeout_episodes': watchdog_timeout_episodes,
+        'exception_episodes': exception_episodes,
         'phase_invalid_attempts': phase_invalid_attempts,
         'phase_invalid_episodes': phase_invalid_episodes,
+        'aborted_episodes': aborted_episodes,
         'phase_valid_episodes': phase_valid_episodes,
         'config': {
             'image_size': list(args.image_size),
@@ -171,7 +176,6 @@ def save_dataset_metadata(output_path, started_at, finished_at, args,
             'arm_max_velocity': float(args.arm_max_velocity),
             'arm_max_acceleration': float(args.arm_max_acceleration),
             'demo_timeout': int(args.demo_timeout),
-            'worker_stuck_timeout': int(args.worker_stuck_timeout),
             'min_phase_len': int(args.min_phase_len),
             'save_mode': args.save_mode,
             'fixed_phase_csv': args.fixed_phase_csv,

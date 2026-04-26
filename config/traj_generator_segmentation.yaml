@@ -46,6 +46,5 @@ collection:
   default_arm_max_velocity: 1.0  # 运动规划使用的默认最大手臂速度。
   default_arm_max_acceleration: 4.0  # 运动规划使用的默认最大手臂加速度。
   default_demo_timeout: 90  # 单条 demo 采集的默认软超时时间，单位为秒；0 表示不限时。
-  default_worker_stuck_timeout: 180  # worker 判定为卡住的默认超时时间，单位为秒。
   max_demo_attempts: 10  # 单条 demo 采集失败时，允许重新尝试 get_demos 的最大次数。
   max_phase_validation_retries: 5  # 阶段数验证不通过时，允许重新采集并重新分割的最大次数。

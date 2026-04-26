@@ -90,9 +90,14 @@ def _collect_failure_details(snapshot):
                 'requested_episode': int(detail.get('requested_episode', detail.get('episode', -1))),
                 'failure_type': detail.get('failure_type', 'unknown'),
                 'reason': detail.get('reason', ''),
+                'stage': detail.get('stage', 'unknown'),
+                'disposition': detail.get('disposition', 'failed'),
                 'observed_phases': detail.get('observed_phases'),
                 'expected_phases': detail.get('expected_phases'),
                 'retries': detail.get('retries'),
+                'trigger_failure_type': detail.get('trigger_failure_type'),
+                'trigger_stage': detail.get('trigger_stage'),
+                'trigger_requested_episode': detail.get('trigger_requested_episode'),
             })
 
     return sorted(
@@ -116,6 +121,11 @@ def _append_launcher_summary(master_log_path, summary, aggregate, jobs):
         f'success_episodes={int(aggregate.get("success_episodes", 0))}',
         f'timeout_episodes={int(aggregate.get("timeout_episodes", 0))}',
         f'failed_episodes={int(aggregate.get("failed_episodes", 0))}',
+        f'demo_timeout_episodes={int(aggregate.get("demo_timeout_episodes", 0))}',
+        f'watchdog_timeout_episodes={int(aggregate.get("watchdog_timeout_episodes", 0))}',
+        f'exception_episodes={int(aggregate.get("exception_episodes", 0))}',
+        f'phase_invalid_episodes={int(aggregate.get("phase_invalid_episodes", 0))}',
+        f'aborted_episodes={int(aggregate.get("aborted_episodes", 0))}',
     ]
 
     for job_summary in summary.get('jobs', []):
@@ -134,10 +144,15 @@ def _append_launcher_summary(master_log_path, summary, aggregate, jobs):
         if progress:
             lines.append(
                 f'  progress planned={int(progress.get("planned_episodes", 0))} '
-                f'done={int(progress.get("done_episodes", 0))} '
+                f'accounted={int(progress.get("done_episodes", 0))} '
                 f'ok={int(progress.get("success_episodes", 0))} '
-                f'timeout={int(progress.get("timeout_episodes", 0))} '
                 f'fail={int(progress.get("failed_episodes", 0))}')
+            lines.append(
+                f'  failure_breakdown demo_timeout={int(progress.get("demo_timeout_episodes", 0))} '
+                f'watchdog_timeout={int(progress.get("watchdog_timeout_episodes", 0))} '
+                f'exception={int(progress.get("exception_episodes", 0))} '
+                f'phase_invalid={int(progress.get("phase_invalid_episodes", 0))} '
+                f'aborted={int(progress.get("aborted_episodes", 0))}')
         for detail in _collect_failure_details(snapshot):
             extra_parts = []
             if detail.get('observed_phases') is not None and detail.get('expected_phases') is not None:
@@ -145,10 +160,17 @@ def _append_launcher_summary(master_log_path, summary, aggregate, jobs):
                     f'phases={detail["observed_phases"]}/{detail["expected_phases"]}')
             if detail.get('retries') is not None:
                 extra_parts.append(f'retries={detail["retries"]}')
+            if detail.get('trigger_failure_type') is not None:
+                extra_parts.append(f'trigger_type={detail["trigger_failure_type"]}')
+            if detail.get('trigger_stage') is not None:
+                extra_parts.append(f'trigger_stage={detail["trigger_stage"]}')
+            if detail.get('trigger_requested_episode') is not None:
+                extra_parts.append(f'trigger_requested_episode={detail["trigger_requested_episode"]}')
             extra_suffix = (' ' + ' '.join(extra_parts)) if extra_parts else ''
             lines.append(
                 f'  failure task={detail["task_name"]} variation={detail["variation_index"]} '
                 f'requested_episode={detail["requested_episode"]} type={detail["failure_type"]} '
+                f'stage={detail["stage"]} disposition={detail["disposition"]} '
                 f'reason={detail["reason"]}{extra_suffix}')
 
     _append_text(master_log_path, '\n'.join(lines) + '\n')
@@ -358,6 +380,11 @@ def _aggregate_progress(jobs):
         'success_episodes': 0,
         'timeout_episodes': 0,
         'failed_episodes': 0,
+        'demo_timeout_episodes': 0,
+        'watchdog_timeout_episodes': 0,
+        'exception_episodes': 0,
+        'phase_invalid_episodes': 0,
+        'aborted_episodes': 0,
         'active_jobs': 0,
     }
     for job in jobs:
@@ -371,12 +398,59 @@ def _aggregate_progress(jobs):
         totals['success_episodes'] += int(progress.get('success_episodes', 0))
         totals['timeout_episodes'] += int(progress.get('timeout_episodes', 0))
         totals['failed_episodes'] += int(progress.get('failed_episodes', 0))
+        totals['demo_timeout_episodes'] += int(progress.get('demo_timeout_episodes', 0))
+        totals['watchdog_timeout_episodes'] += int(progress.get('watchdog_timeout_episodes', 0))
+        totals['exception_episodes'] += int(progress.get('exception_episodes', 0))
+        totals['phase_invalid_episodes'] += int(progress.get('phase_invalid_episodes', 0))
+        totals['aborted_episodes'] += int(progress.get('aborted_episodes', 0))
         if not snapshot.get('finished', False):
             totals['active_jobs'] += 1
     return totals
 
 
-def _merge_dataset_metadata(dataset_metas, merged_output_path, jobs, started_at):
+def _progress_snapshot_to_dataset_meta(snapshot, started_at):
+    if not snapshot:
+        return None
+
+    progress = dict(snapshot.get('progress', {}))
+    variation_stats = dict(snapshot.get('variation_stats', {}))
+    tasks = sorted({
+        stat.get('task_name') for stat in variation_stats.values()
+        if stat.get('task_name')
+    })
+    config = dict(snapshot.get('config', {}))
+    phase_invalid_attempts = sum(int(stat.get('phase_invalid_attempts', 0)) for stat in variation_stats.values())
+    phase_invalid_episodes = sum(int(stat.get('phase_invalid_demos', 0)) for stat in variation_stats.values())
+    phase_valid_episodes = sum(int(stat.get('phase_valid_demos', 0)) for stat in variation_stats.values())
+    demo_timeout_episodes = sum(int(stat.get('demo_timeout_demos', 0)) for stat in variation_stats.values())
+    watchdog_timeout_episodes = sum(int(stat.get('watchdog_timeout_demos', 0)) for stat in variation_stats.values())
+    exception_episodes = sum(int(stat.get('exception_demos', 0)) for stat in variation_stats.values())
+    aborted_episodes = sum(int(stat.get('aborted_demos', 0)) for stat in variation_stats.values())
+
+    return {
+        'started_at': snapshot.get('started_at', started_at.isoformat()),
+        'finished_at': snapshot.get('updated_at', datetime.now().isoformat()),
+        'duration_seconds': round((datetime.now() - started_at).total_seconds(), 3),
+        'tasks': tasks or list(config.get('tasks', [])),
+        'num_tasks': len(tasks or list(config.get('tasks', []))),
+        'num_variations': len(variation_stats),
+        'planned_episodes': int(progress.get('planned_episodes', 0)),
+        'done_episodes': int(progress.get('done_episodes', 0)),
+        'success_episodes': int(progress.get('success_episodes', 0)),
+        'failed_episodes': int(progress.get('failed_episodes', 0)),
+        'timeout_episodes': int(progress.get('timeout_episodes', 0)),
+        'demo_timeout_episodes': int(progress.get('demo_timeout_episodes', demo_timeout_episodes)),
+        'watchdog_timeout_episodes': int(progress.get('watchdog_timeout_episodes', watchdog_timeout_episodes)),
+        'exception_episodes': int(progress.get('exception_episodes', exception_episodes)),
+        'phase_invalid_attempts': int(phase_invalid_attempts),
+        'phase_invalid_episodes': int(phase_invalid_episodes),
+        'aborted_episodes': int(progress.get('aborted_episodes', aborted_episodes)),
+        'phase_valid_episodes': int(phase_valid_episodes),
+        'config': config,
+    }
+
+
+def _merge_dataset_metadata(dataset_metas, merged_output_path, jobs, started_at, merged_task_names=None):
     if not dataset_metas:
         return None
 
@@ -394,8 +468,12 @@ def _merge_dataset_metadata(dataset_metas, merged_output_path, jobs, started_at)
         'success_episodes': 0,
         'failed_episodes': 0,
         'timeout_episodes': 0,
+        'demo_timeout_episodes': 0,
+        'watchdog_timeout_episodes': 0,
+        'exception_episodes': 0,
         'phase_invalid_attempts': 0,
         'phase_invalid_episodes': 0,
+        'aborted_episodes': 0,
         'phase_valid_episodes': 0,
         'config': dict(dataset_metas[0].get('config', {})),
         'launcher': {
@@ -414,11 +492,15 @@ def _merge_dataset_metadata(dataset_metas, merged_output_path, jobs, started_at)
         merged_meta['success_episodes'] += int(meta.get('success_episodes', 0))
         merged_meta['failed_episodes'] += int(meta.get('failed_episodes', 0))
         merged_meta['timeout_episodes'] += int(meta.get('timeout_episodes', 0))
+        merged_meta['demo_timeout_episodes'] += int(meta.get('demo_timeout_episodes', 0))
+        merged_meta['watchdog_timeout_episodes'] += int(meta.get('watchdog_timeout_episodes', 0))
+        merged_meta['exception_episodes'] += int(meta.get('exception_episodes', 0))
         merged_meta['phase_invalid_attempts'] += int(meta.get('phase_invalid_attempts', 0))
         merged_meta['phase_invalid_episodes'] += int(meta.get('phase_invalid_episodes', 0))
+        merged_meta['aborted_episodes'] += int(meta.get('aborted_episodes', 0))
         merged_meta['phase_valid_episodes'] += int(meta.get('phase_valid_episodes', 0))
 
-    merged_meta['tasks'] = sorted(tasks)
+    merged_meta['tasks'] = sorted(merged_task_names) if merged_task_names else sorted(tasks)
     merged_meta['num_tasks'] = len(merged_meta['tasks'])
     return merged_meta
 
@@ -433,6 +515,14 @@ def _merge_shards(merged_output_path, jobs, master_log_path):
         dataset_meta_path = os.path.join(shard_output_path, 'dataset_metadata.json')
         if os.path.exists(dataset_meta_path):
             dataset_metas.append(_load_json(dataset_meta_path))
+        else:
+            snapshot = _read_progress_snapshot(job.get('progress_file'))
+            fallback_meta = _progress_snapshot_to_dataset_meta(
+                snapshot,
+                datetime.fromisoformat(job['started_at']),
+            )
+            if fallback_meta is not None:
+                dataset_metas.append(fallback_meta)
 
         for entry in sorted(os.listdir(shard_output_path)):
             if entry.startswith('.'):
@@ -448,7 +538,13 @@ def _merge_shards(merged_output_path, jobs, master_log_path):
             shutil.move(source_path, destination_path)
             merged_task_names.add(entry)
 
-    merged_meta = _merge_dataset_metadata(dataset_metas, merged_output_path, jobs, datetime.fromisoformat(jobs[0]['started_at']))
+    merged_meta = _merge_dataset_metadata(
+        dataset_metas,
+        merged_output_path,
+        jobs,
+        datetime.fromisoformat(jobs[0]['started_at']),
+        merged_task_names=merged_task_names,
+    )
     if merged_meta is not None:
         _write_json(os.path.join(merged_output_path, 'dataset_metadata.json'), merged_meta)
 
@@ -672,7 +768,8 @@ def main(argv=None):
             last_done = done
         progress_bar.set_postfix({
             'ok': int(aggregate.get('success_episodes', 0)),
-            'timeout': int(aggregate.get('timeout_episodes', 0)),
+            'demo_timeout': int(aggregate.get('demo_timeout_episodes', 0)),
+            'watchdog': int(aggregate.get('watchdog_timeout_episodes', 0)),
             'fail': int(aggregate.get('failed_episodes', 0)),
             'jobs': int(aggregate.get('active_jobs', 0)),
         })
@@ -717,11 +814,9 @@ def main(argv=None):
     progress_bar.refresh()
     progress_bar.close()
 
-    merged_output_path = None
-    if exit_code == 0:
-        merged_output_path = _merge_shards(args.output_path, jobs, master_log_path)
-    else:
-        _append_text(master_log_path, '[Launcher] merge skipped because one or more jobs failed.\n')
+    merged_output_path = _merge_shards(args.output_path, jobs, master_log_path)
+    if exit_code != 0:
+        _append_text(master_log_path, '[Launcher] partial merge completed despite one or more job failures.\n')
 
     _append_job_logs(master_log_path, jobs)
 
@@ -731,7 +826,7 @@ def main(argv=None):
     summary['master_log_path'] = os.path.abspath(master_log_path)
     _append_launcher_summary(master_log_path, summary, aggregate, jobs)
 
-    if exit_code == 0 and not args.keep_workdirs:
+    if not args.keep_workdirs:
         shutil.rmtree(work_root, ignore_errors=True)
 
     print(f'[Info] Launcher log saved to {master_log_path}')
