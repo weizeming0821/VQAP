@@ -46,6 +46,7 @@ from .demo_io import process_demo_in_memory
 from .metadata import (
     save_variation_metadata, save_task_metadata, save_dataset_metadata
 )
+from .resume import inspect_existing_variations
 from .validation import (
     load_fixed_phase_config,
     resolve_fixed_phase_csv_path,
@@ -334,6 +335,12 @@ def update_progress(progress, progress_lock, **deltas):
             progress[k] = int(progress.get(k, 0)) + int(v)
 
 
+def _append_plain_log(log_path, level, message):
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with open(log_path, 'a', encoding='utf-8') as file_obj:
+        file_obj.write(f'[{ts}] [{level}] {message}\n')
+
+
 def _compute_internal_watchdog_timeout(args):
     demo_timeout = int(getattr(args, 'demo_timeout', 0) or 0)
     if demo_timeout <= 0:
@@ -436,6 +443,32 @@ def _register_worker_abort_failures(worker_info, args, progress, progress_lock, 
     if any(progress_deltas.values()):
         update_progress(progress, progress_lock, **progress_deltas)
     return recorded_details
+
+
+def _claim_next_variation(lock, task_index, variation_count, task_names, task_classes,
+                          task_variation_targets, completed_variations):
+    num_tasks = len(task_names)
+    with lock:
+        while task_index.value < num_tasks:
+            current_task_index = int(task_index.value)
+            task_name = task_names[current_task_index]
+            task_class = task_classes[current_task_index]
+            var_target = int(task_variation_targets.get(task_name, 0))
+            completed_for_task = completed_variations.get(task_name, set())
+
+            while int(variation_count.value) < var_target and int(variation_count.value) in completed_for_task:
+                variation_count.value += 1
+
+            if int(variation_count.value) >= var_target:
+                variation_count.value = 0
+                task_index.value += 1
+                continue
+
+            claimed_variation = int(variation_count.value)
+            variation_count.value += 1
+            return task_class, task_name, claimed_variation
+
+    return None
 
 
 def write_progress_snapshot(progress_file, started_at, args, progress, worker_state,
@@ -764,9 +797,9 @@ def create_obs_config(args):
     return obs_config
 
 
-def run_worker(i, lock, task_index, variation_count, results, file_lock, tasks, args,
-               log_path, log_lock, progress, progress_lock, variation_stats, worker_state,
-               fixed_phase_config):
+def run_worker(i, lock, task_index, variation_count, results, file_lock, task_names, task_classes,
+               task_variation_targets, completed_variations, args, log_path, log_lock, progress,
+               progress_lock, variation_stats, worker_state, fixed_phase_config):
     """
     每个进程独立选择一个任务和变体，采集演示数据，立即分割并保存。
     如果分割后的阶段数不符合 fixed_phase_num，则重新采集再分割。
@@ -780,8 +813,6 @@ def run_worker(i, lock, task_index, variation_count, results, file_lock, tasks, 
         worker_seed = (int(base_seed) + int(i) * 100003 + int(os.getpid())) % (2 ** 32 - 1)
         np.random.seed(worker_seed)
         random.seed(worker_seed)
-    num_tasks = len(tasks)
-
     obs_config = create_obs_config(args)
     rlbench_env = Environment(
         action_mode=MoveArmThenGripper(JointVelocity(), Discrete()),
@@ -799,29 +830,22 @@ def run_worker(i, lock, task_index, variation_count, results, file_lock, tasks, 
     signals = set(RUN_SIGNALS) if RUN_SIGNALS else set(ALL_SIGNALS)
 
     while True:
-        with lock:
-            if task_index.value >= num_tasks:
-                append_log(log_path, log_lock, 'INFO', f'process-{i} finished')
-                _set_worker_state(worker_state, i, worker_seed, 'finished', stage='finished')
-                break
+        claimed = _claim_next_variation(
+            lock,
+            task_index,
+            variation_count,
+            task_names,
+            task_classes,
+            task_variation_targets,
+            completed_variations,
+        )
+        if claimed is None:
+            append_log(log_path, log_lock, 'INFO', f'process-{i} finished')
+            _set_worker_state(worker_state, i, worker_seed, 'finished', stage='finished')
+            break
 
-            my_variation_count = variation_count.value
-            t = tasks[task_index.value]
-            task_env = rlbench_env.get_task(t)
-            var_target = get_task_variation_target(task_env, args)
-            if my_variation_count >= var_target:
-                variation_count.value = my_variation_count = 0
-                task_index.value += 1
-
-            variation_count.value += 1
-            if task_index.value >= num_tasks:
-                append_log(log_path, log_lock, 'INFO', f'process-{i} finished')
-                _set_worker_state(worker_state, i, worker_seed, 'finished', stage='finished')
-                break
-            t = tasks[task_index.value]
-
-        task_env = rlbench_env.get_task(t)
-        task_name = task_env.get_name()
+        task_class, task_name, my_variation_count = claimed
+        task_env = rlbench_env.get_task(task_class)
         _set_worker_state(
             worker_state,
             i,
@@ -1191,6 +1215,8 @@ def build_parser():
                         help='保存模式')
     parser.add_argument('--fixed_phase_csv', type=str, default='./TASK_FIXED_PHASE_NUM.csv',
                         help='固定阶段数配置文件路径')
+    parser.add_argument('--resume', action='store_true',
+                        help='启用断点续跑；会跳过已完成的 variation，并重置不完整 variation 后继续')
     parser.add_argument('--base_seed', type=int, default=-1,
                         help='可选，整个采集作业的基础随机种子；每个 worker 会在此基础上派生自己的种子')
     parser.add_argument('--progress_file', type=str, default='',
@@ -1263,34 +1289,59 @@ def run_segmented_collection(args):
                     print(message)
                     f.write(f'[{datetime.now()}] [INFO] {message}\n')
 
-    tasks = [task_file_to_task_class(t) for t in task_files]
+    task_classes = [task_file_to_task_class(t) for t in task_files]
     args.signals = sorted(set(RUN_SIGNALS) if RUN_SIGNALS else set(ALL_SIGNALS))
+
+    check_and_make(args.output_path)
+    estimated_total, task_variation_targets = estimate_total_episodes(task_files, args)
+
+    resume_state = {
+        'completed_variations': {task_name: set() for task_name in task_files},
+        'variation_stats': {},
+        'progress': {
+            'planned_episodes': 0,
+            'done_episodes': 0,
+            'success_episodes': 0,
+            'failed_episodes': 0,
+            'demo_timeout_episodes': 0,
+            'watchdog_timeout_episodes': 0,
+            'exception_episodes': 0,
+            'phase_invalid_episodes': 0,
+            'aborted_episodes': 0,
+        },
+        'reset_variations': [],
+    }
+    if args.resume:
+        resume_state = inspect_existing_variations(
+            args.output_path,
+            task_files,
+            task_variation_targets,
+            args.episodes_per_task,
+            reset_incomplete=True,
+            log_message=lambda message: _append_plain_log(log_file, 'INFO', f'[resume] {message}'),
+        )
+        restored_done = int(resume_state['progress'].get('done_episodes', 0))
+        restored_variations = sum(len(indices) for indices in resume_state['completed_variations'].values())
+        reset_count = len(resume_state.get('reset_variations', []))
+        resume_message = (
+            f'[Resume] restored_variations={restored_variations} '
+            f'restored_episodes={restored_done} reset_incomplete_variations={reset_count}')
+        print(resume_message)
+        _append_plain_log(log_file, 'INFO', resume_message)
 
     manager = Manager()
     result_dict = manager.dict()
     file_lock = manager.Lock()
     log_lock = manager.Lock()
     progress_lock = manager.Lock()
-    progress = manager.dict({
-        'planned_episodes': 0,
-        'done_episodes': 0,
-        'success_episodes': 0,
-        'failed_episodes': 0,
-        'demo_timeout_episodes': 0,
-        'watchdog_timeout_episodes': 0,
-        'exception_episodes': 0,
-        'phase_invalid_episodes': 0,
-        'aborted_episodes': 0,
-    })
-    variation_stats = manager.dict()
+    initial_progress = dict(resume_state['progress'])
+    initial_progress['planned_episodes'] = int(estimated_total)
+    progress = manager.dict(initial_progress)
+    variation_stats = manager.dict(resume_state['variation_stats'])
     worker_state = manager.dict()
     task_index = manager.Value('i', 0)
     variation_count = manager.Value('i', 0)
     lock = manager.Lock()
-
-    check_and_make(args.output_path)
-    estimated_total, task_variation_targets = estimate_total_episodes(task_files, args)
-    progress['planned_episodes'] = int(estimated_total)
     planned_variations = int(sum(task_variation_targets.values()))
     with open(log_file, 'a', encoding='utf-8') as f:
         f.write(
@@ -1312,14 +1363,23 @@ def run_segmented_collection(args):
           f'planned_variations={planned_variations} planned_episodes={estimated_total} '
           f'processes={args.processes} episodes_per_variation={args.episodes_per_task}')
 
+    should_launch_workers = (
+        planned_variations > 0 and int(progress.get('done_episodes', 0)) < int(estimated_total)
+    )
+    if not should_launch_workers:
+        no_work_message = '[Info] No pending variations remain; skip launching collection workers.'
+        print(no_work_message)
+        append_log(log_file, log_lock, 'INFO', no_work_message)
+
     processes = [
         Process(target=run_worker, args=(
             i, lock, task_index, variation_count, result_dict, file_lock,
-            tasks, args, log_file, log_lock, progress, progress_lock,
+            task_files, task_classes, task_variation_targets, resume_state['completed_variations'],
+            args, log_file, log_lock, progress, progress_lock,
             variation_stats, worker_state, fixed_phase_config
         ))
         for i in range(args.processes)
-    ]
+    ] if should_launch_workers else []
     for p in processes:
         p.start()
 

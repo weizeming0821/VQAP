@@ -48,9 +48,52 @@ python scripts/generate_segmented_dataset.py --output_path ./my_output
 # 调整采集参数
 python scripts/generate_segmented_dataset.py --episodes_per_task 5 --variations 10 --processes 8
 
+# 从已有输出目录断点续跑
+python scripts/generate_segmented_dataset.py \
+  --output_path ./my_output \
+  --tasks open_drawer close_drawer \
+  --episodes_per_task 5 \
+  --variations 10 \
+  --resume
+
 # 完整模式（保留完整子轨迹，而非仅关键帧）
 python scripts/generate_segmented_dataset.py --save_mode full
 ```
+
+### 断点续跑 `--resume`
+
+单机模式和多 DISPLAY 模式都支持 `--resume`。恢复粒度是 variation，而不是 episode。
+
+```bash
+# 单机 resume
+python scripts/generate_segmented_dataset.py \
+  --execution_mode single \
+  --output_path ./my_output \
+  --tasks open_drawer \
+  --episodes_per_task 10 \
+  --variations 3 \
+  --resume
+
+# 多 DISPLAY resume
+python scripts/generate_segmented_dataset.py \
+  --execution_mode multi \
+  --output_path ./demos_multi_gpu \
+  --displays :99.0 :99.1 \
+  --processes_per_display 2 2 \
+  --tasks open_drawer close_drawer \
+  --episodes_per_task 10 \
+  --variations 3 \
+  --resume
+```
+
+说明：
+- 已完成的 variation 会通过 `variation_metadata.json` 自动识别，并在 resume 时直接跳过。
+- 未完成的 variation 目录会先删除，再整段重跑，避免重复 episode 编号或 metadata 歧义。
+- 单机模式 resume 直接扫描 `--output_path/task/variationN/`。
+- 多 DISPLAY 模式 resume 会优先复用 `.输出目录名_launcher_work/`，并根据其中已有 shard 数据恢复进度。
+- 多 DISPLAY resume 必须使用和上次中断时相同的 `--output_path`；launcher 会读取 `launcher_state.json` 校验。
+- 如果 interruption 发生在 launcher 运行中，work_root 会被保留，可直接用同一条命令追加 `--resume` 继续。
+- 如果所有 variation 都已经完成，resume 会直接退出，不再启动 RLBench worker。
 
 ### 多 GPU / 多 DISPLAY 分片启动
 
@@ -73,10 +116,11 @@ python scripts/generate_segmented_dataset.py \
 - 每个 DISPLAY 会启动一个独立的 `scripts/generate_segmented_dataset.py --execution_mode single` 子作业。
 - 启动器会在终端显示跨所有 DISPLAY 的总体进度，而不是只打印子作业启动信息。
 - `--output_path` 直接指定最终数据集根目录；例如 `--output_path ./smoke_dataset`，完成后目录结构就是 `smoke_dataset/task/variation...`。
-- 子作业会先写入数据集旁边的固定内部 shard 工作目录 `.输出目录名_launcher_work/`，随后自动合并到 `--output_path` 指定的数据集目录；每次启动会先重建该目录，默认即使部分任务失败也会清理这类中间目录。
+- 子作业会先写入数据集旁边的固定内部 shard 工作目录 `.输出目录名_launcher_work/`，随后自动合并到 `--output_path` 指定的数据集目录；普通启动会先重建该目录，`--resume` 时则会保留并复用其中已有 shard 结果。
 - 启动器最终只保留一份总日志，保存在仓库级 `VQAP/log/` 下，文件名形如 `traj_gen_seg_时间.log`。
 - `--gpu_ids` 主要用于同步约束子进程环境变量；RLBench / PyRep 的渲染绑定仍以 `DISPLAY` 为主。
-- 默认会清理中间 shard 工作目录；若要保留它们用于排查，可加 `--keep_workdirs`。
+- 默认会在成功结束后清理中间 shard 工作目录；若要保留它们用于排查或手动检查 resume 状态，可加 `--keep_workdirs`。
+- launcher work_root 中会包含 `launcher_state.json`、`_resume.log`、`shards/`、`progress/`、`pipeline_logs/` 和 `console_logs/`。
 
 如果你只想运行指定任务，也可以显式传入 `--tasks`：
 
@@ -142,6 +186,7 @@ python validate_segmented_dataset.py ./demos_multi_gpu
 | `--variations` | 5 | 每个任务的变体数 |
 | `--processes` | 8 | 并行进程数 |
 | `--execution_mode` | `auto` | `auto` / `single` / `multi`；默认根据是否传入 `--displays` 自动选择 |
+| `--resume` | 关闭 | 从现有输出目录或 launcher work_root 中断点续跑；完成 variation 会跳过，不完整 variation 会重跑 |
 | `--min_phase_len` | 5 | 相邻关键帧最小帧距 |
 | `--save_mode` | `keyframe_only` | 保存模式 (`full`/`keyframe_only`) |
 | `--fixed_phase_csv` | `./TASK_FIXED_PHASE_NUM.csv` | 固定阶段数配置 |
