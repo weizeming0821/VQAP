@@ -1239,12 +1239,20 @@ def run_segmented_collection(args):
     if args.log_path:
         log_file = os.path.abspath(args.log_path)
         check_and_make(os.path.dirname(log_file))
+        log_mode = 'w'
     else:
         check_and_make('./log')
-        log_file = os.path.join(
-            'log',
-            f'traj_gen_seg_{datetime.now().strftime("%Y%m%d_%H%M%S_%f")}_pid{os.getpid()}.log')
-    with open(log_file, 'w', encoding='utf-8') as f:
+        if args.resume:
+            log_file = os.path.join(
+                'log',
+                f'traj_gen_seg_resume_{datetime.now().strftime("%Y%m%d_%H%M%S_%f")}.log')
+            log_mode = 'w'
+        else:
+            log_file = os.path.join(
+                'log',
+                f'traj_gen_seg_{datetime.now().strftime("%Y%m%d_%H%M%S_%f")}_pid{os.getpid()}.log')
+            log_mode = 'w'
+    with open(log_file, log_mode, encoding='utf-8') as f:
         f.write(f'[{datetime.now()}] [INFO] start segmented collection\n')
         f.write(f'[{datetime.now()}] [INFO] args={vars(args)}\n')
         f.write(f'[{datetime.now()}] [INFO] internal_watchdog_timeout={watchdog_timeout}\n')

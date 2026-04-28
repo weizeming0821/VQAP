@@ -38,7 +38,6 @@ PACKAGE_ROOT = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(PACKAGE_ROOT)
 SEGMENTATION_ENTRY = os.path.join(REPO_ROOT, 'scripts', 'generate_segmented_dataset.py')
 LAUNCHER_STATE_FILE = 'launcher_state.json'
-RESUME_LOG_FILE = '_resume.log'
 RESERVED_FORWARD_ARGS = {
     '--output_path',
     '--base_output_path',
@@ -784,9 +783,11 @@ def main(argv=None):
     progress_root = os.path.join(work_root, 'progress')
     pipeline_log_dir = os.path.join(work_root, 'pipeline_logs')
     console_log_dir = os.path.join(work_root, 'console_logs')
-    resume_log_path = os.path.join(work_root, RESUME_LOG_FILE)
     log_root = os.path.join(REPO_ROOT, 'log')
-    master_log_path = os.path.join(log_root, f'traj_gen_seg_{run_stamp}.log')
+    if args.resume:
+        master_log_path = os.path.join(log_root, f'traj_gen_seg_resume_{run_stamp}.log')
+    else:
+        master_log_path = os.path.join(log_root, f'traj_gen_seg_{run_stamp}.log')
     os.makedirs(shard_root, exist_ok=True)
     os.makedirs(progress_root, exist_ok=True)
     os.makedirs(pipeline_log_dir, exist_ok=True)
@@ -796,7 +797,9 @@ def main(argv=None):
     task_variation_targets = collection.resolve_task_variation_targets(task_names, collection_args)
 
     started_at = datetime.now()
-    with open(master_log_path, 'w', encoding='utf-8') as file_obj:
+    resume_log_path = master_log_path if args.resume else None
+    master_log_mode = 'w'
+    with open(master_log_path, master_log_mode, encoding='utf-8') as file_obj:
         file_obj.write(f'[Launcher] started_at={started_at.isoformat()}\n')
     if args.resume:
         append_timestamped_log(

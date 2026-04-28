@@ -117,10 +117,10 @@ python scripts/generate_segmented_dataset.py \
 - 启动器会在终端显示跨所有 DISPLAY 的总体进度，而不是只打印子作业启动信息。
 - `--output_path` 直接指定最终数据集根目录；例如 `--output_path ./smoke_dataset`，完成后目录结构就是 `smoke_dataset/task/variation...`。
 - 子作业会先写入数据集旁边的固定内部 shard 工作目录 `.输出目录名_launcher_work/`，随后自动合并到 `--output_path` 指定的数据集目录；普通启动会先重建该目录，`--resume` 时则会保留并复用其中已有 shard 结果。
-- 启动器最终只保留一份总日志，保存在仓库级 `VQAP/log/` 下，文件名形如 `traj_gen_seg_时间.log`。
+- 启动器普通运行会在仓库级 `VQAP/log/` 下生成 `traj_gen_seg_时间.log`；`--resume` 时则生成新的 `VQAP/log/traj_gen_seg_resume_时间戳.log`。
 - `--gpu_ids` 主要用于同步约束子进程环境变量；RLBench / PyRep 的渲染绑定仍以 `DISPLAY` 为主。
 - 默认会在成功结束后清理中间 shard 工作目录；若要保留它们用于排查或手动检查 resume 状态，可加 `--keep_workdirs`。
-- launcher work_root 中会包含 `launcher_state.json`、`_resume.log`、`shards/`、`progress/`、`pipeline_logs/` 和 `console_logs/`。
+- launcher work_root 中会包含 `launcher_state.json`、`shards/`、`progress/`、`pipeline_logs/` 和 `console_logs/`；resume 总览日志位于 `VQAP/log/traj_gen_seg_resume_时间戳.log`。
 
 如果你只想运行指定任务，也可以显式传入 `--tasks`：
 
