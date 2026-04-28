@@ -18,8 +18,8 @@ insert_usb_in_computer,InsertUsbInComputer,4
 lamp_off,LampOff,2
 lamp_on,LampOn,2
 lift_numbered_block,LiftNumberedBlock,3
-light_bulb_in,LightBulbIn,5
-light_bulb_out,LightBulbOut,5
+light_bulb_in,LightBulbIn,6
+light_bulb_out,LightBulbOut,6
 meat_off_grill,MeatOffGrill,5
 meat_on_grill,MeatOnGrill,5
 move_hanger,MoveHanger,5
