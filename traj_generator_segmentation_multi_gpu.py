@@ -623,7 +623,9 @@ def main(argv=None):
     os.makedirs(output_parent, exist_ok=True)
 
     run_stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-    work_root = os.path.join(output_parent, f'.{os.path.basename(args.output_path)}_launcher_work_{run_stamp}')
+    work_root = os.path.join(output_parent, f'.{os.path.basename(args.output_path)}_launcher_work')
+    if os.path.exists(work_root):
+        shutil.rmtree(work_root, ignore_errors=True)
     shard_root = os.path.join(work_root, 'shards')
     progress_root = os.path.join(work_root, 'progress')
     pipeline_log_dir = os.path.join(work_root, 'pipeline_logs')
