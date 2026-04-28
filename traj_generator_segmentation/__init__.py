@@ -14,4 +14,5 @@ from .keyframe import extract_keyframes
 from .demo_io import save_subphase_demo_from_memory, save_phase_metadata, process_demo_in_memory
 from .metadata import save_variation_metadata, save_task_metadata
 from .validation import load_fixed_phase_config, validate_phase_count
-from .pipeline import run_segmented_collection, main
+from .collection import run_segmented_collection
+from .cli import main

@@ -10,6 +10,10 @@
 
 ```
 traj_generator_segmentation/
+├── collection.py      # 单机采集与分割实现
+├── launcher.py        # 多 DISPLAY / 多 GPU 分片启动实现
+├── cli.py             # 统一命令行调度
+├── pipeline.py        # 兼容封装
 ├── config.py          # 全局配置常量
 ├── thresholds.py      # 自动阈值估计
 ├── signals.py         # 信号候选帧提取
@@ -17,10 +21,11 @@ traj_generator_segmentation/
 ├── keyframe.py        # 关键帧提取主逻辑
 ├── demo_io.py         # 子阶段保存
 ├── metadata.py        # 元数据管理
-├── validation.py      # 阶段数验证
-└── pipeline.py        # 主流水线
+└── validation.py      # 阶段数验证
 
-traj_generator_segmentation.py  # 入口脚本
+scripts/
+└── generate_segmented_dataset.py  # 唯一直接入口脚本
+
 config/
 └── traj_generator_segmentation.yaml  # 分割与采集配置
 ```
@@ -32,28 +37,28 @@ config/
 
 ```bash
 # 默认配置
-python traj_generator_segmentation.py
+python scripts/generate_segmented_dataset.py
 
 # 指定任务
-python traj_generator_segmentation.py --tasks open_drawer close_drawer
+python scripts/generate_segmented_dataset.py --tasks open_drawer close_drawer
 
 # 指定输出路径
-python traj_generator_segmentation.py --output_path ./my_output
+python scripts/generate_segmented_dataset.py --output_path ./my_output
 
 # 调整采集参数
-python traj_generator_segmentation.py --episodes_per_task 5 --variations 10 --processes 8
+python scripts/generate_segmented_dataset.py --episodes_per_task 5 --variations 10 --processes 8
 
 # 完整模式（保留完整子轨迹，而非仅关键帧）
-python traj_generator_segmentation.py --save_mode full
+python scripts/generate_segmented_dataset.py --save_mode full
 ```
 
 ### 多 GPU / 多 DISPLAY 分片启动
 
-当服务器上可同时使用多个 DISPLAY / GPU 时，建议不要单纯增大单次运行的 `--processes`，而是启动多个独立作业，把任务按 task 维度分片到不同 DISPLAY。仓库提供了独立入口：
+当服务器上可同时使用多个 DISPLAY / GPU 时，建议不要单纯增大单次运行的 `--processes`，而是让统一入口根据 `--displays` 自动切换到 launcher 模式，把任务按 task 维度分片到不同 DISPLAY。
 
 ```bash
 # 例：使用两个 DISPLAY，并为每个 DISPLAY 启动 2 个 worker
-python traj_generator_segmentation_multi_gpu.py \
+python scripts/generate_segmented_dataset.py \
   --output_path ./demos_multi_gpu \
   --displays :99.0 :99.1 \
   --gpu_ids 2 3 \
@@ -65,7 +70,7 @@ python traj_generator_segmentation_multi_gpu.py \
 ```
 
 说明：
-- 每个 DISPLAY 会启动一个独立的 `traj_generator_segmentation.py` 子作业。
+- 每个 DISPLAY 会启动一个独立的 `scripts/generate_segmented_dataset.py --execution_mode single` 子作业。
 - 启动器会在终端显示跨所有 DISPLAY 的总体进度，而不是只打印子作业启动信息。
 - `--output_path` 直接指定最终数据集根目录；例如 `--output_path ./smoke_dataset`，完成后目录结构就是 `smoke_dataset/task/variation...`。
 - 子作业会先写入数据集旁边的固定内部 shard 工作目录 `.输出目录名_launcher_work/`，随后自动合并到 `--output_path` 指定的数据集目录；每次启动会先重建该目录，默认即使部分任务失败也会清理这类中间目录。
@@ -76,7 +81,7 @@ python traj_generator_segmentation_multi_gpu.py \
 如果你只想运行指定任务，也可以显式传入 `--tasks`：
 
 ```bash
-python traj_generator_segmentation_multi_gpu.py \
+python scripts/generate_segmented_dataset.py \
   --output_path ./demos_multi_gpu \
   --displays :99.0 :99.1 \
   --processes_per_display 1 1 \
@@ -103,7 +108,7 @@ python traj_generator_segmentation_benchmark.py \
 
 说明：
 - benchmark 脚本会为每个 worker 配置单独创建一个 run 目录。
-- 每轮 benchmark 会调用 `traj_generator_segmentation_multi_gpu.py` 启动作业。
+- 每轮 benchmark 会调用统一入口脚本，并通过 `--displays` 进入 launcher 模式。
 - 每轮结束后默认会调用 `validate_segmented_dataset.py`，检查 variation / episode 编号与各层 metadata 聚合是否一致。
 - 结果会汇总到 `benchmark_root/benchmark_summary.json`，并输出吞吐排名。
 - 如果只想先看命令矩阵，不真正运行，可加 `--dry_run`。
@@ -136,6 +141,7 @@ python validate_segmented_dataset.py ./demos_multi_gpu
 | `--episodes_per_task` | 2 | 每个变体的 episode 数 |
 | `--variations` | 5 | 每个任务的变体数 |
 | `--processes` | 8 | 并行进程数 |
+| `--execution_mode` | `auto` | `auto` / `single` / `multi`；默认根据是否传入 `--displays` 自动选择 |
 | `--min_phase_len` | 5 | 相邻关键帧最小帧距 |
 | `--save_mode` | `keyframe_only` | 保存模式 (`full`/`keyframe_only`) |
 | `--fixed_phase_csv` | `./TASK_FIXED_PHASE_NUM.csv` | 固定阶段数配置 |

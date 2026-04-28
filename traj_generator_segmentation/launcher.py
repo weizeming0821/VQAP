@@ -1,15 +1,9 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-多 GPU / 多 DISPLAY 分片启动器。
+多 DISPLAY / 多 GPU 启动器实现。
 
-通过启动多个独立的 traj_generator_segmentation.py 子进程，
-将任务按 task 维度均匀分片到不同 DISPLAY 上运行。
-
-设计目标：
-1. 不改现有 segmented pipeline 的核心采集逻辑。
-2. 避免多个独立作业写同一个 output_path 产生 metadata 冲突。
-3. 允许每个 DISPLAY 单独设置 worker 数。
+该模块承载任务分片、子作业拉起、跨 shard 进度聚合、
+部分失败后的合并与 launcher 汇总日志逻辑。
 """
 
 import argparse
@@ -25,15 +19,16 @@ from datetime import datetime
 import rlbench.backend.task as task
 from tqdm import tqdm
 
-from traj_generator_segmentation.validation import (
+from .validation import (
     load_fixed_phase_config,
     resolve_fixed_phase_csv_path,
     split_tasks_by_fixed_phase_config,
 )
 
 
-REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
-SEGMENTATION_ENTRY = os.path.join(REPO_ROOT, 'traj_generator_segmentation.py')
+PACKAGE_ROOT = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(PACKAGE_ROOT)
+SEGMENTATION_ENTRY = os.path.join(REPO_ROOT, 'scripts', 'generate_segmented_dataset.py')
 RESERVED_FORWARD_ARGS = {
     '--output_path',
     '--base_output_path',
@@ -43,6 +38,7 @@ RESERVED_FORWARD_ARGS = {
     '--base_seed',
     '--progress_file',
     '--log_path',
+    '--execution_mode',
 }
 
 
@@ -358,6 +354,7 @@ def _build_child_command(python_executable, output_path, fixed_phase_csv,
     command = [
         python_executable,
         SEGMENTATION_ENTRY,
+        '--execution_mode', 'single',
         '--output_path', output_path,
         '--fixed_phase_csv', fixed_phase_csv,
         '--processes', str(processes),
@@ -559,9 +556,9 @@ def _merge_shards(merged_output_path, jobs, master_log_path):
     return merged_output_path
 
 
-def _parse_args(argv=None):
+def build_parser():
     parser = argparse.ArgumentParser(
-        description='按多 DISPLAY / 多 GPU 分片启动 traj_generator_segmentation.py')
+        description='按多 DISPLAY / 多 GPU 分片启动统一数据生成脚本')
     parser.add_argument('--output_path', type=str, default='',
                         help='最终合并后的数据集输出目录；例如 ./smoke_dataset')
     parser.add_argument('--base_output_path', type=str, default='',
@@ -586,11 +583,15 @@ def _parse_args(argv=None):
                         help='启动子作业时使用的 Python 可执行文件')
     parser.add_argument('--dry_run', action='store_true',
                         help='只打印分片与命令，不真正启动子作业')
-    return parser.parse_known_args(argv)
+    return parser
+
+
+def parse_args(argv=None):
+    return build_parser().parse_known_args(argv)
 
 
 def main(argv=None):
-    args, passthrough_args = _parse_args(argv)
+    args, passthrough_args = parse_args(argv)
 
     args.output_path = args.output_path or args.base_output_path
     if not args.output_path:
