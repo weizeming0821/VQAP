@@ -6,4 +6,4 @@ log
 *.zip
 RLBench/
 test*
-Action_Primitive_Dataset_v0/
+*Dataset*/
