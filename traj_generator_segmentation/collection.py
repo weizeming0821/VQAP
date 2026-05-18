@@ -44,9 +44,14 @@ from .config import (
 from .signals import ALL_SIGNALS
 from .demo_io import process_demo_in_memory
 from .metadata import (
-    save_variation_metadata, save_task_metadata, save_dataset_metadata
+    save_variation_metadata, save_task_metadata, save_dataset_metadata,
+    save_dataset_metadata_from_disk,
 )
-from .resume import inspect_existing_variations
+from .resume import (
+    inspect_existing_variations,
+    inspect_existing_variations_for_complete,
+    load_existing_variation_payload,
+)
 from .validation import (
     load_fixed_phase_config,
     resolve_fixed_phase_csv_path,
@@ -231,6 +236,14 @@ def _record_variation_success(variation_stats, var_key, task_name, variation_ind
     if phase_valid:
         current['phase_valid_demos'] = int(current.get('phase_valid_demos', 0)) + 1
     _store_variation_stats(variation_stats, var_key, current)
+
+
+def _next_free_episode_index(used_episode_indices, start_index=0):
+    candidate = max(0, int(start_index))
+    used_indices = {int(index) for index in used_episode_indices if int(index) >= 0}
+    while candidate in used_indices:
+        candidate += 1
+    return candidate
 
 
 def _record_variation_failure(variation_stats, var_key, task_name, variation_index, planned_demos,
@@ -797,6 +810,143 @@ def create_obs_config(args):
     return obs_config
 
 
+def _create_rlbench_env(args):
+    obs_config = create_obs_config(args)
+    rlbench_env = Environment(
+        action_mode=MoveArmThenGripper(JointVelocity(), Discrete()),
+        obs_config=obs_config,
+        arm_max_velocity=args.arm_max_velocity,
+        arm_max_acceleration=args.arm_max_acceleration,
+        headless=True)
+    rlbench_env.launch()
+    return rlbench_env
+
+
+def _shutdown_rlbench_env(rlbench_env):
+    if rlbench_env is None:
+        return
+    with contextlib.suppress(Exception):
+        rlbench_env.shutdown()
+
+
+def _restart_rlbench_env(rlbench_env, args, log_path, log_lock, worker_index, reason):
+    _shutdown_rlbench_env(rlbench_env)
+    append_log(log_path, log_lock, 'INFO',
+               f'process-{worker_index} restarting RLBench environment: {reason}')
+    return _create_rlbench_env(args)
+
+
+def _prepare_task_environment(rlbench_env, args, task_class, task_name, variation_index,
+                              worker_state, worker_index, worker_seed,
+                              log_path, log_lock, env_factory=None,
+                              max_recovery_attempts=2):
+    if env_factory is None:
+        env_factory = _create_rlbench_env
+
+    last_error = None
+    total_attempts = int(max_recovery_attempts) + 1
+    for attempt_index in range(total_attempts):
+        try:
+            if rlbench_env is None:
+                rlbench_env = env_factory(args)
+            _set_worker_state(
+                worker_state,
+                worker_index,
+                worker_seed,
+                'running',
+                task_name=task_name,
+                variation_index=variation_index,
+                demo_index=-1,
+                stage='variation_setup',
+                recovery_attempt=attempt_index,
+            )
+            task_env = rlbench_env.get_task(task_class)
+            _set_worker_state(
+                worker_state,
+                worker_index,
+                worker_seed,
+                'running',
+                task_name=task_name,
+                variation_index=variation_index,
+                demo_index=-1,
+                stage='variation_reset',
+                recovery_attempt=attempt_index,
+            )
+            task_env.set_variation(variation_index)
+            descriptions, _ = task_env.reset()
+            return rlbench_env, task_env, descriptions
+        except Exception as exc:
+            last_error = exc
+            level = 'WARN' if attempt_index < total_attempts - 1 else 'ERROR'
+            append_log(
+                log_path,
+                log_lock,
+                level,
+                f'process-{worker_index} failed preparing task={task_name} '
+                f'variation={variation_index} attempt={attempt_index + 1}/{total_attempts}: {exc}',
+            )
+            _shutdown_rlbench_env(rlbench_env)
+            rlbench_env = None
+
+    raise RuntimeError(
+        f'Failed to prepare task={task_name} variation={variation_index} '
+        f'after {total_attempts} attempt(s)'
+    ) from last_error
+
+
+def _count_accounted_variations(variation_stats):
+    accounted_variations = 0
+    for stat in variation_stats.values():
+        planned_demos = int(stat.get('planned_demos', 0))
+        success_demos = int(stat.get('success_demos', 0))
+        failed_demos = int(stat.get('failed_demos', 0))
+        if planned_demos > 0 and (success_demos + failed_demos) >= planned_demos:
+            accounted_variations += 1
+    return accounted_variations
+
+
+def _collection_completion_status(progress, variation_stats, planned_variations, planned_episodes):
+    accounted_episodes = int(progress.get('done_episodes', 0))
+    accounted_variations = _count_accounted_variations(variation_stats)
+    planned_variations = int(planned_variations)
+    planned_episodes = int(planned_episodes)
+    missing_variations = max(0, planned_variations - accounted_variations)
+    missing_episodes = max(0, planned_episodes - accounted_episodes)
+    return {
+        'complete': missing_variations == 0 and missing_episodes == 0,
+        'planned_variations': planned_variations,
+        'accounted_variations': accounted_variations,
+        'missing_variations': missing_variations,
+        'planned_episodes': planned_episodes,
+        'accounted_episodes': accounted_episodes,
+        'missing_episodes': missing_episodes,
+    }
+
+
+def _load_complete_variation_state(variation_path, log_path, log_lock):
+    payload = load_existing_variation_payload(variation_path)
+    recoverable_episodes = len(payload.get('episode_stats', []))
+    if recoverable_episodes <= 0 and os.path.isdir(variation_path):
+        stale_entries = [entry for entry in os.listdir(variation_path) if entry != 'variation_metadata.json']
+        if stale_entries:
+            append_log(
+                log_path,
+                log_lock,
+                'WARN',
+                f'complete mode reset unrecoverable variation path={variation_path} '
+                f'stale_entries={len(stale_entries)}',
+            )
+            _remove_tree_if_exists(variation_path)
+            check_and_make(variation_path)
+            payload = {
+                'metadata': {},
+                'descriptions': [],
+                'episode_stats': [],
+                'next_episode_index': 0,
+            }
+    return payload
+
+
 def run_worker(i, lock, task_index, variation_count, results, file_lock, task_names, task_classes,
                task_variation_targets, completed_variations, args, log_path, log_lock, progress,
                progress_lock, variation_stats, worker_state, fixed_phase_config):
@@ -813,14 +963,7 @@ def run_worker(i, lock, task_index, variation_count, results, file_lock, task_na
         worker_seed = (int(base_seed) + int(i) * 100003 + int(os.getpid())) % (2 ** 32 - 1)
         np.random.seed(worker_seed)
         random.seed(worker_seed)
-    obs_config = create_obs_config(args)
-    rlbench_env = Environment(
-        action_mode=MoveArmThenGripper(JointVelocity(), Discrete()),
-        obs_config=obs_config,
-        arm_max_velocity=args.arm_max_velocity,
-        arm_max_acceleration=args.arm_max_acceleration,
-        headless=True)
-    rlbench_env.launch()
+    rlbench_env = _create_rlbench_env(args)
 
     task_env = None
     tasks_with_problems = results[i] = ''
@@ -845,17 +988,6 @@ def run_worker(i, lock, task_index, variation_count, results, file_lock, task_na
             break
 
         task_class, task_name, my_variation_count = claimed
-        task_env = rlbench_env.get_task(task_class)
-        _set_worker_state(
-            worker_state,
-            i,
-            worker_seed,
-            'running',
-            task_name=task_name,
-            variation_index=my_variation_count,
-            demo_index=-1,
-            stage='variation_setup',
-        )
 
         expected_phase_num = fixed_phase_config.get(task_name, None)
 
@@ -872,18 +1004,51 @@ def run_worker(i, lock, task_index, variation_count, results, file_lock, task_na
             ),
         )
 
-        _set_worker_state(
-            worker_state,
-            i,
-            worker_seed,
-            'running',
-            task_name=task_name,
-            variation_index=my_variation_count,
-            demo_index=-1,
-            stage='variation_reset',
-        )
-        task_env.set_variation(my_variation_count)
-        descriptions, _ = task_env.reset()
+        try:
+            rlbench_env, task_env, descriptions = _prepare_task_environment(
+                rlbench_env,
+                args,
+                task_class,
+                task_name,
+                my_variation_count,
+                worker_state,
+                i,
+                worker_seed,
+                log_path,
+                log_lock,
+            )
+        except Exception as exc:
+            problem = (
+                f'Process {i} failed preparing task {task_name} '
+                f'(variation: {my_variation_count}): {exc}'
+            )
+            tasks_with_problems += problem + '\n'
+            append_log(log_path, log_lock, 'ERROR', problem)
+            _register_worker_abort_failures(
+                {
+                    'task_name': task_name,
+                    'variation_index': my_variation_count,
+                    'demo_index': -1,
+                    'stage': 'variation_setup',
+                },
+                args,
+                progress,
+                progress_lock,
+                variation_stats,
+                'worker_crash',
+                f'task environment recovery exhausted: {exc}',
+                stage='variation_setup',
+            )
+            rlbench_env = _restart_rlbench_env(
+                rlbench_env,
+                args,
+                log_path,
+                log_lock,
+                i,
+                'variation preparation failure',
+            )
+            _set_worker_state(worker_state, i, worker_seed, 'idle', demo_index=-1, stage='idle')
+            continue
 
         variation_path = os.path.join(
             args.output_path, task_name,
@@ -896,13 +1061,32 @@ def run_worker(i, lock, task_index, variation_count, results, file_lock, task_na
         append_log(log_path, log_lock, 'INFO',
                    f'process-{i} start task={task_name} variation={my_variation_count}')
 
-        episode_stats = []
+        existing_payload = {
+            'episode_stats': [],
+            'next_episode_index': 0,
+        }
+        if args.complete:
+            existing_payload = _load_complete_variation_state(variation_path, log_path, log_lock)
+            episodes_path = os.path.join(variation_path, EPISODES_FOLDER)
+            check_and_make(episodes_path)
+
+        episode_stats = [dict(stat) for stat in existing_payload.get('episode_stats', [])]
+        used_saved_episode_indices = {
+            int(stat.get('episode', -1))
+            for stat in episode_stats
+            if int(stat.get('episode', -1)) >= 0
+        }
+        next_saved_episode_index = _next_free_episode_index(
+            used_saved_episode_indices,
+            existing_payload.get('next_episode_index', len(episode_stats)),
+        )
+        start_episode_index = len(episode_stats)
         phase_invalid_attempt_count = 0
 
         if args.debug:
             print(f'[DEBUG] process-{i} entering episode loop, episodes_per_task={args.episodes_per_task}', flush=True)
 
-        for ex_idx in range(args.episodes_per_task):
+        for ex_idx in range(start_episode_index, args.episodes_per_task):
             if _has_terminal_failure(dict(variation_stats.get(var_key, {})), ex_idx):
                 continue
 
@@ -1007,7 +1191,10 @@ def run_worker(i, lock, task_index, variation_count, results, file_lock, task_na
                         break
 
                 if demo is not None:
-                    saved_episode_index = len(episode_stats)
+                    saved_episode_index = _next_free_episode_index(
+                        used_saved_episode_indices,
+                        next_saved_episode_index,
+                    )
                     episode_path = os.path.join(episodes_path, EPISODE_FOLDER % saved_episode_index)
                     _set_worker_state(
                         worker_state,
@@ -1068,6 +1255,11 @@ def run_worker(i, lock, task_index, variation_count, results, file_lock, task_na
                         'phase_valid': valid,
                         'phases': phase_info,
                     })
+                    used_saved_episode_indices.add(int(saved_episode_index))
+                    next_saved_episode_index = _next_free_episode_index(
+                        used_saved_episode_indices,
+                        saved_episode_index + 1,
+                    )
 
                     if RUN_SHOW_SEG_TRACE:
                         phases_str = ' | '.join(
@@ -1181,7 +1373,7 @@ def run_worker(i, lock, task_index, variation_count, results, file_lock, task_na
     results[i] = tasks_with_problems
     append_log(log_path, log_lock, 'INFO', f'process-{i} shutdown env')
     _set_worker_state(worker_state, i, worker_seed, 'shutdown', stage='shutdown')
-    rlbench_env.shutdown()
+    _shutdown_rlbench_env(rlbench_env)
 
 
 def build_parser():
@@ -1217,12 +1409,16 @@ def build_parser():
                         help='固定阶段数配置文件路径')
     parser.add_argument('--resume', action='store_true',
                         help='启用断点续跑；会跳过已完成的 variation，并重置不完整 variation 后继续')
+    parser.add_argument('--complete', action='store_true',
+                        help='在现有数据集上补齐缺失的 episode / variation，并沿用已有 episode 索引追加生成')
     parser.add_argument('--base_seed', type=int, default=-1,
                         help='可选，整个采集作业的基础随机种子；每个 worker 会在此基础上派生自己的种子')
     parser.add_argument('--progress_file', type=str, default='',
                         help='可选，若提供则持续写入 JSON 进度快照，供外部 launcher 聚合显示')
     parser.add_argument('--log_path', type=str, default='',
                         help='可选，若提供则将本次运行日志写到指定路径，而不是默认 log 目录')
+    parser.add_argument('--skip_dataset_metadata', action='store_true',
+                        help=argparse.SUPPRESS)
     parser.add_argument('--debug', action='store_true',
                         help='开启调试模式')
     return parser
@@ -1242,7 +1438,12 @@ def run_segmented_collection(args):
         log_mode = 'w'
     else:
         check_and_make('./log')
-        if args.resume:
+        if args.complete:
+            log_file = os.path.join(
+                'log',
+                f'traj_gen_seg_complete_{datetime.now().strftime("%Y%m%d_%H%M%S_%f")}.log')
+            log_mode = 'w'
+        elif args.resume:
             log_file = os.path.join(
                 'log',
                 f'traj_gen_seg_resume_{datetime.now().strftime("%Y%m%d_%H%M%S_%f")}.log')
@@ -1319,7 +1520,26 @@ def run_segmented_collection(args):
         },
         'reset_variations': [],
     }
-    if args.resume:
+    if args.complete:
+        resume_state = inspect_existing_variations_for_complete(
+            args.output_path,
+            task_files,
+            task_variation_targets,
+            args.episodes_per_task,
+            log_message=lambda message: _append_plain_log(log_file, 'INFO', f'[complete] {message}'),
+        )
+        restored_done = int(resume_state['progress'].get('done_episodes', 0))
+        restored_variations = sum(len(indices) for indices in resume_state['completed_variations'].values())
+        pending_variations = max(0, planned_variations - restored_variations) if 'planned_variations' in locals() else None
+        complete_message = (
+            f'[Complete] restored_variations={restored_variations} '
+            f'restored_episodes={restored_done} '
+            f'pending_variations={max(0, int(sum(task_variation_targets.values())) - restored_variations)} '
+            f'pending_episodes={max(0, int(estimated_total) - restored_done)}'
+        )
+        print(complete_message)
+        _append_plain_log(log_file, 'INFO', complete_message)
+    elif args.resume:
         resume_state = inspect_existing_variations(
             args.output_path,
             task_files,
@@ -1512,9 +1732,9 @@ def run_segmented_collection(args):
     final_done = int(progress.get('done_episodes', 0))
     if final_done > last_done:
         bar.update(final_done - last_done)
-    if bar.total is not None and bar.total != final_done:
-        bar.total = final_done
-        bar.refresh()
+    if bar.total is None and estimated_total > 0:
+        bar.total = estimated_total
+    bar.refresh()
     bar.close()
 
     print('\nData collection & segmentation done!')
@@ -1538,15 +1758,43 @@ def run_segmented_collection(args):
 
     progress_snapshot = dict(progress)
     variation_stats_snapshot = dict(variation_stats)
-    save_dataset_metadata(
-        args.output_path,
-        started_at,
-        finished_at,
-        args,
-        task_names,
+    completion_status = _collection_completion_status(
         progress_snapshot,
         variation_stats_snapshot,
+        planned_variations,
+        estimated_total,
     )
+    if not completion_status['complete']:
+        append_log(
+            log_file,
+            log_lock,
+            'ERROR',
+            'Collection ended before all planned work was accounted for: '
+            f'accounted_episodes={completion_status["accounted_episodes"]}/'
+            f'{completion_status["planned_episodes"]} '
+            f'accounted_variations={completion_status["accounted_variations"]}/'
+            f'{completion_status["planned_variations"]} '
+            f'missing_episodes={completion_status["missing_episodes"]} '
+            f'missing_variations={completion_status["missing_variations"]}',
+        )
+    if not args.skip_dataset_metadata:
+        if args.complete:
+            save_dataset_metadata_from_disk(
+                args.output_path,
+                started_at,
+                finished_at,
+                args,
+            )
+        else:
+            save_dataset_metadata(
+                args.output_path,
+                started_at,
+                finished_at,
+                args,
+                task_names,
+                progress_snapshot,
+                variation_stats_snapshot,
+            )
 
     summary_lines, detail_lines = summarize_collection(
         task_files,
@@ -1572,6 +1820,15 @@ def run_segmented_collection(args):
         log_file=log_file,
     )
     print(f'[Info] Log saved: {log_file}')
+
+    if not completion_status['complete']:
+        raise RuntimeError(
+            'Collection ended incomplete: '
+            f'accounted_episodes={completion_status["accounted_episodes"]}/'
+            f'{completion_status["planned_episodes"]}, '
+            f'accounted_variations={completion_status["accounted_variations"]}/'
+            f'{completion_status["planned_variations"]}'
+        )
 
     if crashed_workers:
         raise RuntimeError(

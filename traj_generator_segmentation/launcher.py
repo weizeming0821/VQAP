@@ -20,10 +20,11 @@ import rlbench.backend.task as task
 from tqdm import tqdm
 
 from . import collection
-from .metadata import save_task_metadata
+from .metadata import save_dataset_metadata_from_disk, save_task_metadata
 from .resume import (
     append_timestamped_log,
     inspect_existing_variations,
+    inspect_existing_variations_for_complete,
     load_json_if_exists,
     merge_task_directory_contents,
 )
@@ -49,6 +50,8 @@ RESERVED_FORWARD_ARGS = {
     '--log_path',
     '--execution_mode',
     '--resume',
+    '--complete',
+    '--skip_dataset_metadata',
 }
 
 
@@ -72,6 +75,7 @@ def _build_launcher_state(args, resolved_csv_path, jobs, work_root, started_at, 
         'started_at': started_at.isoformat(),
         'output_path': os.path.abspath(args.output_path),
         'work_root': os.path.abspath(work_root),
+        'complete': bool(args.complete),
         'fixed_phase_csv': resolved_csv_path,
         'fixed_phase_only': bool(args.fixed_phase_only),
         'tasks': [task_name for job in jobs for task_name in job['tasks']],
@@ -386,7 +390,8 @@ def _extract_conflicting_passthrough_args(passthrough):
 
 def _build_child_command(python_executable, output_path, fixed_phase_csv,
                          task_names, processes, passthrough_args,
-                         base_seed, progress_file, log_path, resume=False):
+                         base_seed, progress_file, log_path, resume=False,
+                         complete=False, skip_dataset_metadata=False):
     command = [
         python_executable,
         SEGMENTATION_ENTRY,
@@ -402,6 +407,10 @@ def _build_child_command(python_executable, output_path, fixed_phase_csv,
     ]
     if resume:
         command.append('--resume')
+    if complete:
+        command.append('--complete')
+    if skip_dataset_metadata:
+        command.append('--skip_dataset_metadata')
     command.extend(passthrough_args)
     return command
 
@@ -413,6 +422,44 @@ def _read_progress_snapshot(progress_file):
         return _load_json(progress_file)
     except Exception:
         return None
+
+
+def _count_accounted_variations(variation_stats):
+    accounted_variations = 0
+    for stat in variation_stats.values():
+        planned_demos = int(stat.get('planned_demos', 0))
+        success_demos = int(stat.get('success_demos', 0))
+        failed_demos = int(stat.get('failed_demos', 0))
+        if planned_demos > 0 and (success_demos + failed_demos) >= planned_demos:
+            accounted_variations += 1
+    return accounted_variations
+
+
+def _snapshot_completion_status(snapshot, task_names, task_variation_targets, episodes_per_task):
+    planned_variations = sum(int(task_variation_targets.get(task_name, 0)) for task_name in task_names)
+    planned_episodes = int(planned_variations * int(episodes_per_task))
+    if not snapshot:
+        return {
+            'complete': False,
+            'planned_variations': planned_variations,
+            'accounted_variations': 0,
+            'planned_episodes': planned_episodes,
+            'accounted_episodes': 0,
+        }
+
+    progress = snapshot.get('progress', {})
+    variation_stats = snapshot.get('variation_stats', {})
+    accounted_episodes = int(progress.get('done_episodes', 0))
+    accounted_variations = _count_accounted_variations(variation_stats)
+    return {
+        'complete': bool(snapshot.get('finished', False))
+        and accounted_episodes >= planned_episodes
+        and accounted_variations >= planned_variations,
+        'planned_variations': planned_variations,
+        'accounted_variations': accounted_variations,
+        'planned_episodes': planned_episodes,
+        'accounted_episodes': accounted_episodes,
+    }
 
 
 def _aggregate_progress(jobs):
@@ -650,7 +697,7 @@ def _consolidate_resume_shards(shard_root, jobs, resume_log_path):
             )
 
 
-def _summarize_resume_progress(jobs, task_variation_targets, episodes_per_task):
+def _summarize_resume_progress(jobs, task_variation_targets, episodes_per_task, complete=False):
     completed_variations = 0
     completed_episodes = 0
     total_variations = 0
@@ -658,13 +705,21 @@ def _summarize_resume_progress(jobs, task_variation_targets, episodes_per_task):
 
     for job in jobs:
         task_targets = {task_name: int(task_variation_targets.get(task_name, 0)) for task_name in job['tasks']}
-        scan = inspect_existing_variations(
-            job['output_path'],
-            job['tasks'],
-            task_targets,
-            episodes_per_task,
-            reset_incomplete=False,
-        )
+        if complete:
+            scan = inspect_existing_variations_for_complete(
+                job['output_path'],
+                job['tasks'],
+                task_targets,
+                episodes_per_task,
+            )
+        else:
+            scan = inspect_existing_variations(
+                job['output_path'],
+                job['tasks'],
+                task_targets,
+                episodes_per_task,
+                reset_incomplete=False,
+            )
         job['resume_scan'] = scan
         job_completed_variations = sum(len(indices) for indices in scan['completed_variations'].values())
         job_total_variations = sum(task_targets.values())
@@ -712,6 +767,8 @@ def build_parser():
                         help='若不显式提供 tasks，则只运行 TASK_FIXED_PHASE_NUM.csv 中的任务')
     parser.add_argument('--resume', action='store_true',
                         help='启用断点续跑；保留 launcher work_root，并从其中已有 shard 数据继续执行')
+    parser.add_argument('--complete', action='store_true',
+                        help='在已有数据集 output_path 上补齐缺失的 episode / variation；可与 --resume 组合使用')
     parser.add_argument('--seed_base', type=int, default=-1,
                         help='可选，launcher 层基础随机种子；每个作业会从这里派生自己的 base_seed')
     parser.add_argument('--keep_workdirs', action='store_true',
@@ -777,6 +834,12 @@ def main(argv=None):
             raise ValueError(
                 'Resume output_path mismatch: '
                 f'previous={previous_output_path} current={args.output_path}')
+        previous_complete = bool(previous_state.get('complete', False))
+        if previous_complete != bool(args.complete):
+            raise ValueError(
+                'Resume mode mismatch: '
+                f'previous_complete={previous_complete} current_complete={bool(args.complete)}'
+            )
     elif os.path.exists(work_root):
         shutil.rmtree(work_root, ignore_errors=True)
     shard_root = os.path.join(work_root, 'shards')
@@ -784,7 +847,9 @@ def main(argv=None):
     pipeline_log_dir = os.path.join(work_root, 'pipeline_logs')
     console_log_dir = os.path.join(work_root, 'console_logs')
     log_root = os.path.join(REPO_ROOT, 'log')
-    if args.resume:
+    if args.complete:
+        master_log_path = os.path.join(log_root, f'traj_gen_seg_complete_{run_stamp}.log')
+    elif args.resume:
         master_log_path = os.path.join(log_root, f'traj_gen_seg_resume_{run_stamp}.log')
     else:
         master_log_path = os.path.join(log_root, f'traj_gen_seg_{run_stamp}.log')
@@ -815,7 +880,8 @@ def main(argv=None):
 
         shard_name = f'shard_{index:02d}_{_sanitize_display(display)}'
         shard_output_path = os.path.join(shard_root, shard_name)
-        os.makedirs(shard_output_path, exist_ok=True)
+        if not args.complete:
+            os.makedirs(shard_output_path, exist_ok=True)
 
         child_log_path = os.path.join(console_log_dir, f'{shard_name}.log')
         pipeline_log_path = os.path.join(pipeline_log_dir, f'{shard_name}.log')
@@ -823,7 +889,7 @@ def main(argv=None):
         child_seed = seed_base + index * 1_000_003
         command = _build_child_command(
             python_executable=args.python_executable,
-            output_path=shard_output_path,
+            output_path=args.output_path if args.complete else shard_output_path,
             fixed_phase_csv=resolved_csv_path,
             task_names=shard_tasks,
             processes=processes_per_display[index],
@@ -832,6 +898,8 @@ def main(argv=None):
             progress_file=progress_file,
             log_path=pipeline_log_path,
             resume=args.resume,
+            complete=args.complete,
+            skip_dataset_metadata=args.complete,
         )
         jobs.append({
             'job_index': index,
@@ -840,7 +908,7 @@ def main(argv=None):
             'cuda_visible_devices': gpu_ids[index],
             'processes': int(processes_per_display[index]),
             'tasks': shard_tasks,
-            'output_path': shard_output_path,
+            'output_path': args.output_path if args.complete else shard_output_path,
             'console_log_path': child_log_path,
             'traj_gen_seg_log_path': pipeline_log_path,
             'log_path': child_log_path,
@@ -868,6 +936,7 @@ def main(argv=None):
         'fixed_phase_csv': resolved_csv_path,
         'fixed_phase_only': bool(args.fixed_phase_only),
         'resume': bool(args.resume),
+        'complete': bool(args.complete),
         'seed_base': seed_base,
         'work_root': os.path.abspath(work_root),
         'jobs': [],
@@ -878,15 +947,18 @@ def main(argv=None):
         _build_launcher_state(args, resolved_csv_path, jobs, work_root, started_at, collection_args),
     )
 
-    if args.resume:
+    if args.resume and not args.complete:
         _consolidate_resume_shards(shard_root, jobs, resume_log_path)
+    if args.resume:
         resume_summary = _summarize_resume_progress(
             jobs,
             task_variation_targets,
             int(collection_args.episodes_per_task),
+            complete=args.complete,
         )
+        resume_prefix = '[Complete]' if args.complete else '[Resume]'
         resume_message = (
-            '[Resume] '
+            f'{resume_prefix} '
             f'total_variations={resume_summary["total_variations"]} '
             f'completed_variations={resume_summary["completed_variations"]} '
             f'pending_variations={resume_summary["pending_variations"]} '
@@ -981,9 +1053,29 @@ def main(argv=None):
         for job, process, log_file in processes:
             returncode = process.wait()
             log_file.close()
+            snapshot = _read_progress_snapshot(job.get('progress_file'))
+            job['progress_snapshot'] = snapshot
+            completion_status = _snapshot_completion_status(
+                snapshot,
+                job['tasks'],
+                task_variation_targets,
+                int(collection_args.episodes_per_task),
+            )
             status = 'completed' if returncode == 0 else 'failed'
             if returncode != 0:
                 exit_code = returncode
+            elif not completion_status['complete']:
+                status = 'failed'
+                exit_code = exit_code or 1
+                incomplete_message = (
+                    f'[Launcher] job={job["job_index"]} returned 0 but shard progress is incomplete: '
+                    f'accounted_episodes={completion_status["accounted_episodes"]}/'
+                    f'{completion_status["planned_episodes"]} '
+                    f'accounted_variations={completion_status["accounted_variations"]}/'
+                    f'{completion_status["planned_variations"]}'
+                )
+                print(incomplete_message)
+                _append_text(master_log_path, incomplete_message + '\n')
             print(
                 f'[Done] job={job["job_index"]} display={job["display"]} '
                 f'returncode={returncode}')
@@ -1025,9 +1117,36 @@ def main(argv=None):
     progress_bar.close()
 
     fixed_phase_config = load_fixed_phase_config(resolved_csv_path, warn_if_missing=False)
-    merged_output_path = _merge_shards(args.output_path, jobs, master_log_path, fixed_phase_config=fixed_phase_config)
-    if exit_code != 0:
-        _append_text(master_log_path, '[Launcher] partial merge completed despite one or more job failures.\n')
+    if args.complete:
+        merged_output_path = args.output_path
+        for task_name in sorted(task_names):
+            task_path = os.path.join(args.output_path, task_name)
+            if os.path.isdir(task_path):
+                save_task_metadata(
+                    task_path,
+                    task_name,
+                    fixed_phase_num=fixed_phase_config.get(task_name),
+                )
+        collection_args.fixed_phase_csv = resolved_csv_path
+        save_dataset_metadata_from_disk(
+            args.output_path,
+            started_at,
+            datetime.now(),
+            collection_args,
+            extra_metadata={
+                'launcher': {
+                    'displays': [job['display'] for job in jobs],
+                    'gpu_ids': [job['cuda_visible_devices'] for job in jobs],
+                    'processes_per_display': [job['processes'] for job in jobs],
+                    'seed_base': seed_base,
+                },
+            },
+        )
+        _append_text(master_log_path, f'[Complete] refreshed dataset metadata under {args.output_path}\n')
+    else:
+        merged_output_path = _merge_shards(args.output_path, jobs, master_log_path, fixed_phase_config=fixed_phase_config)
+        if exit_code != 0:
+            _append_text(master_log_path, '[Launcher] partial merge completed despite one or more job failures.\n')
 
     _append_job_logs(master_log_path, jobs)
 

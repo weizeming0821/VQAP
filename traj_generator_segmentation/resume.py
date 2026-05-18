@@ -28,6 +28,115 @@ def load_json_if_exists(path):
         return None
 
 
+def _parse_episode_index(value):
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.startswith('episode'):
+        text = text[len('episode'):]
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _next_available_episode_index(used_episode_indices):
+    candidate = 0
+    used_indices = {int(index) for index in used_episode_indices if int(index) >= 0}
+    while candidate in used_indices:
+        candidate += 1
+    return candidate
+
+
+def _load_phase_metadata(variation_path, relative_phase_path, episode_index):
+    candidate_paths = []
+    if relative_phase_path:
+        candidate_paths.append(os.path.join(variation_path, relative_phase_path))
+    if episode_index is not None:
+        candidate_paths.append(
+            os.path.join(variation_path, 'episodes', f'episode{int(episode_index)}', 'phase_metadata.json')
+        )
+    for candidate_path in candidate_paths:
+        metadata = load_json_if_exists(candidate_path)
+        if metadata is not None:
+            return metadata
+    return None
+
+
+def load_existing_variation_payload(variation_path):
+    metadata_path = os.path.join(variation_path, 'variation_metadata.json')
+    metadata = load_json_if_exists(metadata_path) or {}
+    descriptions = list(metadata.get('descriptions', []))
+
+    episode_stats = []
+    seen_episodes = set()
+    next_requested_episode = 0
+    for summary in list(metadata.get('episode_summaries', [])):
+        episode_index = _parse_episode_index(summary.get('episode'))
+        phase_metadata = _load_phase_metadata(
+            variation_path,
+            summary.get('phase_metadata_path'),
+            episode_index,
+        )
+        if episode_index is None or phase_metadata is None:
+            continue
+        num_phases = phase_metadata.get('num_phases')
+        if num_phases is None:
+            num_phases = len(list(phase_metadata.get('phases', [])))
+        requested_episode = _parse_episode_index(summary.get('requested_episode'))
+        if requested_episode is None:
+            requested_episode = next_requested_episode
+        next_requested_episode = max(next_requested_episode, int(requested_episode) + 1)
+        episode_stats.append({
+            'episode': int(episode_index),
+            'requested_episode': int(requested_episode),
+            'num_phases': int(num_phases),
+            'phase_valid': bool(summary.get('phase_valid', True)),
+        })
+        seen_episodes.add(int(episode_index))
+
+    episodes_root = os.path.join(variation_path, 'episodes')
+    if os.path.isdir(episodes_root):
+        for entry in sorted(os.listdir(episodes_root)):
+            episode_path = os.path.join(episodes_root, entry)
+            if not entry.startswith('episode') or not os.path.isdir(episode_path):
+                continue
+            episode_index = _parse_episode_index(entry)
+            if episode_index is None or int(episode_index) in seen_episodes:
+                continue
+            phase_metadata = load_json_if_exists(os.path.join(episode_path, 'phase_metadata.json'))
+            if phase_metadata is None:
+                continue
+            num_phases = phase_metadata.get('num_phases')
+            if num_phases is None:
+                num_phases = len(list(phase_metadata.get('phases', [])))
+            episode_stats.append({
+                'episode': int(episode_index),
+                'requested_episode': int(next_requested_episode),
+                'num_phases': int(num_phases),
+                'phase_valid': True,
+            })
+            seen_episodes.add(int(episode_index))
+            next_requested_episode += 1
+
+    episode_stats.sort(key=lambda item: (
+        int(item.get('requested_episode', -1)),
+        int(item.get('episode', -1)),
+    ))
+    next_episode_index = _next_available_episode_index(seen_episodes)
+
+    return {
+        'metadata': metadata,
+        'descriptions': descriptions,
+        'episode_stats': episode_stats,
+        'next_episode_index': int(next_episode_index),
+    }
+
+
 def is_variation_complete(variation_path, planned_episodes):
     metadata_path = os.path.join(variation_path, 'variation_metadata.json')
     metadata = load_json_if_exists(metadata_path)
@@ -90,6 +199,29 @@ def build_variation_stats_from_metadata(task_name, variation_index, planned_epis
         'phase_invalid_demos': phase_invalid_demos,
         'aborted_demos': aborted_demos,
         'failed_demos': failed_demos,
+        'failure_details': [],
+        'status': status,
+    }
+
+
+def build_variation_stats_for_complete(task_name, variation_index, planned_episodes, payload):
+    episode_stats = list(payload.get('episode_stats', []))
+    success_demos = len(episode_stats)
+    phase_valid_demos = sum(1 for stat in episode_stats if stat.get('phase_valid', True))
+    status = 'completed' if success_demos >= int(planned_episodes) else 'in_progress'
+    return {
+        'task_name': task_name,
+        'variation_index': int(variation_index),
+        'planned_demos': int(planned_episodes),
+        'success_demos': int(success_demos),
+        'phase_valid_demos': int(phase_valid_demos),
+        'demo_timeout_demos': 0,
+        'watchdog_timeout_demos': 0,
+        'exception_demos': 0,
+        'phase_invalid_attempts': 0,
+        'phase_invalid_demos': 0,
+        'aborted_demos': 0,
+        'failed_demos': 0,
         'failure_details': [],
         'status': status,
     }
@@ -163,6 +295,61 @@ def inspect_existing_variations(output_path, task_names, task_variation_targets,
         'variation_stats': variation_stats,
         'progress': build_progress_from_variation_stats(variation_stats),
         'reset_variations': reset_variations,
+        'incomplete_variations': incomplete_variations,
+    }
+
+
+def inspect_existing_variations_for_complete(output_path, task_names, task_variation_targets,
+                                            planned_episodes, log_message=None):
+    completed_variations = {task_name: set() for task_name in task_names}
+    variation_stats = {}
+    incomplete_variations = []
+
+    for task_name in task_names:
+        target_variations = int(task_variation_targets.get(task_name, 0))
+        task_path = os.path.join(output_path, task_name)
+        if not os.path.isdir(task_path):
+            continue
+
+        for variation_index in range(target_variations):
+            variation_path = os.path.join(task_path, VARIATIONS_FOLDER % variation_index)
+            if not os.path.isdir(variation_path):
+                continue
+
+            payload = load_existing_variation_payload(variation_path)
+            recovered_episodes = len(payload.get('episode_stats', []))
+            if recovered_episodes <= 0:
+                incomplete_variations.append((task_name, int(variation_index), variation_path))
+                if callable(log_message):
+                    log_message(
+                        f'complete mode detected variation without recoverable episodes '
+                        f'task={task_name} variation={variation_index} path={variation_path}'
+                    )
+                continue
+
+            stats = build_variation_stats_for_complete(
+                task_name,
+                variation_index,
+                planned_episodes,
+                payload,
+            )
+            variation_stats[f'{task_name}::{variation_index}'] = stats
+            if recovered_episodes >= int(planned_episodes):
+                completed_variations[task_name].add(int(variation_index))
+            else:
+                incomplete_variations.append((task_name, int(variation_index), variation_path))
+                if callable(log_message):
+                    log_message(
+                        f'complete mode will append variation task={task_name} '
+                        f'variation={variation_index} existing_episodes={recovered_episodes} '
+                        f'planned_episodes={planned_episodes} path={variation_path}'
+                    )
+
+    return {
+        'completed_variations': completed_variations,
+        'variation_stats': variation_stats,
+        'progress': build_progress_from_variation_stats(variation_stats),
+        'reset_variations': [],
         'incomplete_variations': incomplete_variations,
     }
 
