@@ -2,7 +2,7 @@ import pickle
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from PIL import Image
+import yaml
 from torch.utils.data import Dataset
 
 try:
@@ -30,19 +30,39 @@ LOW_DIM_FIELDS: List[str] = [
 ]
 
 IMAGE_SUFFIXES: Tuple[str, ...] = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+GLOBAL_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "global_config.yaml"
+
+
+"""读取全局配置文件。"""
+def load_global_config() -> Dict[str, Any]:
+	if not GLOBAL_CONFIG_PATH.is_file():
+		return {}
+
+	with GLOBAL_CONFIG_PATH.open("r", encoding="utf-8") as file:
+		config = yaml.safe_load(file)
+
+	if config is None:
+		return {}
+	if not isinstance(config, dict):
+		raise ValueError(f"Config file must contain a top-level mapping: {GLOBAL_CONFIG_PATH}")
+	return config
 
 
 """Action_Primitive_Dataset 类。
 
 输入：
     __init__:
-		dataset_root: str，数据集根目录路径，需包含多个动作子目录，每个动作子目录下包含多个 phase 子目录。
+		dataset_root: str，数据集根目录路径。Action/Task/VariationX/Phase_XXX
+			会额外读取 config/global_config.yaml 中的 train_actions 配置，
+			若配置为动作列表，则只索引这些 action 目录。
 		views: Optional[Sequence[str]]，可选的视角名称列表，默认为 ALL_VIEWS 中的全部视角。
 		top_k: int，选择 top-k 个最优视角进行返回，默认为 1。
 		view_selector_kwargs: Optional[Dict[str, Any]]，传递给 ViewSelector 的额外参数字典。
 输出：
     __getitem__:
 		action: str，动作标签。
+		task: str，任务名称。
+		variation: str，variation 名称。
 		trajectory_data: Dict[str, List[Any]]，按字段组织的轨迹数据字典，每个字段对应一个列表，长度等于轨迹帧数。
 		trajectory_length: int，轨迹的帧数。
 		selected_views: List[Dict[str, Any]]，长度为 top_k 的列表，每个元素包含以下键：
@@ -65,12 +85,54 @@ class Action_Primitive_Dataset(Dataset):
 		if not self.dataset_root.exists():
 			raise FileNotFoundError(f"Dataset root does not exist: {self.dataset_root}")
 
+		self.selected_actions = self._load_selected_actions()
 		self.views = list(views) if views is not None else list(ALL_VIEWS)
 		self.top_k = self._normalize_top_k(top_k)
 		self.view_selector_kwargs = dict(view_selector_kwargs or {})
 		self._view_selector: Optional[ViewSelector] = None
 		self.samples: List[Dict[str, Any]] = []
 		self.index_dataset()
+
+	"""从全局配置读取需要训练的动作白名单。"""
+	def _load_selected_actions(self) -> Optional[List[str]]:
+		config = load_global_config()
+		configured_actions = config.get("train_actions")
+		if configured_actions is None:
+			return None
+
+		if isinstance(configured_actions, str):
+			configured_actions = [configured_actions]
+
+		if not isinstance(configured_actions, (list, tuple)):
+			raise ValueError(
+				f"train_actions in {GLOBAL_CONFIG_PATH} must be null, a string, or a sequence of strings"
+			)
+
+		selected_actions: List[str] = []
+		seen_actions: set[str] = set()
+		for action_name in configured_actions:
+			if not isinstance(action_name, str):
+				raise ValueError(
+					f"train_actions in {GLOBAL_CONFIG_PATH} must only contain strings"
+				)
+
+			normalized_name = action_name.strip()
+			if not normalized_name:
+				raise ValueError(
+					f"train_actions in {GLOBAL_CONFIG_PATH} cannot contain empty action names"
+				)
+
+			action_key = normalized_name.casefold()
+			if action_key in seen_actions:
+				continue
+			seen_actions.add(action_key)
+			selected_actions.append(normalized_name)
+
+		if not selected_actions:
+			raise ValueError(
+				f"train_actions in {GLOBAL_CONFIG_PATH} cannot be an empty list; use null to load all actions"
+			)
+		return selected_actions
 
 	"""检查 top_k 合法性，并统一成正整数。"""
 	def _normalize_top_k(self, top_k: int) -> int:
@@ -79,11 +141,94 @@ class Action_Primitive_Dataset(Dataset):
 			raise ValueError("top_k must be a positive integer and less than or equal to the number of available views")
 		return top_k
 
-	"""获取一个 action 目录下的所有 phase 子目录，并按名称排序。"""
-	def _get_phase_dirs(self, action_dir: Path) -> List[Path]:
+	"""按名称排序目录；若目录名以数字结尾，则按数值排序。"""
+	def _sort_dirs(self, dirs: Sequence[Path]) -> List[Path]:
+		def sort_key(path: Path) -> Tuple[int, Any, str]:
+			name = path.name
+			index = len(name)
+			while index > 0 and name[index - 1].isdigit():
+				index -= 1
+			if index < len(name):
+				prefix = name[:index].casefold()
+				suffix = int(name[index:])
+				return (0, (prefix, suffix), name)
+			return (1, name.casefold(), name)
+
+		return sorted(dirs, key=sort_key)
+
+	"""获取一个目录下的所有 phase 子目录，并按名称排序。"""
+	def _get_phase_dirs(self, parent_dir: Path) -> List[Path]:
 		return sorted(
-			[path for path in action_dir.iterdir() if path.is_dir() and path.name.startswith("phase_")],
+			[path for path in parent_dir.iterdir() if path.is_dir() and path.name.lower().startswith("phase_")],
 			key=lambda path: path.name,
+		)
+
+	"""获取一个 action 目录下的所有 task 子目录，并按名称排序。"""
+	def _get_task_dirs(self, action_dir: Path) -> List[Path]:
+		task_dirs = [
+			path for path in action_dir.iterdir()
+			if path.is_dir() and (path / "task_metadata.json").is_file()
+		]
+		return self._sort_dirs(task_dirs)
+
+	"""获取一个 task 目录下的所有 variation 子目录，并按名称排序。"""
+	def _get_variation_dirs(self, task_dir: Path) -> List[Path]:
+		variation_dirs = [
+			path for path in task_dir.iterdir()
+			if path.is_dir() and (path / "variation_metadata.json").is_file()
+		]
+		return self._sort_dirs(variation_dirs)
+
+	"""根据全局配置筛选需要读取的 action 目录。"""
+	def _filter_action_dirs(self, action_dirs: Sequence[Path]) -> List[Path]:
+		if self.selected_actions is None:
+			return list(action_dirs)
+
+		available_actions = {action_dir.name.casefold(): action_dir for action_dir in action_dirs}
+		filtered_action_dirs: List[Path] = []
+		missing_actions: List[str] = []
+		for action_name in self.selected_actions:
+			action_dir = available_actions.get(action_name.casefold())
+			if action_dir is None:
+				missing_actions.append(action_name)
+				continue
+			filtered_action_dirs.append(action_dir)
+
+		if missing_actions:
+			available_names = ", ".join(action_dir.name for action_dir in action_dirs)
+			missing_names = ", ".join(missing_actions)
+			raise ValueError(
+				f"Configured train_actions not found under {self.dataset_root}: {missing_names}. "
+				f"Available actions: {available_names}"
+			)
+
+		return filtered_action_dirs
+
+	"""把单个 phase 注册为一个可读取样本。"""
+	def _register_phase_sample(
+		self,
+		action_name: str,
+		phase_path: Path,
+		task_name: Optional[str] = None,
+		variation_name: Optional[str] = None,
+	) -> None:
+		pkl_path = phase_path / "low_dim_obs.pkl"
+		if not pkl_path.is_file():
+			return
+
+		view_image_pairs = self._collect_view_image_pairs(phase_path)
+		if not view_image_pairs:
+			return
+
+		self.samples.append(
+			{
+				"action": action_name,
+				"task": task_name,
+				"variation": variation_name,
+				"phase_path": str(phase_path),
+				"pkl_path": str(pkl_path),
+				"view_image_pairs": view_image_pairs,
+			}
 		)
 
 	"""获取一个 phase 目录下指定视角的 RGB 图像目录路径。"""
@@ -123,35 +268,35 @@ class Action_Primitive_Dataset(Dataset):
 	"""遍历数据集构建样本列表。"""
 	def index_dataset(self) -> None:
 		self.samples = []
-		action_dirs = sorted(
+		action_dirs = self._sort_dirs(
 			[path for path in self.dataset_root.iterdir() if path.is_dir() and (path / "action_metadata.json").is_file()],
-			key=lambda path: path.name,
 		)
+		action_dirs = self._filter_action_dirs(action_dirs)
 		if not action_dirs:
 			raise ValueError(f"No action directories found under: {self.dataset_root}")
 
-		# 遍历根目录下的动作目录
 		for action_dir in action_dirs:
 			action_name = action_dir.name
+			task_dirs = self._get_task_dirs(action_dir)
 
-			# 遍历动作目录下的 phase 子目录
+			# 新结构：Action/Task/VariationX/Phase_XXX
+			if task_dirs:
+				for task_dir in task_dirs:
+					task_name = task_dir.name
+					for variation_dir in self._get_variation_dirs(task_dir):
+						variation_name = variation_dir.name
+						for phase_path in self._get_phase_dirs(variation_dir):
+							self._register_phase_sample(
+								action_name=action_name,
+								phase_path=phase_path,
+								task_name=task_name,
+								variation_name=variation_name,
+							)
+				continue
+
+			# 旧结构：Action/phase_xxx
 			for phase_path in self._get_phase_dirs(action_dir):
-				pkl_path = phase_path / "low_dim_obs.pkl"
-				if not pkl_path.is_file():
-					continue
-
-				view_image_pairs = self._collect_view_image_pairs(phase_path)
-				if not view_image_pairs:
-					continue
-
-				self.samples.append(
-					{
-						"action": action_name,
-						"phase_path": str(phase_path),
-						"pkl_path": str(pkl_path),
-						"view_image_pairs": view_image_pairs,
-					}
-				)
+				self._register_phase_sample(action_name=action_name, phase_path=phase_path)
 
 		if not self.samples:
 			raise ValueError(f"No valid phase samples found under: {self.dataset_root}")
@@ -237,7 +382,7 @@ class Action_Primitive_Dataset(Dataset):
 				f"Error: {exc}"
 			)
 
-	"""返回动作标签、该 phase 的轨迹字典、轨迹长度和 selected_views 列表。"""
+	"""返回动作/任务/variation 标签、轨迹字典、轨迹长度和 selected_views 列表。"""
 	def __getitem__(self, index: int) -> Dict[str, Any]:
 
 		if index < 0 or index >= len(self.samples):
@@ -251,7 +396,12 @@ class Action_Primitive_Dataset(Dataset):
 		selected_views = self.view_select(sample)
 
 		return {
+			"Action": sample["action"],
+			"Task": sample["task"],
+			"Variation": sample["variation"],
 			"action": sample["action"],
+			"task": sample["task"],
+			"variation": sample["variation"],
 			"trajectory_data": trajectory_data,
 			"trajectory_length": len(observations),
 			"selected_views": selected_views,
@@ -267,10 +417,12 @@ ActionPrimitiveDataset = Action_Primitive_Dataset
 
 # 简单测试
 if __name__ == "__main__":
-	dataset = Action_Primitive_Dataset(dataset_root="Action_Primitive_Dataset_v0")
+	dataset = Action_Primitive_Dataset(dataset_root="AtomAction_Dataset_re", views=["front"])
 	print(f"Dataset contains {len(dataset)} samples.")
 	sample = dataset[0]
 	print(f"Sample 0 action: {sample['action']}")
+	print(f"Sample 0 task: {sample['task']}")
+	print(f"Sample 0 variation: {sample['variation']}")
 	print(f"Sample 0 trajectory length: {sample['trajectory_length']}")
 	print(f"Sample 0 trajectory data keys: {list(sample['trajectory_data'].keys())}")
 	for key, value in sample["trajectory_data"].items():
