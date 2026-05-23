@@ -39,7 +39,7 @@ SUPPORTED_DINOV2_MODELS = {
                 其中 H = W = input_size，默认情况下为 [3, 224, 224]。
             best_end_image: torch.Tensor，末帧经过 transforms 处理后的图像张量，形状为 [3, H, W]。
                 其中 H = W = input_size，默认情况下为 [3, 224, 224]。
-            best_score: torch.Tensor，0 维标量张量，dtype 由 config/utils.yaml 中的 tensor_dtype 控制。
+            best_score: torch.Tensor，0 维标量张量，dtype 由 config/global_config.yaml 中的 tensor_dtype 控制。
                 分数越大表示视觉变化越明显。
 """
 class View_Selector:
@@ -94,7 +94,7 @@ class View_Selector:
             for param in self.selection_model.parameters():
                 param.requires_grad = False
 
-            self.transform = build_dinov2_transform(self.input_size)
+            self._ensure_transform_ready()
         except Exception as exc:
             self.selection_model = None
             self.transform = None
@@ -111,12 +111,33 @@ class View_Selector:
             raise FileNotFoundError(f"Image file does not exist: {path}")
         return path
 
+    """确保图像预处理流程已准备就绪；该步骤不依赖 DINOv2 模型加载。"""
+    def _ensure_transform_ready(self) -> None:
+        if self.transform is None:
+            self.transform = build_dinov2_transform(self.input_size)
+
     """根据图像路径读取图片并执行 DINOv2 预处理。"""
     def _load_transformed_image(self, img_path: str) -> torch.Tensor:
+        self._ensure_transform_ready()
         image_path = self._validate_image_path(img_path)
         with Image.open(image_path) as img:
             img = img.convert("RGB")
             return self.transform(img).to(dtype=self.tensor_dtype)
+
+    """构造与 select_best_view 一致的单个视角结果结构。"""
+    def build_view_result(
+        self,
+        view_name: Optional[str],
+        start_path: str,
+        end_path: str,
+        score: float,
+    ) -> Dict[str, object]:
+        return {
+            "best_view": view_name,
+            "best_start_image": self._load_transformed_image(start_path),
+            "best_end_image": self._load_transformed_image(end_path),
+            "best_score": torch.tensor(score, dtype=self.tensor_dtype),
+        }
 
     """校验多视角起止帧列表的长度和命名是否一致。"""
     def _validate_pairs(
@@ -163,7 +184,6 @@ class View_Selector:
         start_paths: Sequence[str],
         end_paths: Sequence[str],
     ) -> List[float]:
-        self._validate_pairs(start_paths, end_paths)
 
         scores: List[float] = []
         for start_path, end_path in zip(start_paths, end_paths):
@@ -209,12 +229,12 @@ class View_Selector:
         selected_views: List[Dict[str, object]] = []
         for selected_view in sorted_views[:selected_count]:
             selected_views.append(
-                {
-                    "best_view": selected_view["view_name"],
-                    "best_start_image": self._load_transformed_image(selected_view["start_path"]),
-                    "best_end_image": self._load_transformed_image(selected_view["end_path"]),
-                    "best_score": torch.tensor(selected_view["score"], dtype=self.tensor_dtype)
-                }
+                self.build_view_result(
+                    view_name=selected_view["view_name"],
+                    start_path=selected_view["start_path"],
+                    end_path=selected_view["end_path"],
+                    score=selected_view["score"],
+                )
             )
 
         return selected_views
@@ -226,16 +246,16 @@ ViewSelector = View_Selector
 # 简单测试
 if __name__ == "__main__":
     selector = View_Selector()
-    start_paths = ["Action_Primitive_Dataset_v0/approach/phase_0001/front_rgb/0.png", 
-                   "Action_Primitive_Dataset_v0/approach/phase_0001/left_shoulder_rgb/0.png",
-                   "Action_Primitive_Dataset_v0/approach/phase_0001/right_shoulder_rgb/0.png",
-                   "Action_Primitive_Dataset_v0/approach/phase_0001/overhead_rgb/0.png",
-                   "Action_Primitive_Dataset_v0/approach/phase_0001/wrist_rgb/0.png"]
-    end_paths = ["Action_Primitive_Dataset_v0/approach/phase_0001/front_rgb/60.png", 
-                 "Action_Primitive_Dataset_v0/approach/phase_0001/left_shoulder_rgb/60.png",
-                 "Action_Primitive_Dataset_v0/approach/phase_0001/right_shoulder_rgb/60.png",
-                 "Action_Primitive_Dataset_v0/approach/phase_0001/overhead_rgb/60.png",
-                 "Action_Primitive_Dataset_v0/approach/phase_0001/wrist_rgb/60.png"]
+    start_paths = ["AtomAction_Dataset_re/approach/close_grill/Variation0/Phase_001/front_rgb/0.png", 
+                   "AtomAction_Dataset_re/approach/close_grill/Variation0/Phase_001/left_shoulder_rgb/0.png",
+                   "AtomAction_Dataset_re/approach/close_grill/Variation0/Phase_001/right_shoulder_rgb/0.png",
+                   "AtomAction_Dataset_re/approach/close_grill/Variation0/Phase_001/overhead_rgb/0.png",
+                   "AtomAction_Dataset_re/approach/close_grill/Variation0/Phase_001/wrist_rgb/0.png"]
+    end_paths = ["AtomAction_Dataset_re/approach/close_grill/Variation0/Phase_001/front_rgb/67.png", 
+                 "AtomAction_Dataset_re/approach/close_grill/Variation0/Phase_001/left_shoulder_rgb/67.png",
+                 "AtomAction_Dataset_re/approach/close_grill/Variation0/Phase_001/right_shoulder_rgb/67.png",
+                 "AtomAction_Dataset_re/approach/close_grill/Variation0/Phase_001/overhead_rgb/67.png",
+                 "AtomAction_Dataset_re/approach/close_grill/Variation0/Phase_001/wrist_rgb/67.png"]
     view_names = ["front", "left_shoulder", "right_shoulder", "overhead", "wrist"]
 
     try:

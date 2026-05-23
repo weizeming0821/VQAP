@@ -54,7 +54,7 @@ def load_global_config() -> Dict[str, Any]:
     __init__:
 		dataset_root: str，数据集根目录路径。Action/Task/VariationX/Phase_XXX
 			会额外读取 config/global_config.yaml 中的 train_actions 配置，
-			若配置为动作列表，则只索引这些 action 目录。
+			必须为非空动作列表，并且每个动作都必须存在于数据集目录中。
 		views: Optional[Sequence[str]]，可选的视角名称列表，默认为 ALL_VIEWS 中的全部视角。
 		top_k: int，选择 top-k 个最优视角进行返回，默认为 1。
 		view_selector_kwargs: Optional[Dict[str, Any]]，传递给 ViewSelector 的额外参数字典。
@@ -69,7 +69,7 @@ def load_global_config() -> Dict[str, Any]:
 			best_view: str，选定的视角名称。
 			best_start_image: torch.Tensor，首帧经过 transforms 处理后的图像张量，形状为 [3, H, W]。
 			best_end_image: torch.Tensor，末帧经过 transforms 处理后的图像张量，形状为 [3, H, W]。
-			best_score: torch.Tensor，0 维标量张量，dtype 由 config/utils.yaml 中的 tensor_dtype 控制，分数越大表示视觉变化越明显。
+			best_score: torch.Tensor，0 维标量张量，dtype 由 config/global_config.yaml 中的 tensor_dtype 控制，分数越大表示视觉变化越明显。
 """
 class Action_Primitive_Dataset(Dataset):
 
@@ -94,44 +94,25 @@ class Action_Primitive_Dataset(Dataset):
 		self.index_dataset()
 
 	"""从全局配置读取需要训练的动作白名单。"""
-	def _load_selected_actions(self) -> Optional[List[str]]:
+	def _load_selected_actions(self) -> List[str]:
 		config = load_global_config()
 		configured_actions = config.get("train_actions")
-		if configured_actions is None:
-			return None
-
-		if isinstance(configured_actions, str):
-			configured_actions = [configured_actions]
-
-		if not isinstance(configured_actions, (list, tuple)):
+		if configured_actions is None or not isinstance(configured_actions, (list, tuple)):
 			raise ValueError(
-				f"train_actions in {GLOBAL_CONFIG_PATH} must be null, a string, or a sequence of strings"
+				f"train_actions in {GLOBAL_CONFIG_PATH} must be a non-empty list of action names"
 			)
 
 		selected_actions: List[str] = []
 		seen_actions: set[str] = set()
 		for action_name in configured_actions:
-			if not isinstance(action_name, str):
-				raise ValueError(
-					f"train_actions in {GLOBAL_CONFIG_PATH} must only contain strings"
-				)
 
 			normalized_name = action_name.strip()
-			if not normalized_name:
-				raise ValueError(
-					f"train_actions in {GLOBAL_CONFIG_PATH} cannot contain empty action names"
-				)
-
 			action_key = normalized_name.casefold()
 			if action_key in seen_actions:
 				continue
 			seen_actions.add(action_key)
 			selected_actions.append(normalized_name)
 
-		if not selected_actions:
-			raise ValueError(
-				f"train_actions in {GLOBAL_CONFIG_PATH} cannot be an empty list; use null to load all actions"
-			)
 		return selected_actions
 
 	"""检查 top_k 合法性，并统一成正整数。"""
@@ -181,9 +162,6 @@ class Action_Primitive_Dataset(Dataset):
 
 	"""根据全局配置筛选需要读取的 action 目录。"""
 	def _filter_action_dirs(self, action_dirs: Sequence[Path]) -> List[Path]:
-		if self.selected_actions is None:
-			return list(action_dirs)
-
 		available_actions = {action_dir.name.casefold(): action_dir for action_dir in action_dirs}
 		filtered_action_dirs: List[Path] = []
 		missing_actions: List[str] = []
@@ -261,7 +239,6 @@ class Action_Primitive_Dataset(Dataset):
 			view_pairs[view_name] = {
 				"start_path": str(image_files[0]),
 				"end_path": str(image_files[-1]),
-				"frame_count": len(image_files),
 			}
 		return view_pairs
 
@@ -279,7 +256,6 @@ class Action_Primitive_Dataset(Dataset):
 			action_name = action_dir.name
 			task_dirs = self._get_task_dirs(action_dir)
 
-			# 新结构：Action/Task/VariationX/Phase_XXX
 			if task_dirs:
 				for task_dir in task_dirs:
 					task_name = task_dir.name
@@ -293,10 +269,6 @@ class Action_Primitive_Dataset(Dataset):
 								variation_name=variation_name,
 							)
 				continue
-
-			# 旧结构：Action/phase_xxx
-			for phase_path in self._get_phase_dirs(action_dir):
-				self._register_phase_sample(action_name=action_name, phase_path=phase_path)
 
 		if not self.samples:
 			raise ValueError(f"No valid phase samples found under: {self.dataset_root}")
@@ -350,17 +322,18 @@ class Action_Primitive_Dataset(Dataset):
 		if not view_names:
 			raise ValueError(f"No available RGB views found for sample: {sample['phase_path']}")
 
-		# 如果限定范围只有一个视角，直接返回长度为 1 的列表，无需调用选择器。
+		# 如果只有一个可用视角，直接构造与多视角一致的返回结构，无需执行 DINOv2 打分。
 		if len(view_names) == 1:
 			only_view = view_names[0]
 			only_pair = view_pairs[only_view]
+			view_selector = self._get_view_selector()
 			return [
-				{
-					"best_view": only_view,
-					"best_start_path": only_pair["start_path"],
-					"best_end_path": only_pair["end_path"],
-					"best_score": 1.0,  # 只有一个视角时，变化分数默认为 1.0
-				}
+				view_selector.build_view_result(
+					view_name=only_view,
+					start_path=only_pair["start_path"],
+					end_path=only_pair["end_path"],
+					score=1.0,
+				)
 			]
 
 		# 多个视角时，调用选择器进行评估和排序
@@ -399,9 +372,6 @@ class Action_Primitive_Dataset(Dataset):
 			"Action": sample["action"],
 			"Task": sample["task"],
 			"Variation": sample["variation"],
-			"action": sample["action"],
-			"task": sample["task"],
-			"variation": sample["variation"],
 			"trajectory_data": trajectory_data,
 			"trajectory_length": len(observations),
 			"selected_views": selected_views,
@@ -420,9 +390,9 @@ if __name__ == "__main__":
 	dataset = Action_Primitive_Dataset(dataset_root="AtomAction_Dataset_re", views=["front"])
 	print(f"Dataset contains {len(dataset)} samples.")
 	sample = dataset[0]
-	print(f"Sample 0 action: {sample['action']}")
-	print(f"Sample 0 task: {sample['task']}")
-	print(f"Sample 0 variation: {sample['variation']}")
+	print(f"Sample 0 action: {sample['Action']}")
+	print(f"Sample 0 task: {sample['Task']}")
+	print(f"Sample 0 variation: {sample['Variation']}")
 	print(f"Sample 0 trajectory length: {sample['trajectory_length']}")
 	print(f"Sample 0 trajectory data keys: {list(sample['trajectory_data'].keys())}")
 	for key, value in sample["trajectory_data"].items():

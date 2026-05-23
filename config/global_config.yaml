@@ -2,9 +2,21 @@
 tensor_dtype: float32
 
 # 训练时读取的数据集动作白名单；动作名需与数据集根目录下的 action 目录名一致。
-# 设为 null 表示读取全部动作。
+# 必须为非空列表，且列表中的动作都必须存在于数据集中。
 # 例如：
 # train_actions:
 #   - approach
 #   - grasp
-train_actions: null
+train_actions: 
+  - approach
+  - flip-close
+  - flip-open
+  - grasp
+  - lift
+  - place
+  - press
+  - pull
+  - push
+  - revolve-out
+  - rotate
+  - transfer
