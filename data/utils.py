@@ -62,14 +62,15 @@ def build_dinov2_transform(input_size: int = 224) -> transforms.Compose:
 		]
 	)
 
-"""重写 Action_Primitive_Dataset 类的数据裁剪函数"""
-def ActionPrimitiveDataset_collate_fn(batch: Any) -> Any:
-    return batch
+"""重写 AtomActionDataset 的数据裁剪函数。"""
+def AtomActionDataset_collate_fn(batch: Any) -> Any:
+	return batch
+
+
 
 """统计数据均值与方差并保存到 action_metadata.json 中"""
 
 
-
-"""轨迹数据初始化函数"""
+"""轨迹数据预处理函数"""
 
 

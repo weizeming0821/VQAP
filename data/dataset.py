@@ -48,7 +48,7 @@ def load_global_config() -> Dict[str, Any]:
 	return config
 
 
-"""Action_Primitive_Dataset 类。
+"""AtomActionDataset 类。
 
 输入：
     __init__:
@@ -71,7 +71,7 @@ def load_global_config() -> Dict[str, Any]:
 			best_end_image: torch.Tensor，末帧经过 transforms 处理后的图像张量，形状为 [3, H, W]。
 			best_score: torch.Tensor，0 维标量张量，dtype 由 config/global_config.yaml 中的 tensor_dtype 控制，分数越大表示视觉变化越明显。
 """
-class Action_Primitive_Dataset(Dataset):
+class AtomActionDataset(Dataset):
 
 	def __init__(
 		self,
@@ -382,12 +382,9 @@ class Action_Primitive_Dataset(Dataset):
 		return len(self.samples)
 
 
-ActionPrimitiveDataset = Action_Primitive_Dataset
-
-
 # 简单测试
 if __name__ == "__main__":
-	dataset = Action_Primitive_Dataset(dataset_root="AtomAction_Dataset_re", views=["front"])
+	dataset = AtomActionDataset(dataset_root="AtomAction_Dataset_re", views=["front"])
 	print(f"Dataset contains {len(dataset)} samples.")
 	sample = dataset[0]
 	print(f"Sample 0 action: {sample['Action']}")
