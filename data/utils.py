@@ -13,8 +13,7 @@ SUPPORTED_TENSOR_DTYPES = {
 	"float32": torch.float32,
 	"float64": torch.float64,
 	"bfloat16": torch.bfloat16,
-}
-
+ }
 
 """读取全局配置文件。"""
 def load_utils_config() -> Dict[str, Any]:
@@ -61,6 +60,7 @@ def build_dinov2_transform(input_size: int = 224) -> transforms.Compose:
 			),
 		]
 	)
+
 
 """把单帧低维数据转成张量，标量统一扩成 [1]。"""
 def _to_trajectory_tensor(value: Any, tensor_dtype: torch.dtype) -> Optional[torch.Tensor]:
@@ -149,9 +149,16 @@ def AtomActionDataset_collate_fn(batch: Any) -> Dict[str, Any]:
 	}
 
 
-"""统计数据均值与方差并保存到 action_metadata.json 中"""
+"""调用独立脚本中的轨迹统计逻辑。"""
 def compute_and_save_statistics(dataset: Any) -> None:
-	pass
+	try:
+		from .scripts.compute_dataset_statistics import compute_and_save_statistics as _compute_statistics
+	except ImportError:
+		from data.scripts.compute_dataset_statistics import compute_and_save_statistics as _compute_statistics
+
+	_compute_statistics(dataset)
 
 
 """轨迹数据预处理函数"""
+def normalize():
+	pass
