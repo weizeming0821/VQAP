@@ -1,12 +1,7 @@
 # 全局配置
 tensor_dtype: float32
 
-# 训练时读取的数据集动作白名单；动作名需与数据集根目录下的 action 目录名一致。
-# 必须为非空列表，且列表中的动作都必须存在于数据集中。
-# 例如：
-# train_actions:
-#   - approach
-#   - grasp
+# 训练时读取的数据集动作白名单
 train_actions: 
   - approach
   - flip-close
@@ -20,3 +15,13 @@ train_actions:
   - revolve-out
   - rotate
   - transfer
+
+# VQAP 输入的动作维度白名单
+train_act_dim:
+  - joint_positions
+  - joint_velocities
+  - gripper_pose
+  - joint_forces
+  - gripper_joint_positions
+  - gripper_touch_forces
+  - gripper_open
