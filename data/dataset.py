@@ -60,12 +60,12 @@ def load_global_config() -> Dict[str, Any]:
 		view_selector_kwargs: Optional[Dict[str, Any]]，传递给 ViewSelector 的额外参数字典。
 输出：
     __getitem__:
-		action: str，动作标签。
-		task: str，任务名称。
-		variation: str，variation 名称。
+		Action: str，动作标签。
+		Task: str，任务名称。
+		Variation: str，variation 名称。
 		trajectory_data: Dict[str, List[Any]]，按字段组织的轨迹数据字典，每个字段对应一个列表，长度等于轨迹帧数。
 		trajectory_length: int，轨迹的帧数。
-		selected_views: List[Dict[str, Any]]，长度为 top_k 的列表，每个元素包含以下键：
+		selected_views: List[Dict[str, Any]]，长度为小于等于 top_k 的列表，每个元素包含以下键：
 			best_view: str，选定的视角名称。
 			best_start_image: torch.Tensor，首帧经过 transforms 处理后的图像张量，形状为 [3, H, W]。
 			best_end_image: torch.Tensor，末帧经过 transforms 处理后的图像张量，形状为 [3, H, W]。

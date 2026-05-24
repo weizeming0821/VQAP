@@ -1,5 +1,6 @@
+import json
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 from PIL import Image
@@ -20,6 +21,9 @@ SUPPORTED_DINOV2_MODELS = {
     "dinov2_vitl14_reg",
     "dinov2_vitg14_reg",
 }
+
+VIEW_SELECTION_CACHE_KEY = "view_selection_cache"
+VIEW_SELECTION_CACHE_VERSION = 1
 
 """基于冻结 DINOv2 的视角信息量评估器。
 
@@ -85,7 +89,7 @@ class View_Selector:
 
     """首次使用时加载官方权重，并永久冻结参数。"""
     def _ensure_model_loaded(self) -> None:
-        if self.selection_model is not None and self.transform is not None:
+        if self.selection_model is not None:
             return
 
         try:
@@ -137,6 +141,77 @@ class View_Selector:
             "best_start_image": self._load_transformed_image(start_path),
             "best_end_image": self._load_transformed_image(end_path),
             "best_score": torch.tensor(score, dtype=self.tensor_dtype),
+        }
+
+    """根据任意一张 phase 内图片路径定位对应的 phase_metadata.json。"""
+    def _get_phase_metadata_path(self, img_path: str) -> Path:
+        image_path = self._validate_image_path(img_path)
+        return image_path.parent.parent / "phase_metadata.json"
+
+    """读取单个 phase 的元数据；若不存在则返回空字典。"""
+    def _load_phase_metadata(self, phase_metadata_path: Path) -> Dict[str, Any]:
+        if not phase_metadata_path.is_file():
+            return {}
+
+        with phase_metadata_path.open("r", encoding="utf-8") as file:
+            metadata = json.load(file)
+
+        if not isinstance(metadata, dict):
+            raise ValueError(f"Phase metadata must contain a top-level mapping: {phase_metadata_path}")
+        return metadata
+
+    """把更新后的 phase 元数据写回磁盘。"""
+    def _write_phase_metadata(self, phase_metadata_path: Path, metadata: Dict[str, Any]) -> None:
+        temp_path = phase_metadata_path.with_suffix(f"{phase_metadata_path.suffix}.tmp")
+        with temp_path.open("w", encoding="utf-8") as file:
+            json.dump(metadata, file, ensure_ascii=False, indent=2)
+            file.write("\n")
+        temp_path.replace(phase_metadata_path)
+
+    """获取或创建当前 phase 的视角缓存块。"""
+    def _get_or_create_view_selection_cache(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        cache = metadata.get(VIEW_SELECTION_CACHE_KEY)
+        if not isinstance(cache, dict):
+            cache = {}
+            metadata[VIEW_SELECTION_CACHE_KEY] = cache
+
+        cache["version"] = VIEW_SELECTION_CACHE_VERSION
+        cache["config"] = {
+            "model_name": self.model_name,
+            "repo": self.repo,
+            "input_size": self.input_size,
+        }
+
+        views_cache = cache.get("views")
+        if not isinstance(views_cache, dict):
+            views_cache = {}
+            cache["views"] = views_cache
+        return cache
+
+    """检查单个视角缓存是否已经包含复用所需字段。"""
+    def _has_complete_view_cache(self, cache_entry: Any) -> bool:
+        required_keys = {
+            "start_path",
+            "end_path",
+            "start_feature",
+            "end_feature",
+            "cosine_similarity",
+            "change_score",
+        }
+        return isinstance(cache_entry, dict) and required_keys.issubset(cache_entry.keys())
+
+    """计算单个视角的特征与相似度，并整理成可写入元数据的缓存结构。"""
+    def _build_view_cache_entry(self, start_path: str, end_path: str, phase_dir: Path) -> Dict[str, Any]:
+        start_feature = self.get_feature(start_path)
+        end_feature = self.get_feature(end_path)
+        cosine_similarity = float(torch.cosine_similarity(start_feature, end_feature, dim=-1).item())
+        return {
+            "start_path": Path(start_path).expanduser().resolve().relative_to(phase_dir).as_posix(),
+            "end_path": Path(end_path).expanduser().resolve().relative_to(phase_dir).as_posix(),
+            "start_feature": start_feature.detach().cpu().squeeze(0).tolist(),
+            "end_feature": end_feature.detach().cpu().squeeze(0).tolist(),
+            "cosine_similarity": cosine_similarity,
+            "change_score": float(1.0 - cosine_similarity),
         }
 
     """校验多视角起止帧列表的长度和命名是否一致。"""
@@ -198,31 +273,57 @@ class View_Selector:
         view_names: Optional[Sequence[str]] = None,
         top_k: int = 1,
     ) -> List[Dict[str, object]]:
-        
         # 基础检查
         self._validate_pairs(start_paths, end_paths, view_names)
         if top_k <= 0:
             raise ValueError("top_k must be a positive integer")
 
-        # 加载模型并计算分数
-        self._ensure_model_loaded()
-        scores = self.compute_change_scores(start_paths, end_paths)
-
         # 打包结果
-        resolved_view_names = list(view_names) if view_names is not None else [None] * len(scores)
+        resolved_view_names = list(view_names) if view_names is not None else [None] * len(start_paths)
         scored_views: List[Dict[str, object]] = []
-        for index, (view_name, start_path, end_path, score) in enumerate(
-            zip(resolved_view_names, start_paths, end_paths, scores)
-        ):
-            scored_views.append(
-                {
-                    "index": index,
-                    "view_name": view_name,
-                    "start_path": start_path,
-                    "end_path": end_path,
-                    "score": score,
-                }
-            )
+        if view_names is None:
+            scores = self.compute_change_scores(start_paths, end_paths)
+            for index, (view_name, start_path, end_path, score) in enumerate(
+                zip(resolved_view_names, start_paths, end_paths, scores)
+            ):
+                scored_views.append(
+                    {
+                        "index": index,
+                        "view_name": view_name,
+                        "start_path": start_path,
+                        "end_path": end_path,
+                        "score": score,
+                    }
+                )
+        else:
+            phase_metadata_path = self._get_phase_metadata_path(start_paths[0])
+            phase_dir = phase_metadata_path.parent
+            phase_metadata = self._load_phase_metadata(phase_metadata_path)
+            cache = self._get_or_create_view_selection_cache(phase_metadata)
+            cached_views = cache["views"]
+            cache_updated = False
+
+            for index, (view_name, start_path, end_path) in enumerate(
+                zip(resolved_view_names, start_paths, end_paths)
+            ):
+                cached_view = cached_views.get(view_name)
+                if not self._has_complete_view_cache(cached_view):
+                    cached_view = self._build_view_cache_entry(start_path, end_path, phase_dir)
+                    cached_views[view_name] = cached_view
+                    cache_updated = True
+
+                scored_views.append(
+                    {
+                        "index": index,
+                        "view_name": view_name,
+                        "start_path": start_path,
+                        "end_path": end_path,
+                        "score": float(cached_view["change_score"]),
+                    }
+                )
+
+            if cache_updated:
+                self._write_phase_metadata(phase_metadata_path, phase_metadata)
 
         sorted_views = sorted(scored_views, key=lambda item: item["score"], reverse=True)
         selected_count = min(top_k, len(sorted_views))
