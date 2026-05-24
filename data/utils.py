@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import yaml
@@ -62,15 +62,96 @@ def build_dinov2_transform(input_size: int = 224) -> transforms.Compose:
 		]
 	)
 
-"""重写 AtomActionDataset 的数据裁剪函数。"""
-def AtomActionDataset_collate_fn(batch: Any) -> Any:
-	return batch
+"""把单帧低维数据转成张量，标量统一扩成 [1]。"""
+def _to_trajectory_tensor(value: Any, tensor_dtype: torch.dtype) -> Optional[torch.Tensor]:
+	if value is None:
+		return None
 
+	tensor = torch.as_tensor(value, dtype=tensor_dtype)
+	if tensor.ndim == 0:
+		tensor = tensor.unsqueeze(0)
+	return tensor
+
+
+"""将 AtomActionDataset 的样本列表整理成批数据。
+
+输入：
+	batch: List[Dict[str, Any]]，每个元素对应 AtomActionDataset.__getitem__ 的返回值。
+
+输出：
+	Dict[str, Any]
+		Action/Task/Variation: 长度为 B 的列表。
+		trajectory_data: Dict[str, torch.Tensor]，每个字段形状为 [B, T, D]。
+		trajectory_length: torch.LongTensor，形状为 [B]。
+		trajectory_mask: torch.BoolTensor，形状为 [B, T]，True 表示有效帧。
+		selected_views: 长度为 B 的列表，保留每个样本原始的视角结果。
+"""
+def AtomActionDataset_collate_fn(batch: Any) -> Dict[str, Any]:
+	if not isinstance(batch, list) or len(batch) == 0:
+		raise ValueError("batch must be a non-empty list")
+
+	tensor_dtype = get_configured_tensor_dtype()
+	trajectory_length = torch.tensor(
+		[int(sample["trajectory_length"]) for sample in batch],
+		dtype=torch.long,
+	)
+	batch_size = len(batch)
+	max_length = int(trajectory_length.max().item())
+	trajectory_mask = torch.zeros((batch_size, max_length), dtype=torch.bool)
+	for batch_index, length in enumerate(trajectory_length.tolist()):
+		trajectory_mask[batch_index, :length] = True
+
+	trajectory_data: Dict[str, torch.Tensor] = {}
+	field_names = list(batch[0]["trajectory_data"].keys())
+	for field_name in field_names:
+		feature_shape: Tuple[int, ...] = (1,)
+		for sample in batch:
+			for frame_value in sample["trajectory_data"][field_name]:
+				frame_tensor = _to_trajectory_tensor(frame_value, tensor_dtype)
+				if frame_tensor is not None:
+					feature_shape = tuple(frame_tensor.shape)
+					break
+			if feature_shape != (1,):
+				break
+
+		# 每个字段都补到 [B, T, D]，未使用位置保持 0。
+		padded_field = torch.zeros((batch_size, max_length, *feature_shape), dtype=tensor_dtype)
+		for batch_index, sample in enumerate(batch):
+			field_sequence = sample["trajectory_data"][field_name]
+			expected_length = int(trajectory_length[batch_index].item())
+			if len(field_sequence) != expected_length:
+				raise ValueError(
+					f"trajectory_data[{field_name}] length does not match trajectory_length: "
+					f"{len(field_sequence)} != {expected_length}"
+				)
+
+			for time_index, frame_value in enumerate(field_sequence):
+				frame_tensor = _to_trajectory_tensor(frame_value, tensor_dtype)
+				if frame_tensor is None:
+					continue
+				if tuple(frame_tensor.shape) != feature_shape:
+					raise ValueError(
+						f"Inconsistent frame shape in field {field_name}: "
+						f"expected {feature_shape}, got {tuple(frame_tensor.shape)}"
+					)
+				padded_field[batch_index, time_index] = frame_tensor
+
+		trajectory_data[field_name] = padded_field
+
+	return {
+		"Action": [sample["Action"] for sample in batch],
+		"Task": [sample["Task"] for sample in batch],
+		"Variation": [sample["Variation"] for sample in batch],
+		"trajectory_data": trajectory_data,
+		"trajectory_length": trajectory_length,
+		"trajectory_mask": trajectory_mask,
+		"selected_views": [sample["selected_views"] for sample in batch],
+	}
 
 
 """统计数据均值与方差并保存到 action_metadata.json 中"""
+def compute_and_save_statistics(dataset: Any) -> None:
+	pass
 
 
 """轨迹数据预处理函数"""
-
-
