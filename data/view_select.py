@@ -188,30 +188,25 @@ class View_Selector:
             cache["views"] = views_cache
         return cache
 
-    """检查单个视角缓存是否已经包含复用所需字段。"""
+    """检查单个视角缓存是否可直接复用。"""
     def _has_complete_view_cache(self, cache_entry: Any) -> bool:
         required_keys = {
             "start_path",
             "end_path",
-            "start_feature",
-            "end_feature",
             "cosine_similarity",
             "change_score",
         }
         return isinstance(cache_entry, dict) and required_keys.issubset(cache_entry.keys())
 
-    """计算单个视角的特征与相似度，并整理成可写入元数据的缓存结构。"""
+    """计算单个视角的缓存内容。"""
     def _build_view_cache_entry(self, start_path: str, end_path: str, phase_dir: Path) -> Dict[str, Any]:
-        start_feature = self.get_feature(start_path)
-        end_feature = self.get_feature(end_path)
-        cosine_similarity = float(torch.cosine_similarity(start_feature, end_feature, dim=-1).item())
+        change_score = self.compute_change_score(start_path, end_path)
+        cosine_similarity = float(1.0 - change_score)
         return {
             "start_path": Path(start_path).expanduser().resolve().relative_to(phase_dir).as_posix(),
             "end_path": Path(end_path).expanduser().resolve().relative_to(phase_dir).as_posix(),
-            "start_feature": start_feature.detach().cpu().squeeze(0).tolist(),
-            "end_feature": end_feature.detach().cpu().squeeze(0).tolist(),
             "cosine_similarity": cosine_similarity,
-            "change_score": float(1.0 - cosine_similarity),
+            "change_score": float(change_score),
         }
 
     """校验多视角起止帧列表的长度和命名是否一致。"""
