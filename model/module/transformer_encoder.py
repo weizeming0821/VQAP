@@ -146,12 +146,6 @@ class TransformerEncoder(nn.Module):
 		x: [B, T, C] -> N 层 Encoder -> encoded_x: [B, T, C]
 	"""
 	def forward(self, x: torch.Tensor, trajectory_mask: torch.Tensor) -> torch.Tensor:
-		if x.ndim != 3:
-			raise ValueError("x must have shape [B, T, C]")
-		if trajectory_mask.ndim != 2:
-			raise ValueError("trajectory_mask must have shape [B, T]")
-		if x.shape[:2] != trajectory_mask.shape:
-			raise ValueError("trajectory_mask must align with x shape [B, T]")
 
 		rope_cos, rope_sin = self.rope(seq_len=x.shape[1], device=x.device, dtype=x.dtype)
 		for layer in self.layers:

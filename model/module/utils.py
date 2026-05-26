@@ -154,10 +154,7 @@ class MultiHeadAttention(nn.Module):
 	"""初始化多头注意力模块。"""
 	def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.0) -> None:
 		super().__init__()
-		if hidden_dim <= 0:
-			raise ValueError("hidden_dim must be a positive integer")
-		if num_heads <= 0:
-			raise ValueError("num_heads must be a positive integer")
+
 		if hidden_dim % num_heads != 0:
 			raise ValueError("hidden_dim must be divisible by num_heads")
 
@@ -190,14 +187,6 @@ class MultiHeadAttention(nn.Module):
 		rope_cos: torch.Tensor,
 		rope_sin: torch.Tensor,
 	) -> torch.Tensor:
-		if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
-			raise ValueError("query, key and value must have shape [B, T, C]")
-		if trajectory_mask.ndim != 2:
-			raise ValueError("trajectory_mask must have shape [B, T]")
-		if key.shape != value.shape:
-			raise ValueError("key and value must share the same shape")
-		if query.shape[0] != key.shape[0] or key.shape[:2] != trajectory_mask.shape:
-			raise ValueError("trajectory_mask must align with key/value shape [B, T_k]")
 
 		batch_size, query_length, _ = query.shape
 		key_length = key.shape[1]
@@ -207,6 +196,7 @@ class MultiHeadAttention(nn.Module):
 		key_states = self.k_proj(key).view(batch_size, key_length, self.num_heads, self.head_dim).transpose(1, 2)
 		value_states = self.v_proj(value).view(batch_size, key_length, self.num_heads, self.head_dim).transpose(1, 2)
 
+		# RoPE 位置编码
 		query_states = RotaryPositionEncoding1D.apply_rotary(
 			query_states,
 			rope_cos[:, :query_length],

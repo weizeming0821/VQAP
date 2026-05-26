@@ -88,8 +88,6 @@ class AtomAction_NSVQ(nn.Module):
         )
 
     def forward(self, trajectory_data: Dict[str, torch.Tensor], trajectory_mask: torch.Tensor) -> torch.Tensor:
-        if trajectory_mask.ndim != 2:
-            raise ValueError("trajectory_mask must have shape [B, T]")
 
         # 读取各动作维度数据
         gripper_pose = trajectory_data["gripper_pose"]
@@ -116,14 +114,14 @@ class AtomAction_NSVQ(nn.Module):
         gripper_open_features = self.gripper_open_projector(self.gripper_open_embedding(gripper_open_ids))
 
         # 四组特征拼接：[B, T, 192+192+64+64] -> [B, T, 512]
-        trajectory_tokens = torch.cat(
+        trajectory_features = torch.cat(
             (ee_features, body_features, gripper_mech_features, gripper_open_features),
             dim=-1,
         )
 
         # Transformer Encoder：[B, T, 512] -> [B, T, 512]
-        encoded_trajectory_tokens = self.transformer_encoder(trajectory_tokens, trajectory_mask)
-        return encoded_trajectory_tokens
+        encoded_trajectory_features = self.transformer_encoder(trajectory_features, trajectory_mask)
+        return encoded_trajectory_features
 
 
     """计算模块参数量。"""
