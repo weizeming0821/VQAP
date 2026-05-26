@@ -32,6 +32,46 @@ class TrajectoryProjectionMLP(nn.Module):
 		return self.network(x)
 
 
+"""通道注意力模块。
+
+输入：
+	__init__:
+		feature_dim: int，输入输出特征维度 C。
+		bottleneck_dim: int，瓶颈层维度。
+	forward:
+		x: [B, T, C]
+
+输出：
+	forward:
+		channel_encoded_x: [B, T, C]
+"""
+class ChannelAttention(nn.Module):
+
+	"""初始化逐时间步通道注意力模块。"""
+	def __init__(self, feature_dim: int, bottleneck_dim: int) -> None:
+		super().__init__()
+		self.feature_dim = int(feature_dim)
+		self.bottleneck_dim = int(bottleneck_dim)
+		self.channel_gate = nn.Sequential(
+			nn.Linear(self.feature_dim, self.bottleneck_dim),
+			nn.GELU(),
+			nn.Linear(self.bottleneck_dim, self.feature_dim),
+			nn.Sigmoid(),
+		)
+
+	"""对每个时间步独立执行通道注意力。
+
+	维度变化：
+		x: [B, T, C] -> [B*T, C] -> channel gate -> [B*T, C] -> [B, T, C]
+	"""
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		batch_size, seq_len, feature_dim = x.shape
+		x_flat = x.reshape(batch_size * seq_len, feature_dim)
+		channel_weights = self.channel_gate(x_flat)
+		x_flat = x_flat + x_flat * channel_weights
+		return x_flat.reshape(batch_size, seq_len, feature_dim)
+
+
 """1D RoPE 缓存模块。
 
 输入：
@@ -74,7 +114,7 @@ class RotaryPositionEncoding1D(nn.Module):
 	"""对输入张量施加 RoPE。
 
 	输入：
-		x: [B, T, D] 或兼容广播的张量，D 必须为偶数。
+		x: [..., T, D] 或兼容广播的张量，D 必须为偶数。
 		cos/sin: [1, T, D]。
 	输出：
 		与 x 同形状。

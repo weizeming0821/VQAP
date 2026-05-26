@@ -3,12 +3,8 @@ from typing import Any, Dict, Iterable
 import torch
 import torch.nn as nn
 
-try:
-    from .transformer_encoder import TransformerEncoder
-    from .utils import TrajectoryProjectionMLP
-except ImportError:
-    from transformer_encoder import TransformerEncoder
-    from utils import TrajectoryProjectionMLP
+from .encoder import ChannelEncoder, TransformerEncoder
+from .utils import TrajectoryProjectionMLP
 
 
 # 全局常量定义，各动作维度的输入维度
@@ -49,6 +45,7 @@ class AtomAction_NSVQ(nn.Module):
         body_cfg = self.model_args["body_branch"]
         gripper_mech_cfg = self.model_args["gripper_mech_branch"]
         gripper_open_cfg = self.model_args["gripper_open_branch"]
+        channel_encoder_cfg = self.model_args["channel_encoder"]
         rope_cfg = self.model_args["rope"]
         encoder_cfg = self.model_args["transformer_encoder"]
 
@@ -75,6 +72,12 @@ class AtomAction_NSVQ(nn.Module):
             embedding_dim=gripper_open_output_dim,
         )
         self.gripper_open_projector = nn.Linear(gripper_open_output_dim, gripper_open_output_dim)
+
+        # Channel Encoder：[B, T, 512] -> [B, T, 512]
+        self.channel_encoder = ChannelEncoder(
+            hidden_dim=int(encoder_cfg["hidden_dim"]),
+            bottleneck_dim=int(channel_encoder_cfg["bottleneck_dim"]),
+        )
 
         # Transformer Encoder：[B, T, 512] -> [B, T, 512]
         self.transformer_encoder = TransformerEncoder(
@@ -119,8 +122,11 @@ class AtomAction_NSVQ(nn.Module):
             dim=-1,
         )
 
+        # Channel Encoder：[B, T, 512] -> [B, T, 512]
+        channel_encoded_features = self.channel_encoder(trajectory_features, trajectory_mask)
+
         # Transformer Encoder：[B, T, 512] -> [B, T, 512]
-        encoded_trajectory_features = self.transformer_encoder(trajectory_features, trajectory_mask)
+        encoded_trajectory_features = self.transformer_encoder(channel_encoded_features, trajectory_mask)
         return encoded_trajectory_features
 
 

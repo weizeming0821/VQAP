@@ -13,6 +13,8 @@ AtomAction_NSVQ:
   rope:
     theta: 10000.0
     max_seq_len: 2048
+  channel_encoder:
+    bottleneck_dim: 64
   transformer_encoder:
     hidden_dim: 512
     num_layers: 4

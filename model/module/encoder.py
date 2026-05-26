@@ -1,12 +1,46 @@
-from typing import Optional
-
 import torch
 import torch.nn as nn
 
 try:
-	from .utils import MultiHeadAttention, RotaryPositionEncoding1D
+	from .utils import ChannelAttention, MultiHeadAttention, RotaryPositionEncoding1D
 except ImportError:
-	from utils import MultiHeadAttention, RotaryPositionEncoding1D
+	from utils import ChannelAttention, MultiHeadAttention, RotaryPositionEncoding1D
+
+
+"""通道编码模块。
+
+输入：
+	__init__:
+		hidden_dim: int，输入输出维度 C。
+		bottleneck_dim: int，通道注意力瓶颈维度。
+	forward:
+		x: [B, T, C]
+		trajectory_mask: [B, T]，True 表示有效帧。
+
+输出：
+	forward:
+		channel_encoded_x: [B, T, C]
+"""
+class ChannelEncoder(nn.Module):
+
+	def __init__(self, hidden_dim: int, bottleneck_dim: int) -> None:
+		super().__init__()
+		self.channel_attention = ChannelAttention(
+			feature_dim=int(hidden_dim),
+			bottleneck_dim=int(bottleneck_dim),
+		)
+
+	"""先做逐帧通道注意力，再用 trajectory_mask 屏蔽 padding 位置。
+
+	维度变化：
+		x: [B, T, C] -> ChannelAttention -> [B, T, C]
+	"""
+	def forward(self, x: torch.Tensor, trajectory_mask: torch.Tensor) -> torch.Tensor:
+		valid_mask = trajectory_mask.unsqueeze(-1).to(x.dtype)
+		x = x * valid_mask
+		x = self.channel_attention(x)
+		x = x * valid_mask
+		return x
 
 
 """Transformer Encoder 单层。
