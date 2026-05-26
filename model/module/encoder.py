@@ -25,20 +25,33 @@ class ChannelEncoder(nn.Module):
 
 	def __init__(self, hidden_dim: int, bottleneck_dim: int) -> None:
 		super().__init__()
+		self.hidden_dim = int(hidden_dim)
 		self.channel_attention = ChannelAttention(
-			feature_dim=int(hidden_dim),
+			feature_dim=self.hidden_dim,
 			bottleneck_dim=int(bottleneck_dim),
+		)
+		self.output_ffn = nn.Sequential(
+			nn.Linear(self.hidden_dim, self.hidden_dim),
+			nn.LayerNorm(self.hidden_dim),
+			nn.GELU(),
+			nn.Linear(self.hidden_dim, self.hidden_dim),
 		)
 
 	"""先做逐帧通道注意力，再用 trajectory_mask 屏蔽 padding 位置。
 
 	维度变化：
-		x: [B, T, C] -> ChannelAttention -> [B, T, C]
+		x: [B, T, C] -> ChannelAttention -> [B, T, C] -> FFN(2层LLN) -> [B, T, C]
 	"""
 	def forward(self, x: torch.Tensor, trajectory_mask: torch.Tensor) -> torch.Tensor:
 		valid_mask = trajectory_mask.unsqueeze(-1).to(x.dtype)
+
+		# [B, T, C] -> [B, T, C]
 		x = x * valid_mask
 		x = self.channel_attention(x)
+		x = x * valid_mask
+
+		# [B, T, C] -> [B, T, C]
+		x = self.output_ffn(x)
 		x = x * valid_mask
 		return x
 
