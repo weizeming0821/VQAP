@@ -1,0 +1,15 @@
+AtomAction_NSVQ:
+  ee_branch:
+    hidden_dim: 384
+    output_dim: 192
+  body_branch:
+    hidden_dim: 384
+    output_dim: 192
+  gripper_mech_branch:
+    hidden_dim: 64
+    output_dim: 64
+  gripper_open_branch:
+    output_dim: 64
+  rope:
+    theta: 10000.0
+    max_seq_len: 2048
