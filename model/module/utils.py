@@ -1,3 +1,4 @@
+import math
 from typing import Optional, Tuple
 
 import torch
@@ -127,3 +128,110 @@ class RotaryPositionEncoding1D(nn.Module):
 			self._build_cache(seq_len=seq_len, device=device, dtype=dtype)
 
 		return self._cos_cached[:, :seq_len], self._sin_cached[:, :seq_len]
+
+
+"""多头注意力模块。
+
+输入：
+	__init__:
+		hidden_dim: int，输入与输出特征维度 C。
+		num_heads: int，注意力头数 H。
+		dropout: float，注意力权重的 dropout 概率。
+	forward:
+		query: [B, T_q, C]
+		key: [B, T_k, C]
+		value: [B, T_k, C]
+		trajectory_mask: [B, T_k]，True 表示有效帧。
+		rope_cos: [1, T, D_h]
+		rope_sin: [1, T, D_h]
+
+输出：
+	forward:
+		attention_output: [B, T_q, C]
+"""
+class MultiHeadAttention(nn.Module):
+
+	"""初始化多头注意力模块。"""
+	def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.0) -> None:
+		super().__init__()
+		if hidden_dim <= 0:
+			raise ValueError("hidden_dim must be a positive integer")
+		if num_heads <= 0:
+			raise ValueError("num_heads must be a positive integer")
+		if hidden_dim % num_heads != 0:
+			raise ValueError("hidden_dim must be divisible by num_heads")
+
+		self.hidden_dim = int(hidden_dim)
+		self.num_heads = int(num_heads)
+		self.head_dim = self.hidden_dim // self.num_heads
+
+		self.q_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+		self.k_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+		self.v_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+		self.out_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+		self.attention_dropout = nn.Dropout(dropout)
+
+	"""执行带 RoPE 和 padding mask 的多头注意力。
+
+	输入：
+		query: [B, T_q, C]
+		key/value: [B, T_k, C]
+		trajectory_mask: [B, T_k]
+		rope_cos/sin: [1, T, D_h]
+	输出：
+		attention_output: [B, T_q, C]
+	"""
+	def forward(
+		self,
+		query: torch.Tensor,
+		key: torch.Tensor,
+		value: torch.Tensor,
+		trajectory_mask: torch.Tensor,
+		rope_cos: torch.Tensor,
+		rope_sin: torch.Tensor,
+	) -> torch.Tensor:
+		if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
+			raise ValueError("query, key and value must have shape [B, T, C]")
+		if trajectory_mask.ndim != 2:
+			raise ValueError("trajectory_mask must have shape [B, T]")
+		if key.shape != value.shape:
+			raise ValueError("key and value must share the same shape")
+		if query.shape[0] != key.shape[0] or key.shape[:2] != trajectory_mask.shape:
+			raise ValueError("trajectory_mask must align with key/value shape [B, T_k]")
+
+		batch_size, query_length, _ = query.shape
+		key_length = key.shape[1]
+
+		# [B, T, C] -> [B, H, T, D_h]
+		query_states = self.q_proj(query).view(batch_size, query_length, self.num_heads, self.head_dim).transpose(1, 2)
+		key_states = self.k_proj(key).view(batch_size, key_length, self.num_heads, self.head_dim).transpose(1, 2)
+		value_states = self.v_proj(value).view(batch_size, key_length, self.num_heads, self.head_dim).transpose(1, 2)
+
+		query_states = RotaryPositionEncoding1D.apply_rotary(
+			query_states,
+			rope_cos[:, :query_length],
+			rope_sin[:, :query_length],
+		)
+		key_states = RotaryPositionEncoding1D.apply_rotary(
+			key_states,
+			rope_cos[:, :key_length],
+			rope_sin[:, :key_length],
+		)
+
+		# [B, H, T_q, D_h] x [B, H, D_h, T_k] -> [B, H, T_q, T_k]
+		attention_scores = torch.matmul(query_states, key_states.transpose(-1, -2)) / math.sqrt(self.head_dim)
+		key_padding_mask = (~trajectory_mask).unsqueeze(1).unsqueeze(2)
+		attention_scores = attention_scores.masked_fill(key_padding_mask, torch.finfo(attention_scores.dtype).min)
+
+		# [B, H, T_q, T_k] -> [B, H, T_q, T_k]
+		attention_weights = torch.softmax(attention_scores, dim=-1)
+		attention_weights = attention_weights * trajectory_mask.unsqueeze(1).unsqueeze(2).to(attention_weights.dtype)
+		attention_weights = self.attention_dropout(attention_weights)
+
+		# [B, H, T_q, T_k] x [B, H, T_k, D_h] -> [B, H, T_q, D_h]
+		attention_output = torch.matmul(attention_weights, value_states)
+		# [B, H, T_q, D_h] -> [B, T_q, C]
+		attention_output = attention_output.transpose(1, 2).contiguous().view(batch_size, query_length, self.hidden_dim)
+		return self.out_proj(attention_output)
+
+

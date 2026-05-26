@@ -1,12 +1,14 @@
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable
 
 import torch
 import torch.nn as nn
 
 try:
-    from .utils import *
+    from .transformer_encoder import TransformerEncoder
+    from .utils import TrajectoryProjectionMLP
 except ImportError:
-    from utils import *
+    from transformer_encoder import TransformerEncoder
+    from utils import TrajectoryProjectionMLP
 
 
 # 全局常量定义，各动作维度的输入维度
@@ -22,6 +24,7 @@ GRIPPER_OPEN_NUM_CLASSES = 2
         model_args: Dict[str, Any]
     forward:
         trajectory_data: Dict[str, torch.Tensor]
+        trajectory_mask: [B, T]，True 表示有效帧。
             gripper_pose: [B, T, 9]
             joint_positions: [B, T, 7]
             joint_velocities: [B, T, 7]
@@ -32,7 +35,7 @@ GRIPPER_OPEN_NUM_CLASSES = 2
 
 输出：
     forward:
-        trajectory_tokens: [B, T, 512]
+        encoded_trajectory_tokens: [B, T, 512]
 """
 class AtomAction_NSVQ(nn.Module):
 
@@ -40,13 +43,14 @@ class AtomAction_NSVQ(nn.Module):
         super(AtomAction_NSVQ, self).__init__()
 
         # 读取配置参数
-        self.model_args = model_args
+        self.model_args = model_args["AtomAction_NSVQ"] if "AtomAction_NSVQ" in model_args else model_args
 
-        ee_cfg = self.model_args.get("ee_branch")
-        body_cfg = self.model_args.get("body_branch")
-        gripper_mech_cfg = self.model_args.get("gripper_mech_branch")
-        gripper_open_cfg = self.model_args.get("gripper_open_branch")
-        rope_cfg = self.model_args.get("rope")
+        ee_cfg = self.model_args["ee_branch"]
+        body_cfg = self.model_args["body_branch"]
+        gripper_mech_cfg = self.model_args["gripper_mech_branch"]
+        gripper_open_cfg = self.model_args["gripper_open_branch"]
+        rope_cfg = self.model_args["rope"]
+        encoder_cfg = self.model_args["transformer_encoder"]
 
         # 初始化各分支的投影模块
         self.ee_projector = TrajectoryProjectionMLP(
@@ -72,29 +76,21 @@ class AtomAction_NSVQ(nn.Module):
         )
         self.gripper_open_projector = nn.Linear(gripper_open_output_dim, gripper_open_output_dim)
 
-        # 检查投影后的总维度是否符合预期
-        self.token_dim = (
-            int(ee_cfg["output_dim"])
-            + int(body_cfg["output_dim"])
-            + int(gripper_mech_cfg["output_dim"])
-            + gripper_open_output_dim
-        )
-        if self.token_dim != self.TARGET_TOKEN_DIM:
-            raise ValueError(
-                f"Projected token dim must be {self.TARGET_TOKEN_DIM}, got {self.token_dim}"
-            )
-
-        # 初始化 RoPE 模块
-        rope_input_dim =int(ee_cfg["output_dim"]) + int(body_cfg["output_dim"])+ int(gripper_mech_cfg["output_dim"])+ gripper_open_output_dim
-        self.rope = RotaryPositionEncoding1D(
-            feature_dim=rope_input_dim,
-            theta=float(rope_cfg["theta"]),
-            max_seq_len=int(rope_cfg["max_seq_len"]),
+        # Transformer Encoder：[B, T, 512] -> [B, T, 512]
+        self.transformer_encoder = TransformerEncoder(
+            hidden_dim=int(encoder_cfg["hidden_dim"]),
+            num_layers=int(encoder_cfg["num_layers"]),
+            num_heads=int(encoder_cfg["num_heads"]),
+            ffn_dim=int(encoder_cfg["ffn_dim"]),
+            dropout=float(encoder_cfg["dropout"]),
+            rope_theta=float(rope_cfg["theta"]),
+            rope_max_seq_len=int(rope_cfg["max_seq_len"]),
         )
 
-    
-    def forward(self, trajectory_data: Dict[str, torch.Tensor]) -> torch.Tensor:
-        
+    def forward(self, trajectory_data: Dict[str, torch.Tensor], trajectory_mask: torch.Tensor) -> torch.Tensor:
+        if trajectory_mask.ndim != 2:
+            raise ValueError("trajectory_mask must have shape [B, T]")
+
         # 读取各动作维度数据
         gripper_pose = trajectory_data["gripper_pose"]
         joint_positions = trajectory_data["joint_positions"]
@@ -120,8 +116,14 @@ class AtomAction_NSVQ(nn.Module):
         gripper_open_features = self.gripper_open_projector(self.gripper_open_embedding(gripper_open_ids))
 
         # 四组特征拼接：[B, T, 192+192+64+64] -> [B, T, 512]
-        trajectory_features = torch.cat((ee_features, body_features, gripper_mech_features, gripper_open_features),dim=-1,)
+        trajectory_tokens = torch.cat(
+            (ee_features, body_features, gripper_mech_features, gripper_open_features),
+            dim=-1,
+        )
 
+        # Transformer Encoder：[B, T, 512] -> [B, T, 512]
+        encoded_trajectory_tokens = self.transformer_encoder(trajectory_tokens, trajectory_mask)
+        return encoded_trajectory_tokens
 
 
     """计算模块参数量。"""
