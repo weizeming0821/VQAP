@@ -192,15 +192,14 @@ def _stats_to_tensor(values: Any, reference: torch.Tensor, field_name: str, stat
 	return stats_tensor
 
 
-"""按分位数把数据映射到 [-1, 1]，并截断极端值。"""
+"""按分位数线性归一化，使 q01/q99 对应 -1/1。"""
 def _quantile_normalize(
 	value: torch.Tensor,
 	q01: torch.Tensor,
 	q99: torch.Tensor,
 ) -> torch.Tensor:
 	denominator = (q99 - q01).clamp_min(NORMALIZATION_EPS)
-	normalized = ((value - q01) / denominator) * 2.0 - 1.0
-	return normalized.clamp_(-1.0, 1.0)
+	return ((value - q01) / denominator) * 2.0 - 1.0
 
 
 """按 Z-score 逐维归一化。"""
