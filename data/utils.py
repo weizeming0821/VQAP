@@ -9,7 +9,7 @@ from torchvision import transforms
 
 
 
-CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "global_config.yaml"
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "global.yaml"
 TRAJ_STATS_KEY = "traj_stats"
 NORMALIZATION_EPS = 1e-6
 ZSCORE_FIELDS = {"joint_positions", "gripper_joint_positions"}

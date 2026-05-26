@@ -32,7 +32,7 @@ LOW_DIM_FIELDS: List[str] = [
 ]
 
 IMAGE_SUFFIXES: Tuple[str, ...] = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
-GLOBAL_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "global_config.yaml"
+GLOBAL_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "global.yaml"
 
 
 """读取全局配置文件。"""
@@ -55,7 +55,7 @@ def load_global_config() -> Dict[str, Any]:
 输入：
     __init__:
 		dataset_root: str，数据集根目录路径。Action/Task/VariationX/Phase_XXX
-			会额外读取 config/global_config.yaml 中的 train_actions 配置，
+			会额外读取 config/global.yaml 中的 train_actions 配置，
 			必须为非空动作列表，并且每个动作都必须存在于数据集目录中。
 		views: Optional[Sequence[str]]，可选的视角名称列表，默认为 ALL_VIEWS 中的全部视角。
 		top_k: int，选择 top-k 个最优视角进行返回，默认为 1。
@@ -71,7 +71,7 @@ def load_global_config() -> Dict[str, Any]:
 			best_view: str，选定的视角名称。
 			best_start_image: torch.Tensor，首帧经过 transforms 处理后的图像张量，形状为 [3, H, W]。
 			best_end_image: torch.Tensor，末帧经过 transforms 处理后的图像张量，形状为 [3, H, W]。
-			best_score: torch.Tensor，0 维标量张量，dtype 由 config/global_config.yaml 中的 tensor_dtype 控制，分数越大表示视觉变化越明显。
+			best_score: torch.Tensor，0 维标量张量，dtype 由 config/global.yaml 中的 tensor_dtype 控制，分数越大表示视觉变化越明显。
 """
 class AtomActionDataset(Dataset):
 

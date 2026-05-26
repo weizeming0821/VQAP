@@ -43,7 +43,7 @@ VIEW_SELECTION_CACHE_VERSION = 1
                 其中 H = W = input_size，默认情况下为 [3, 224, 224]。
             best_end_image: torch.Tensor，末帧经过 transforms 处理后的图像张量，形状为 [3, H, W]。
                 其中 H = W = input_size，默认情况下为 [3, 224, 224]。
-            best_score: torch.Tensor，0 维标量张量，dtype 由 config/global_config.yaml 中的 tensor_dtype 控制。
+            best_score: torch.Tensor，0 维标量张量，dtype 由 config/global.yaml 中的 tensor_dtype 控制。
                 分数越大表示视觉变化越明显。
 """
 class View_Selector:
