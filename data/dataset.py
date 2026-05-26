@@ -6,9 +6,11 @@ import yaml
 from torch.utils.data import Dataset
 
 try:
-	from .view_select import ViewSelector
+    from .view_select import ViewSelector
+    from .utils import normalize
 except ImportError:
-	from view_select import ViewSelector
+    from view_select import ViewSelector
+    from utils import normalize
 
 
 ALL_VIEWS: List[str] = [
@@ -363,7 +365,10 @@ class AtomActionDataset(Dataset):
 
 		sample = self.samples[index]
 		observations = self.load_action_data(sample["pkl_path"])
-		trajectory_data = self._build_trajectory_data(observations)
+		trajectory_data = normalize(
+			trajectory_data=self._build_trajectory_data(observations),
+			dataset_root=self.dataset_root,
+		)
 
 		# 获取最优视角数据
 		selected_views = self.view_select(sample)

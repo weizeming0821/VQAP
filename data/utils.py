@@ -1,3 +1,5 @@
+import json
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -8,6 +10,10 @@ from torchvision import transforms
 
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "global_config.yaml"
+TRAJ_STATS_KEY = "traj_stats"
+NORMALIZATION_EPS = 1e-6
+ZSCORE_FIELDS = {"joint_positions", "gripper_joint_positions"}
+QUANTILE_FIELDS = {"joint_velocities", "joint_forces", "gripper_touch_forces"}
 SUPPORTED_TENSOR_DTYPES = {
 	"float16": torch.float16,
 	"float32": torch.float32,
@@ -159,6 +165,125 @@ def compute_and_save_statistics(dataset: Any) -> None:
 	_compute_statistics(dataset)
 
 
+"""读取数据集根目录 dataset_metadata.json 中的轨迹统计量。"""
+@lru_cache(maxsize=None)
+def _load_dataset_traj_stats(dataset_root: str) -> Dict[str, Dict[str, Any]]:
+	metadata_path = Path(dataset_root).expanduser().resolve() / "dataset_metadata.json"
+	if not metadata_path.is_file():
+		raise FileNotFoundError(f"dataset_metadata.json does not exist: {metadata_path}")
+
+	with metadata_path.open("r", encoding="utf-8") as file:
+		metadata = json.load(file)
+
+	traj_stats = metadata.get(TRAJ_STATS_KEY)
+	if not isinstance(traj_stats, dict) or len(traj_stats) == 0:
+		raise ValueError(f"Missing traj_stats in dataset metadata: {metadata_path}")
+	return traj_stats
+
+
+"""将统计量列表转成与参考张量同形状的张量。"""
+def _stats_to_tensor(values: Any, reference: torch.Tensor, field_name: str, stat_name: str) -> torch.Tensor:
+	stats_tensor = torch.as_tensor(values, dtype=reference.dtype)
+	if tuple(stats_tensor.shape) != tuple(reference.shape):
+		raise ValueError(
+			f"Invalid {stat_name} shape for field {field_name}: "
+			f"expected {tuple(reference.shape)}, got {tuple(stats_tensor.shape)}"
+		)
+	return stats_tensor
+
+
+"""按分位数把数据映射到 [-1, 1]，并截断极端值。"""
+def _quantile_normalize(
+	value: torch.Tensor,
+	q01: torch.Tensor,
+	q99: torch.Tensor,
+) -> torch.Tensor:
+	denominator = (q99 - q01).clamp_min(NORMALIZATION_EPS)
+	normalized = ((value - q01) / denominator) * 2.0 - 1.0
+	return normalized.clamp_(-1.0, 1.0)
+
+
+"""按 Z-score 逐维归一化。"""
+def _zscore_normalize(
+	value: torch.Tensor,
+	mean: torch.Tensor,
+	std: torch.Tensor,
+) -> torch.Tensor:
+	return (value - mean) / std.clamp_min(NORMALIZATION_EPS)
+
+
+"""将 [qx, qy, qz, qw] 四元数转成 6D 旋转表示。"""
+def _quaternion_to_rotation6d(quaternion: torch.Tensor) -> torch.Tensor:
+	if quaternion.shape != (4,):
+		raise ValueError(f"quaternion must have shape (4,), got {tuple(quaternion.shape)}")
+
+	unit_quaternion = quaternion / quaternion.norm().clamp_min(NORMALIZATION_EPS)
+	qx, qy, qz, qw = unit_quaternion.unbind(dim=0)
+	xx, yy, zz = qx * qx, qy * qy, qz * qz
+	xy, xz, yz = qx * qy, qx * qz, qy * qz
+	wx, wy, wz = qw * qx, qw * qy, qw * qz
+
+	rotation_matrix = torch.stack(
+		[
+			torch.stack((1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy))),
+			torch.stack((2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx))),
+			torch.stack((2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy))),
+		],
+		dim=0,
+	)
+	# 取旋转矩阵前两列并按列拼接，输出 [6]。
+	return torch.cat((rotation_matrix[:, 0], rotation_matrix[:, 1]), dim=0)
+
+
 """轨迹数据预处理函数"""
-def normalize():
-	pass
+def normalize(trajectory_data: Dict[str, Any], dataset_root: Any) -> Dict[str, Any]:
+	if not isinstance(trajectory_data, dict):
+		raise ValueError("trajectory_data must be a dictionary")
+
+	tensor_dtype = get_configured_tensor_dtype()
+	traj_stats = _load_dataset_traj_stats(str(dataset_root))
+	normalized_data: Dict[str, Any] = {}
+
+	for field_name, field_sequence in trajectory_data.items():
+		if field_name == "gripper_open":
+			normalized_data[field_name] = list(field_sequence)
+			continue
+
+		field_stats = traj_stats.get(field_name)
+		if not isinstance(field_stats, dict):
+			raise ValueError(f"Missing normalization stats for field: {field_name}")
+
+		normalized_sequence = []
+		for frame_value in field_sequence:
+			frame_tensor = _to_trajectory_tensor(frame_value, tensor_dtype)
+			if frame_tensor is None:
+				normalized_sequence.append(None)
+				continue
+
+			if field_name == "gripper_pose":
+				if frame_tensor.shape != (7,):
+					raise ValueError(f"gripper_pose must have shape (7,), got {tuple(frame_tensor.shape)}")
+				position_q01 = _stats_to_tensor(field_stats["q01"][:3], frame_tensor[:3], field_name, "q01")
+				position_q99 = _stats_to_tensor(field_stats["q99"][:3], frame_tensor[:3], field_name, "q99")
+				normalized_position = _quantile_normalize(frame_tensor[:3], position_q01, position_q99)
+				rotation6d = _quaternion_to_rotation6d(frame_tensor[3:])
+				# gripper_pose 由原始 7 维变成 [位置 3 维 + 旋转 6 维] 共 9 维。
+				normalized_sequence.append(torch.cat((normalized_position, rotation6d), dim=0).tolist())
+				continue
+
+			if field_name in ZSCORE_FIELDS:
+				mean = _stats_to_tensor(field_stats["mean"], frame_tensor, field_name, "mean")
+				std = _stats_to_tensor(field_stats["std"], frame_tensor, field_name, "std")
+				normalized_frame = _zscore_normalize(frame_tensor, mean, std)
+			elif field_name in QUANTILE_FIELDS:
+				q01 = _stats_to_tensor(field_stats["q01"], frame_tensor, field_name, "q01")
+				q99 = _stats_to_tensor(field_stats["q99"], frame_tensor, field_name, "q99")
+				normalized_frame = _quantile_normalize(frame_tensor, q01, q99)
+			else:
+				normalized_frame = frame_tensor
+
+			normalized_sequence.append(normalized_frame.tolist())
+
+		normalized_data[field_name] = normalized_sequence
+
+	return normalized_data
