@@ -106,6 +106,7 @@ class NSVQQuantizer(nn.Module):
 		)
 		self.reset_parameters()
 
+	"""均匀分布初始化，范围与码本大小成反比。码本越大，初始化值越接近 0。"""
 	def reset_parameters(self) -> None:
 		init_bound = 1.0 / float(self.codebook_size)
 		nn.init.uniform_(self.codebooks, -init_bound, init_bound)
@@ -118,19 +119,17 @@ class NSVQQuantizer(nn.Module):
 		squared_distances: [N, K]
 	"""
 	def compute_codebook_distances(self, inputs: torch.Tensor) -> torch.Tensor:
-		if inputs.ndim != 2:
-			raise ValueError("inputs must have shape [N, D]")
 		if inputs.shape[-1] != self.codebook_dim:
 			raise ValueError("inputs feature dim must match codebook_dim")
 
-		input_norm = (inputs ** 2).sum(dim=-1, keepdim=True)
-		codebook_norm = (self.codebooks ** 2).sum(dim=-1).unsqueeze(0)
-		squared_distances = input_norm + codebook_norm - 2.0 * inputs @ self.codebooks.t()
+		input_norm = (inputs ** 2).sum(dim=-1, keepdim=True)	# [N, D] -> [N, 1]
+		codebook_norm = (self.codebooks ** 2).sum(dim=-1).unsqueeze(0)	# [K, D] -> [1, K]
+		squared_distances = input_norm + codebook_norm - 2.0 * inputs @ self.codebooks.t()		# [N, 1] + [1, K] - 2 * [N, D] @ [D, K] -> [N, K]
 		return squared_distances
 
 	"""按离散索引查表取码本向量。"""
 	def lookup_codewords(self, codebook_indices: torch.Tensor) -> torch.Tensor:
-		flat_indices = codebook_indices.reshape(-1)
+		flat_indices = codebook_indices.reshape(-1)	
 		selected_codewords = self.codebooks.index_select(dim=0, index=flat_indices)
 		return selected_codewords.view(*codebook_indices.shape, self.codebook_dim)
 
