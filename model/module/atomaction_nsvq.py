@@ -1,9 +1,10 @@
-from typing import Any, Dict, Iterable
+from typing import Any, Dict
 
 import torch
 import torch.nn as nn
 
 from .encoder import ChannelEncoder, TransformerEncoder
+from .nsvq import DetailCodebookModule, GlobalCodebookModule
 from .utils import TrajectoryProjectionMLP
 
 
@@ -31,7 +32,19 @@ GRIPPER_OPEN_NUM_CLASSES = 2
 
 输出：
     forward:
-        encoded_trajectory_tokens: [B, T, 512]
+        trajectory_features: [B, T, 512]
+        channel_encoded_features: [B, T, 512]
+        z: [B, T, 512]
+        z_q_global: [B, 512]
+        h_g: [B, 256]
+        f_q_global: [B, 256]
+        k_g: [B]
+        perplexity_g: 标量
+        Z_q_detail: [B, 9, 512]
+        H_d: [B, 9, 256]
+        F_q_detail: [B, 9, 256]
+        K_d: [B, 9]
+        perplexity_d: 标量
 """
 class AtomAction_NSVQ(nn.Module):
 
@@ -48,6 +61,9 @@ class AtomAction_NSVQ(nn.Module):
         channel_encoder_cfg = self.model_args["channel_encoder"]
         rope_cfg = self.model_args["rope"]
         encoder_cfg = self.model_args["transformer_encoder"]
+        global_codebook_cfg = self.model_args["global_codebook"]
+        detail_codebook_cfg = self.model_args["detail_codebook"]
+        nsvq_cfg = self.model_args["nsvq"]
 
         # 初始化各分支的投影模块
         self.ee_projector = TrajectoryProjectionMLP(
@@ -90,7 +106,38 @@ class AtomAction_NSVQ(nn.Module):
             rope_max_seq_len=int(rope_cfg["max_seq_len"]),
         )
 
-    def forward(self, trajectory_data: Dict[str, torch.Tensor], trajectory_mask: torch.Tensor) -> torch.Tensor:
+        # 全局语义码本分支：[B, T, 512] + [B, T] -> [B, 256]
+        self.global_codebook_module = GlobalCodebookModule(
+            hidden_dim=int(encoder_cfg["hidden_dim"]),
+            codebook_dim=int(global_codebook_cfg["codebook_dim"]),
+            codebook_size=int(global_codebook_cfg["codebook_size"]),
+            replace_every=int(nsvq_cfg["replace_every"]),
+            discard_threshold=float(nsvq_cfg["discard_threshold"]),
+            replace_noise_scale=float(nsvq_cfg["replace_noise_scale"]),
+            eps=float(nsvq_cfg["eps"]),
+        )
+
+        # 细节语义码本分支：[B, T, 512] + [B, T] -> [B, N_detail, 256]
+        self.detail_codebook_module = DetailCodebookModule(
+            hidden_dim=int(encoder_cfg["hidden_dim"]),
+            num_queries=int(detail_codebook_cfg["num_queries"]),
+            num_heads=int(detail_codebook_cfg["num_heads"]),
+            codebook_dim=int(detail_codebook_cfg["codebook_dim"]),
+            codebook_size=int(detail_codebook_cfg["codebook_size"]),
+            dropout=float(detail_codebook_cfg["dropout"]),
+            rope_theta=float(rope_cfg["theta"]),
+            rope_max_seq_len=int(rope_cfg["max_seq_len"]),
+            replace_every=int(nsvq_cfg["replace_every"]),
+            discard_threshold=float(nsvq_cfg["discard_threshold"]),
+            replace_noise_scale=float(nsvq_cfg["replace_noise_scale"]),
+            eps=float(nsvq_cfg["eps"]),
+        )
+
+    def forward(
+        self,
+        trajectory_data: Dict[str, torch.Tensor],
+        trajectory_mask: torch.Tensor,
+    ) -> Any:
 
         # 读取各动作维度数据
         gripper_pose = trajectory_data["gripper_pose"]
@@ -127,7 +174,19 @@ class AtomAction_NSVQ(nn.Module):
 
         # Transformer Encoder：[B, T, 512] -> [B, T, 512]
         encoded_trajectory_features = self.transformer_encoder(channel_encoded_features, trajectory_mask)
-        return encoded_trajectory_features
+
+        # 全局语义码本分支：[B, T, 512] + [B, T] -> z_q_global [B, 512] -> h_g / f_q_global [B, 256]
+        global_codebook_outputs = self.global_codebook_module(encoded_trajectory_features, trajectory_mask)
+
+        # 细节语义码本分支：[B, T, 512] + [B, T] -> Z_q_detail [B, 9, 512] -> H_d / F_q_detail [B, 9, 256]
+        detail_codebook_outputs = self.detail_codebook_module(encoded_trajectory_features, trajectory_mask)
+
+        model_outputs = {
+            **global_codebook_outputs,
+            **detail_codebook_outputs,
+        }
+
+        return model_outputs
 
 
     """计算模块参数量。"""
@@ -139,6 +198,15 @@ class AtomAction_NSVQ(nn.Module):
         return {
             "total": total_params,
             "trainable": trainable_params,
+        }
+
+
+    """显式触发全局码本与细节码本的死码替换。"""
+    @torch.no_grad()
+    def replace_unused_codebooks(self):
+        return {
+            "replaced_codebooks_g": self.global_codebook_module.replace_unused_codebooks(),
+            "replaced_codebooks_d": self.detail_codebook_module.replace_unused_codebooks(),
         }
 
 

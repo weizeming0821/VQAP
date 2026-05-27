@@ -21,3 +21,17 @@ AtomAction_NSVQ:
     num_heads: 8
     ffn_dim: 2048
     dropout: 0.1
+  global_codebook:
+    codebook_size: 36
+    codebook_dim: 256
+  detail_codebook:
+    num_queries: 9
+    num_heads: 4
+    codebook_size: 256
+    codebook_dim: 256
+    dropout: 0.1
+  nsvq:
+    replace_every: 1000
+    discard_threshold: 0.1
+    replace_noise_scale: 1.0e-5
+    eps: 1.0e-6
