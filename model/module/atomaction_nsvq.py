@@ -1,4 +1,4 @@
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -22,13 +22,6 @@ GRIPPER_OPEN_NUM_CLASSES = 2
     forward:
         trajectory_data: Dict[str, torch.Tensor]
         trajectory_mask: [B, T]，True 表示有效帧。
-            gripper_pose: [B, T, 9]
-            joint_positions: [B, T, 7]
-            joint_velocities: [B, T, 7]
-            joint_forces: [B, T, 7]
-            gripper_joint_positions: [B, T, 2]
-            gripper_touch_forces: [B, T, 6]
-            gripper_open: [B, T, 1]
 
 输出：
     forward:
@@ -176,10 +169,16 @@ class AtomAction_NSVQ(nn.Module):
         encoded_trajectory_features = self.transformer_encoder(channel_encoded_features, trajectory_mask)
 
         # 全局语义码本分支：[B, T, 512] + [B, T] -> z_q_global [B, 512] -> h_g / f_q_global [B, 256]
-        global_codebook_outputs = self.global_codebook_module(encoded_trajectory_features, trajectory_mask)
+        global_codebook_outputs = self.global_codebook_module(
+            encoded_trajectory_features,
+            trajectory_mask,
+        )
 
         # 细节语义码本分支：[B, T, 512] + [B, T] -> Z_q_detail [B, 9, 512] -> H_d / F_q_detail [B, 9, 256]
-        detail_codebook_outputs = self.detail_codebook_module(encoded_trajectory_features, trajectory_mask)
+        detail_codebook_outputs = self.detail_codebook_module(
+            encoded_trajectory_features,
+            trajectory_mask,
+        )
 
         model_outputs = {
             **global_codebook_outputs,
