@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import torch
 import torch.nn as nn
@@ -25,19 +25,14 @@ GRIPPER_OPEN_NUM_CLASSES = 2
 
 输出：
     forward:
-        trajectory_features: [B, T, 512]
-        channel_encoded_features: [B, T, 512]
-        z: [B, T, 512]
-        z_q_global: [B, 512]
-        h_g: [B, 256]
-        f_q_global: [B, 256]
-        k_g: [B]
-        perplexity_g: 标量
-        Z_q_detail: [B, 9, 512]
-        H_d: [B, 9, 256]
-        F_q_detail: [B, 9, 256]
-        K_d: [B, 9]
-        perplexity_d: 标量
+        global_feature: [B, D]
+        global_codeword: [B, D]
+        global_codeindex: [B]
+        global_perplexity: 标量
+        detail_features: [B, N_detail, D]
+        detail_codewords: [B, N_detail, D]
+        detail_codeindices: [B, N_detail]
+        detail_perplexity: 标量
 """
 class AtomAction_NSVQ(nn.Module):
 
@@ -130,7 +125,7 @@ class AtomAction_NSVQ(nn.Module):
         self,
         trajectory_data: Dict[str, torch.Tensor],
         trajectory_mask: torch.Tensor,
-    ) -> Any:
+    ) -> Dict[str, torch.Tensor]:
 
         # 读取各动作维度数据
         gripper_pose = trajectory_data["gripper_pose"]
@@ -168,23 +163,38 @@ class AtomAction_NSVQ(nn.Module):
         # Transformer Encoder：[B, T, 512] -> [B, T, 512]
         encoded_trajectory_features = self.transformer_encoder(channel_encoded_features, trajectory_mask)
 
-        # 全局语义码本分支：[B, T, 512] + [B, T] -> z_q_global [B, 512] -> h_g / f_q_global [B, 256]
+        # 全局语义码本分支
         global_codebook_outputs = self.global_codebook_module(
             encoded_trajectory_features,
             trajectory_mask,
         )
 
-        # 细节语义码本分支：[B, T, 512] + [B, T] -> Z_q_detail [B, 9, 512] -> H_d / F_q_detail [B, 9, 256]
+        # 细节语义码本分支
         detail_codebook_outputs = self.detail_codebook_module(
             encoded_trajectory_features,
             trajectory_mask,
         )
 
-        model_outputs = {
-            **global_codebook_outputs,
-            **detail_codebook_outputs,
-        }
+        global_feature = global_codebook_outputs["global_feature"]          # [ B, D ]
+        global_codeword = global_codebook_outputs["global_codeword"]        # [ B, D ]
+        global_codeindex = global_codebook_outputs["global_codeindex"]      # [ B ]
+        global_perplexity = global_codebook_outputs["global_perplexity"]    # 标量
 
+        detail_features = detail_codebook_outputs["detail_features"]        # [B, N_detail, D]
+        detail_codewords = detail_codebook_outputs["detail_codewords"]      # [B, N_detail, D]
+        detail_codeindices = detail_codebook_outputs["detail_codeindexs"]   # [B, N_detail]
+        detail_perplexity = detail_codebook_outputs["detail_perplexity"]    # 标量
+
+        model_outputs = {
+            "global_feature": global_feature,
+            "global_codeword": global_codeword,
+            "global_codeindex": global_codeindex,
+            "global_perplexity": global_perplexity,
+            "detail_features": detail_features,
+            "detail_codewords": detail_codewords,
+            "detail_codeindices": detail_codeindices,
+            "detail_perplexity": detail_perplexity,
+        }
         return model_outputs
 
 
