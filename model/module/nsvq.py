@@ -458,18 +458,12 @@ class DetailCodebookModule(nn.Module):
 		# [B, N_detail, C] -> [B, N_detail, D]
 		projected_detail_features = self.projection(detail_query_features)
 
-		if codebook_indices is None:
-			# 量化器按 [N, D] 处理，因此先展平成 [B * N_detail, D]，量化后再 reshape 回去。
-			flat_projected_detail_features = projected_detail_features.reshape(batch_size * self.num_queries, self.codebook_dim)
-			flat_quantized_detail_features, flat_detail_codebook_indices, detail_perplexity = self.quantizer(
-				flat_projected_detail_features
-			)
-			quantized_detail_features = flat_quantized_detail_features.view(batch_size, self.num_queries, self.codebook_dim)
-			detail_codebook_indices = flat_detail_codebook_indices.view(batch_size, self.num_queries)
-		else:
-			quantized_detail_features, detail_codebook_indices, detail_perplexity = self.quantizer(
-				codebook_indices=codebook_indices
-			)
+		# 量化器按 [N, D] 处理，因此先展平成 [B * N_detail, D]，量化后再 reshape 回去。
+		flat_projected_detail_features = projected_detail_features.reshape(batch_size * self.num_queries, self.codebook_dim)
+		flat_quantized_detail_features, flat_detail_codebook_indices, detail_perplexity = self.quantizer(flat_projected_detail_features)
+
+		quantized_detail_features = flat_quantized_detail_features.view(batch_size, self.num_queries, self.codebook_dim)	# [B, N_detail, D]
+		detail_codebook_indices = flat_detail_codebook_indices.view(batch_size, self.num_queries)	# [B, N_detail]
 
 		return {
 			"detail_features": projected_detail_features,
