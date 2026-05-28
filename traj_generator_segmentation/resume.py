@@ -9,6 +9,15 @@ from datetime import datetime
 from rlbench.backend.const import VARIATIONS_FOLDER
 
 
+def _planned_variation_indices(task_variation_targets, task_name):
+    target = task_variation_targets.get(task_name, [])
+    if isinstance(target, int):
+        return list(range(max(0, int(target))))
+    if not target:
+        return []
+    return [int(index) for index in target]
+
+
 def append_timestamped_log(log_path, message):
     if not log_path:
         return
@@ -260,12 +269,11 @@ def inspect_existing_variations(output_path, task_names, task_variation_targets,
     incomplete_variations = []
 
     for task_name in task_names:
-        target_variations = int(task_variation_targets.get(task_name, 0))
         task_path = os.path.join(output_path, task_name)
         if not os.path.isdir(task_path):
             continue
 
-        for variation_index in range(target_variations):
+        for variation_index in _planned_variation_indices(task_variation_targets, task_name):
             variation_path = os.path.join(task_path, VARIATIONS_FOLDER % variation_index)
             if not os.path.isdir(variation_path):
                 continue
@@ -306,12 +314,11 @@ def inspect_existing_variations_for_complete(output_path, task_names, task_varia
     incomplete_variations = []
 
     for task_name in task_names:
-        target_variations = int(task_variation_targets.get(task_name, 0))
         task_path = os.path.join(output_path, task_name)
         if not os.path.isdir(task_path):
             continue
 
-        for variation_index in range(target_variations):
+        for variation_index in _planned_variation_indices(task_variation_targets, task_name):
             variation_path = os.path.join(task_path, VARIATIONS_FOLDER % variation_index)
             if not os.path.isdir(variation_path):
                 continue

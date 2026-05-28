@@ -89,6 +89,63 @@ def _disable_tqdm_output():
     return not _stream_is_tty(sys.stderr)
 
 
+def _argv_has_option(argv, option_name):
+    option_prefix = option_name + '='
+    for token in argv:
+        if token == option_name or token.startswith(option_prefix):
+            return True
+    return False
+
+
+def _normalize_variation_index_list(raw_indices):
+    if not raw_indices:
+        return []
+
+    normalized = []
+    seen = set()
+    for raw_index in raw_indices:
+        variation_index = int(raw_index)
+        if variation_index < 0:
+            raise ValueError('--variation_index only accepts non-negative integers')
+        if variation_index in seen:
+            continue
+        seen.add(variation_index)
+        normalized.append(variation_index)
+    return normalized
+
+
+def _configure_variation_selection_args(args, raw_argv=None):
+    raw_argv = list(raw_argv or [])
+    explicit_variations = _argv_has_option(raw_argv, '--variations')
+    requested_variation_indices = _normalize_variation_index_list(
+        getattr(args, 'variation_index', []))
+
+    args.variation_index = requested_variation_indices
+    args.variation_selection_warning = ''
+    if requested_variation_indices and explicit_variations:
+        requested_text = ' '.join(str(index) for index in requested_variation_indices)
+        args.variation_selection_warning = (
+            '[Warn] Both --variation_index and --variations were provided; '
+            f'will ignore --variations and use --variation_index {requested_text}'
+        )
+    return args
+
+
+def _planned_variation_indices(task_variation_targets, task_name):
+    target = task_variation_targets.get(task_name, [])
+    if isinstance(target, int):
+        return list(range(max(0, int(target))))
+    if not target:
+        return []
+    return [int(index) for index in target]
+
+
+def _count_planned_variations(task_variation_targets, task_names=None):
+    if task_names is None:
+        task_names = list(task_variation_targets.keys())
+    return sum(len(_planned_variation_indices(task_variation_targets, task_name)) for task_name in task_names)
+
+
 def _build_failure_detail(task_name, variation_index, episode_index, failure_type, reason, **extra):
     detail = {
         'task_name': task_name,
@@ -466,10 +523,13 @@ def _claim_next_variation(lock, task_index, variation_count, task_names, task_cl
             current_task_index = int(task_index.value)
             task_name = task_names[current_task_index]
             task_class = task_classes[current_task_index]
-            var_target = int(task_variation_targets.get(task_name, 0))
+            planned_variations = _planned_variation_indices(task_variation_targets, task_name)
+            var_target = len(planned_variations)
             completed_for_task = completed_variations.get(task_name, set())
 
-            while int(variation_count.value) < var_target and int(variation_count.value) in completed_for_task:
+            while (
+                    int(variation_count.value) < var_target
+                    and int(planned_variations[int(variation_count.value)]) in completed_for_task):
                 variation_count.value += 1
 
             if int(variation_count.value) >= var_target:
@@ -477,7 +537,7 @@ def _claim_next_variation(lock, task_index, variation_count, task_names, task_cl
                 task_index.value += 1
                 continue
 
-            claimed_variation = int(variation_count.value)
+            claimed_variation = int(planned_variations[int(variation_count.value)])
             variation_count.value += 1
             return task_class, task_name, claimed_variation
 
@@ -504,6 +564,7 @@ def write_progress_snapshot(progress_file, started_at, args, progress, worker_st
             'processes': int(args.processes),
             'episodes_per_task': int(args.episodes_per_task),
             'variations': int(args.variations),
+            'variation_index': list(getattr(args, 'variation_index', []) or []),
             'tasks': list(args.tasks),
             'base_seed': getattr(args, 'base_seed', None),
             'demo_timeout': int(args.demo_timeout),
@@ -516,16 +577,20 @@ def write_progress_snapshot(progress_file, started_at, args, progress, worker_st
 def estimate_total_episodes(task_files, args):
     """基于真实 RLBench variation_count() 预估总 episode 数。"""
     task_variation_targets = resolve_task_variation_targets(task_files, args)
-    total_variations = sum(task_variation_targets.values())
+    total_variations = _count_planned_variations(task_variation_targets, task_files)
     return int(total_variations * args.episodes_per_task), task_variation_targets
 
 
-def get_task_variation_target(task_env, args):
-    """返回当前任务本次运行会处理的 variation 数量上限。"""
-    var_target = int(task_env.variation_count())
+def get_task_variation_indices(task_env, args):
+    """返回当前任务本次运行会处理的 variation 编号列表。"""
+    available_variations = int(task_env.variation_count())
+    requested_variation_indices = list(getattr(args, 'variation_index', []) or [])
+    if requested_variation_indices:
+        return [index for index in requested_variation_indices if index < available_variations]
+
     if args.variations >= 0:
-        var_target = min(int(args.variations), var_target)
-    return var_target
+        available_variations = min(int(args.variations), available_variations)
+    return list(range(max(0, available_variations)))
 
 
 def _build_variation_probe_args(args):
@@ -535,19 +600,24 @@ def _build_variation_probe_args(args):
         'arm_max_velocity': float(args.arm_max_velocity),
         'arm_max_acceleration': float(args.arm_max_acceleration),
         'variations': int(args.variations),
+        'variation_index': list(getattr(args, 'variation_index', []) or []),
     }
 
 
 def _fallback_variation_targets(task_files, args):
+    requested_variation_indices = list(getattr(args, 'variation_index', []) or [])
+    if requested_variation_indices:
+        return {task_name: list(requested_variation_indices) for task_name in task_files}
+
     if int(args.variations) >= 0:
-        per_task_variations = int(args.variations)
+        per_task_variations = list(range(max(0, int(args.variations))))
     else:
-        per_task_variations = 1
-    return {task_name: per_task_variations for task_name in task_files}
+        per_task_variations = [0]
+    return {task_name: list(per_task_variations) for task_name in task_files}
 
 
 def _resolve_task_variation_targets_in_process(task_files, args):
-    """在当前进程中查询每个任务在当前参数下实际会处理的 variation 数量。"""
+    """在当前进程中查询每个任务在当前参数下实际会处理的 variation 列表。"""
     if not task_files:
         return {}
 
@@ -565,7 +635,7 @@ def _resolve_task_variation_targets_in_process(task_files, args):
         for task_name in task_files:
             task_class = task_file_to_task_class(task_name)
             task_env = rlbench_env.get_task(task_class)
-            variation_targets[task_name] = get_task_variation_target(task_env, args)
+            variation_targets[task_name] = get_task_variation_indices(task_env, args)
     finally:
         rlbench_env.shutdown()
 
@@ -588,7 +658,7 @@ def _variation_target_probe(task_files, probe_args, result_queue):
 
 
 def resolve_task_variation_targets(task_files, args):
-    """在独立 spawn 子进程中查询 variation 数，避免污染后续 worker fork。"""
+    """在独立 spawn 子进程中查询 variation 列表，避免污染后续 worker fork。"""
     if not task_files:
         return {}
 
@@ -1394,6 +1464,8 @@ def build_parser():
                         help='每个任务变体采集的 episode 数量')
     parser.add_argument('--variations', type=int, default=DEFAULT_VARIATIONS,
                         help='每个任务采集的变体数量上限，-1 表示全部')
+    parser.add_argument('--variation_index', nargs='+', type=int, default=[],
+                        help='显式指定要采集的 variation 编号列表；若提供则优先于 --variations')
     parser.add_argument('--arm_max_velocity', type=float, default=DEFAULT_ARM_MAX_VELOCITY,
                         help='运动规划使用的最大手臂速度')
     parser.add_argument('--arm_max_acceleration', type=float, default=DEFAULT_ARM_MAX_ACCELERATION,
@@ -1425,7 +1497,9 @@ def build_parser():
 
 
 def parse_args(argv=None):
-    return build_parser().parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(raw_argv)
+    return _configure_variation_selection_args(args, raw_argv)
 
 
 def run_segmented_collection(args):
@@ -1457,6 +1531,12 @@ def run_segmented_collection(args):
         f.write(f'[{datetime.now()}] [INFO] start segmented collection\n')
         f.write(f'[{datetime.now()}] [INFO] args={vars(args)}\n')
         f.write(f'[{datetime.now()}] [INFO] internal_watchdog_timeout={watchdog_timeout}\n')
+
+    variation_selection_warning = getattr(args, 'variation_selection_warning', '')
+    if variation_selection_warning:
+        print(variation_selection_warning)
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(f'[{datetime.now()}] [WARN] {variation_selection_warning}\n')
 
     args.fixed_phase_csv = resolve_fixed_phase_csv_path(args.fixed_phase_csv)
     fixed_phase_csv_exists = os.path.exists(args.fixed_phase_csv)
@@ -1503,6 +1583,12 @@ def run_segmented_collection(args):
 
     check_and_make(args.output_path)
     estimated_total, task_variation_targets = estimate_total_episodes(task_files, args)
+    planned_variations = _count_planned_variations(task_variation_targets, task_files)
+    if args.variation_index and planned_variations <= 0:
+        raise ValueError(
+            'No valid variation indices remain after resolving the selected tasks: '
+            + ' '.join(str(index) for index in args.variation_index)
+        )
 
     resume_state = {
         'completed_variations': {task_name: set() for task_name in task_files},
@@ -1534,7 +1620,7 @@ def run_segmented_collection(args):
         complete_message = (
             f'[Complete] restored_variations={restored_variations} '
             f'restored_episodes={restored_done} '
-            f'pending_variations={max(0, int(sum(task_variation_targets.values())) - restored_variations)} '
+            f'pending_variations={max(0, planned_variations - restored_variations)} '
             f'pending_episodes={max(0, int(estimated_total) - restored_done)}'
         )
         print(complete_message)
@@ -1570,7 +1656,6 @@ def run_segmented_collection(args):
     task_index = manager.Value('i', 0)
     variation_count = manager.Value('i', 0)
     lock = manager.Lock()
-    planned_variations = int(sum(task_variation_targets.values()))
     with open(log_file, 'a', encoding='utf-8') as f:
         f.write(
             f'[{datetime.now()}] [INFO] planned_variations={planned_variations} '

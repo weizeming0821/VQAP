@@ -70,6 +70,19 @@ def _write_json(path, payload):
         json.dump(payload, file_obj, ensure_ascii=False, indent=2)
 
 
+def _planned_variation_indices(task_variation_targets, task_name):
+    target = task_variation_targets.get(task_name, [])
+    if isinstance(target, int):
+        return list(range(max(0, int(target))))
+    if not target:
+        return []
+    return [int(index) for index in target]
+
+
+def _count_planned_variations(task_variation_targets, task_names):
+    return sum(len(_planned_variation_indices(task_variation_targets, task_name)) for task_name in task_names)
+
+
 def _build_launcher_state(args, resolved_csv_path, jobs, work_root, started_at, collection_args):
     return {
         'started_at': started_at.isoformat(),
@@ -91,6 +104,7 @@ def _build_launcher_state(args, resolved_csv_path, jobs, work_root, started_at, 
         'collection_config': {
             'episodes_per_task': int(collection_args.episodes_per_task),
             'variations': int(collection_args.variations),
+            'variation_index': list(getattr(collection_args, 'variation_index', []) or []),
             'save_mode': collection_args.save_mode,
             'demo_timeout': int(collection_args.demo_timeout),
         },
@@ -436,7 +450,7 @@ def _count_accounted_variations(variation_stats):
 
 
 def _snapshot_completion_status(snapshot, task_names, task_variation_targets, episodes_per_task):
-    planned_variations = sum(int(task_variation_targets.get(task_name, 0)) for task_name in task_names)
+    planned_variations = _count_planned_variations(task_variation_targets, task_names)
     planned_episodes = int(planned_variations * int(episodes_per_task))
     if not snapshot:
         return {
@@ -704,7 +718,10 @@ def _summarize_resume_progress(jobs, task_variation_targets, episodes_per_task, 
     pending_tasks = 0
 
     for job in jobs:
-        task_targets = {task_name: int(task_variation_targets.get(task_name, 0)) for task_name in job['tasks']}
+        task_targets = {
+            task_name: _planned_variation_indices(task_variation_targets, task_name)
+            for task_name in job['tasks']
+        }
         if complete:
             scan = inspect_existing_variations_for_complete(
                 job['output_path'],
@@ -722,14 +739,14 @@ def _summarize_resume_progress(jobs, task_variation_targets, episodes_per_task, 
             )
         job['resume_scan'] = scan
         job_completed_variations = sum(len(indices) for indices in scan['completed_variations'].values())
-        job_total_variations = sum(task_targets.values())
+        job_total_variations = sum(len(indices) for indices in task_targets.values())
         completed_variations += job_completed_variations
         total_variations += job_total_variations
         completed_episodes += int(scan['progress'].get('done_episodes', 0))
         pending_tasks += sum(
             1
             for task_name in job['tasks']
-            if len(scan['completed_variations'].get(task_name, set())) < int(task_targets.get(task_name, 0))
+            if len(scan['completed_variations'].get(task_name, set())) < len(task_targets.get(task_name, []))
         )
 
     total_episodes = int(total_variations * episodes_per_task)
@@ -799,6 +816,9 @@ def main(argv=None):
             + ', '.join(conflicts))
 
     collection_args = collection.parse_args(passthrough_args)
+    variation_selection_warning = getattr(collection_args, 'variation_selection_warning', '')
+    if variation_selection_warning:
+        print(variation_selection_warning)
 
     resolved_csv_path, task_names = _resolve_task_names(
         fixed_phase_csv=args.fixed_phase_csv,
