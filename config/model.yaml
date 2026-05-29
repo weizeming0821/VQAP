@@ -21,6 +21,7 @@ AtomAction_NSVQ:
     num_heads: 8
     ffn_dim: 2048
     dropout: 0.1
+    norm_type: layernorm
   global_codebook:
     codebook_size: 36
     codebook_dim: 256

@@ -92,6 +92,7 @@ class AtomAction_NSVQ(nn.Module):
             dropout=float(encoder_cfg["dropout"]),
             rope_theta=float(rope_cfg["theta"]),
             rope_max_seq_len=int(rope_cfg["max_seq_len"]),
+            norm_type=str(encoder_cfg.get("norm_type", "layernorm")),
         )
 
         # 全局语义码本分支：[B, T, 512] + [B, T] -> [B, 256]

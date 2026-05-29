@@ -2,9 +2,18 @@ import torch
 import torch.nn as nn
 
 try:
-	from .utils import ChannelAttention, MultiHeadAttention, RotaryPositionEncoding1D
+	from .utils import ChannelAttention, MultiHeadAttention, RMSNorm, RotaryPositionEncoding1D
 except ImportError:
-	from utils import ChannelAttention, MultiHeadAttention, RotaryPositionEncoding1D
+	from utils import ChannelAttention, MultiHeadAttention, RMSNorm, RotaryPositionEncoding1D
+
+
+def build_transformer_norm(hidden_dim: int, norm_type: str) -> nn.Module:
+	normalized_norm_type = str(norm_type).strip().lower()
+	if normalized_norm_type == "layernorm":
+		return nn.LayerNorm(hidden_dim)
+	if normalized_norm_type == "rmsnorm":
+		return RMSNorm(hidden_dim)
+	raise ValueError(f"Unsupported norm_type: {norm_type}")
 
 
 """通道编码模块。
@@ -64,6 +73,7 @@ class ChannelEncoder(nn.Module):
 		num_heads: int，注意力头数 H。
 		ffn_dim: int，前馈网络中间维度。
 		dropout: float，dropout 概率。
+		norm_type: str，`layernorm` 或 `rmsnorm`。
 	forward:
 		x: [B, T, C]
 		trajectory_mask: [B, T]
@@ -76,9 +86,17 @@ class ChannelEncoder(nn.Module):
 """
 class TransformerEncoderLayer(nn.Module):
 
-	def __init__(self, hidden_dim: int, num_heads: int, ffn_dim: int, dropout: float = 0.0) -> None:
+	def __init__(
+		self,
+		hidden_dim: int,
+		num_heads: int,
+		ffn_dim: int,
+		dropout: float = 0.0,
+		norm_type: str = "layernorm",
+	) -> None:
 		super().__init__()
-		self.attention_norm = nn.LayerNorm(hidden_dim)
+		self.norm_type = str(norm_type).strip().lower()
+		self.attention_norm = build_transformer_norm(hidden_dim, self.norm_type)
 		self.self_attention = MultiHeadAttention(
 			hidden_dim=hidden_dim,
 			num_heads=num_heads,
@@ -86,7 +104,7 @@ class TransformerEncoderLayer(nn.Module):
 		)
 		self.attention_dropout = nn.Dropout(dropout)
 
-		self.ffn_norm = nn.LayerNorm(hidden_dim)
+		self.ffn_norm = build_transformer_norm(hidden_dim, self.norm_type)
 		self.ffn = nn.Sequential(
 			nn.Linear(hidden_dim, ffn_dim),
 			nn.GELU(),
@@ -141,6 +159,7 @@ class TransformerEncoderLayer(nn.Module):
 		dropout: float，dropout 概率。
 		rope_theta: float，RoPE 频率基数。
 		rope_max_seq_len: int，RoPE 支持的最大序列长度。
+		norm_type: str，`layernorm` 或 `rmsnorm`，默认 `layernorm`。
 	forward:
 		x: [B, T, C]
 		trajectory_mask: [B, T]，True 表示有效帧。
@@ -160,6 +179,7 @@ class TransformerEncoder(nn.Module):
 		dropout: float,
 		rope_theta: float,
 		rope_max_seq_len: int,
+		norm_type: str = "layernorm",
 	) -> None:
 		super().__init__()
 		if hidden_dim % num_heads != 0:
@@ -169,6 +189,9 @@ class TransformerEncoder(nn.Module):
 		self.num_layers = int(num_layers)
 		self.num_heads = int(num_heads)
 		self.head_dim = self.hidden_dim // self.num_heads
+		self.norm_type = str(norm_type).strip().lower()
+		if self.norm_type not in {"layernorm", "rmsnorm"}:
+			raise ValueError("norm_type must be either 'layernorm' or 'rmsnorm'")
 
 		self.rope = RotaryPositionEncoding1D(
 			feature_dim=self.head_dim,
@@ -182,6 +205,7 @@ class TransformerEncoder(nn.Module):
 					num_heads=self.num_heads,
 					ffn_dim=int(ffn_dim),
 					dropout=float(dropout),
+					norm_type=self.norm_type,
 				)
 				for _ in range(self.num_layers)
 			]

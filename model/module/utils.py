@@ -4,6 +4,38 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
+
+"""RMSNorm 归一化模块。
+
+输入：
+	__init__:
+		feature_dim: int，输入特征维度。
+		eps: float，数值稳定项。
+	forward:
+		x: [..., C]
+
+输出：
+	forward:
+		与输入同形状的归一化结果。
+"""
+class RMSNorm(nn.Module):
+
+	def __init__(self, feature_dim: int, eps: float = 1e-6) -> None:
+		super().__init__()
+		if feature_dim <= 0:
+			raise ValueError("feature_dim must be positive")
+
+		self.feature_dim = int(feature_dim)
+		self.eps = float(eps)
+		self.weight = nn.Parameter(torch.ones(self.feature_dim))
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		if x.shape[-1] != self.feature_dim:
+			raise ValueError("input feature dim must match feature_dim")
+
+		rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+		return x * rms * self.weight
+
 """动作轨迹投影模块。
 
 输入：
