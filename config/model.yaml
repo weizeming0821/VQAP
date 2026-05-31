@@ -62,3 +62,10 @@ AtomAction_NSVQ:
     discard_threshold: 0.1
     replace_noise_scale: 1.0e-5
     eps: 1.0e-6
+
+VASA:
+  dinov2:
+    repo: facebookresearch/dinov2
+    model_name: dinov2_vitb14
+    input_size: 224
+    feature_dim: 768
