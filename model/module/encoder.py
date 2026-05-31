@@ -2,18 +2,9 @@ import torch
 import torch.nn as nn
 
 try:
-	from .utils import ChannelAttention, MultiHeadAttention, RMSNorm, RotaryPositionEncoding1D
+	from .utils import ChannelAttention, MultiHeadAttention, RMSNorm, RotaryPositionEncoding1D, build_norm_layer
 except ImportError:
-	from utils import ChannelAttention, MultiHeadAttention, RMSNorm, RotaryPositionEncoding1D
-
-
-def build_transformer_norm(hidden_dim: int, norm_type: str) -> nn.Module:
-	normalized_norm_type = str(norm_type).strip().lower()
-	if normalized_norm_type == "layernorm":
-		return nn.LayerNorm(hidden_dim)
-	if normalized_norm_type == "rmsnorm":
-		return RMSNorm(hidden_dim)
-	raise ValueError(f"Unsupported norm_type: {norm_type}")
+	from utils import ChannelAttention, MultiHeadAttention, RMSNorm, RotaryPositionEncoding1D, build_norm_layer
 
 
 """通道编码模块。
@@ -96,7 +87,7 @@ class TransformerEncoderLayer(nn.Module):
 	) -> None:
 		super().__init__()
 		self.norm_type = str(norm_type).strip().lower()
-		self.attention_norm = build_transformer_norm(hidden_dim, self.norm_type)
+		self.attention_norm = build_norm_layer(hidden_dim, self.norm_type)
 		self.self_attention = MultiHeadAttention(
 			hidden_dim=hidden_dim,
 			num_heads=num_heads,
@@ -104,7 +95,7 @@ class TransformerEncoderLayer(nn.Module):
 		)
 		self.attention_dropout = nn.Dropout(dropout)
 
-		self.ffn_norm = build_transformer_norm(hidden_dim, self.norm_type)
+		self.ffn_norm = build_norm_layer(hidden_dim, self.norm_type)
 		self.ffn = nn.Sequential(
 			nn.Linear(hidden_dim, ffn_dim),
 			nn.GELU(),

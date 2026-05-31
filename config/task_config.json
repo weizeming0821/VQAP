@@ -1,0 +1,35 @@
+{
+  "seen_tasks": [
+    "change_channel",
+    "close_box",
+    "close_fridge",
+    "close_laptop_lid",
+    "pour_from_cup_to_cup",
+    "push_buttons",
+    "put_knife_in_knife_block",
+    "setup_checkers",
+    "setup_chess",
+    "stack_blocks",
+    "take_off_weighing_scales",
+    "toilet_seat_down",
+    "tv_on"
+  ],
+  "unseen_tasks": [
+    "empty_container",
+    "empty_dishwasher",
+    "light_bulb_in",
+    "place_cups",
+    "place_hanger_on_rack",
+    "put_all_groceries_in_cupboard",
+    "put_books_on_bookshelf",
+    "put_bottle_in_fridge",
+    "put_shoes_in_box",
+    "put_tray_in_oven",
+    "slide_cabinet_open",
+    "slide_cabinet_open_and_place_cups",
+    "straighten_rope",
+    "take_cup_out_from_cabinet",
+    "take_shoes_out_of_box",
+    "weighing_scales"
+  ]
+}
