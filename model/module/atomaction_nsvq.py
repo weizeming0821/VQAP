@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 
 from .encoder import ChannelEncoder, TransformerEncoder
+from .flow_matching import FlowMatchingHead
 from .nsvq import DetailCodebookModule, GlobalCodebookModule
 from .utils import TrajectoryProjectionMLP
 
@@ -22,6 +23,8 @@ GRIPPER_OPEN_NUM_CLASSES = 2
     forward:
         trajectory_data: Dict[str, torch.Tensor]
         trajectory_mask: [B, T]，True 表示有效帧。
+        noisy_ee_trajectory: [B, T, 9]，加噪后的末端执行器轨迹。
+        timestep: [B] 或 [B, 1]，Flow Matching 流时间。
 
 输出：
     forward:
@@ -33,6 +36,9 @@ GRIPPER_OPEN_NUM_CLASSES = 2
         detail_codewords: [B, N_detail, D]
         detail_codeindices: [B, N_detail]
         detail_perplexity: 标量
+        position_vector_field: [B, T, 3]
+        rotation_vector_field: [B, T, 6]
+        gripper_logit: [B, T, 1]
 """
 class AtomAction_NSVQ(nn.Module):
 
@@ -51,6 +57,7 @@ class AtomAction_NSVQ(nn.Module):
         encoder_cfg = self.model_args["transformer_encoder"]
         global_codebook_cfg = self.model_args["global_codebook"]
         detail_codebook_cfg = self.model_args["detail_codebook"]
+        flow_matching_cfg = self.model_args["flow_matching_head"]
         nsvq_cfg = self.model_args["nsvq"]
 
         # 初始化各分支的投影模块
@@ -122,10 +129,19 @@ class AtomAction_NSVQ(nn.Module):
             eps=float(nsvq_cfg["eps"]),
         )
 
+        # Flow Matching Head：[B, T, 9] + [B] + 码本条件 -> 向量场 / 夹爪预测
+        self.flow_matching_head = FlowMatchingHead(
+            config=flow_matching_cfg,
+            rope_theta=float(rope_cfg["theta"]),
+            rope_max_seq_len=int(rope_cfg["max_seq_len"]),
+        )
+
     def forward(
         self,
         trajectory_data: Dict[str, torch.Tensor],
         trajectory_mask: torch.Tensor,
+        noisy_ee_trajectory: torch.Tensor,
+        timestep: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
 
         # 读取各动作维度数据
@@ -186,6 +202,15 @@ class AtomAction_NSVQ(nn.Module):
         detail_codeindices = detail_codebook_outputs["detail_codeindexs"]   # [B, N_detail]
         detail_perplexity = detail_codebook_outputs["detail_perplexity"]    # 标量
 
+        # Flow Matching Head：[B, T, 9] + [B] + 码本条件 -> 向量场 / 夹爪预测
+        flow_matching_outputs = self.flow_matching_head(
+            noisy_ee_trajectory=noisy_ee_trajectory,
+            timestep=timestep,
+            global_codeword=global_codeword,
+            detail_codewords=detail_codewords,
+            trajectory_mask=trajectory_mask,
+        )
+
         model_outputs = {
             "global_feature": global_feature,
             "global_codeword": global_codeword,
@@ -195,7 +220,9 @@ class AtomAction_NSVQ(nn.Module):
             "detail_codewords": detail_codewords,
             "detail_codeindices": detail_codeindices,
             "detail_perplexity": detail_perplexity,
+            **flow_matching_outputs,
         }
+        
         return model_outputs
 
 

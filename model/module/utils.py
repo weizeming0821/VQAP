@@ -36,6 +36,178 @@ class RMSNorm(nn.Module):
 		rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
 		return x * rms * self.weight
 
+
+"""按配置构造归一化层。
+
+输入：
+	feature_dim: int，隐藏维度。
+	norm_type: str，`layernorm` 或 `rmsnorm`。
+	eps: float，数值稳定项。
+
+输出：
+	归一化模块实例。
+"""
+def build_norm_layer(feature_dim: int, norm_type: str, eps: float = 1e-6) -> nn.Module:
+	normalized_norm_type = str(norm_type).strip().lower()
+	if normalized_norm_type == "layernorm":
+		return nn.LayerNorm(feature_dim)
+	if normalized_norm_type == "rmsnorm":
+		return RMSNorm(feature_dim, eps=eps)
+	raise ValueError(f"Unsupported norm_type: {norm_type}")
+
+
+"""将序列 mask 作用到 [B, T, C] 张量。
+
+输入：
+	sequence_tensor: [B, T, C]
+	trajectory_mask: [B, T]，True 表示有效帧。
+
+输出：
+	masked_tensor: [B, T, C]
+"""
+def apply_sequence_mask(sequence_tensor: torch.Tensor, trajectory_mask: torch.Tensor) -> torch.Tensor:
+	if trajectory_mask.ndim != 2:
+		raise ValueError("trajectory_mask must have shape [B, T]")
+	if sequence_tensor.shape[:2] != trajectory_mask.shape:
+		raise ValueError("sequence_tensor and trajectory_mask must share the same [B, T] shape")
+
+	valid_mask = trajectory_mask.unsqueeze(-1).to(sequence_tensor.dtype)
+	return sequence_tensor * valid_mask
+
+
+"""Flow Matching 时间步正弦嵌入。
+
+输入：
+	__init__:
+		embedding_dim: int，输出嵌入维度，必须为偶数。
+		min_period: float，最小周期。
+		max_period: float，最大周期。
+	forward:
+		timestep: [B] 或 [B, 1]。
+
+输出：
+	forward:
+		time_embedding: [B, embedding_dim]
+"""
+class SinusoidalTimestepEmbedding(nn.Module):
+
+	def __init__(self, embedding_dim: int, min_period: float = 4e-3, max_period: float = 4.0) -> None:
+		super().__init__()
+		if embedding_dim <= 0 or embedding_dim % 2 != 0:
+			raise ValueError("embedding_dim must be a positive even integer")
+		if min_period <= 0 or max_period <= 0:
+			raise ValueError("min_period and max_period must be positive")
+
+		self.embedding_dim = int(embedding_dim)
+		self.min_period = float(min_period)
+		self.max_period = float(max_period)
+
+	def forward(self, timestep: torch.Tensor) -> torch.Tensor:
+		if timestep.ndim == 2 and timestep.shape[-1] == 1:
+			timestep = timestep.squeeze(-1)
+		if timestep.ndim != 1:
+			raise ValueError("timestep must have shape [B] or [B, 1]")
+
+		half_dim = self.embedding_dim // 2
+		fractions = torch.linspace(0.0, 1.0, half_dim, device=timestep.device, dtype=torch.float32)
+		periods = self.min_period * (self.max_period / self.min_period) ** fractions
+		radians = timestep.to(dtype=torch.float32).unsqueeze(-1) * (2.0 * math.pi / periods)
+		return torch.cat((radians.sin(), radians.cos()), dim=-1)
+
+
+"""Transformer 风格前馈网络。
+
+输入：
+	__init__:
+		hidden_dim: int，输入输出维度。
+		ffn_dim: int，中间隐藏维度。
+		dropout: float，dropout 概率。
+	forward:
+		x: [B, T, C]
+
+输出：
+	forward:
+		ffn_output: [B, T, C]
+"""
+class TransformerFFN(nn.Module):
+
+	def __init__(self, hidden_dim: int, ffn_dim: int, dropout: float = 0.0) -> None:
+		super().__init__()
+		self.input_linear = nn.Linear(hidden_dim, ffn_dim)
+		self.activation = nn.GELU()
+		self.dropout = nn.Dropout(dropout)
+		self.output_linear = nn.Linear(ffn_dim, hidden_dim)
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		x = self.input_linear(x)
+		x = self.activation(x)
+		x = self.dropout(x)
+		return self.output_linear(x)
+
+
+"""根据条件向量生成 AdaRMSNorm 所需的 scale / shift / gate。
+
+输入：
+	__init__:
+		condition_dim: int，条件向量维度。
+		hidden_dim: int，目标隐藏维度。
+	forward:
+		condition: [B, condition_dim]
+
+输出：
+	forward:
+		gamma: [B, 1, hidden_dim]
+		beta: [B, 1, hidden_dim]
+		gate: [B, 1, hidden_dim]
+"""
+class AdaptiveModulation(nn.Module):
+
+	def __init__(self, condition_dim: int, hidden_dim: int) -> None:
+		super().__init__()
+		self.hidden_dim = int(hidden_dim)
+		self.projection = nn.Linear(int(condition_dim), self.hidden_dim * 3)
+		self.reset_parameters()
+
+	def reset_parameters(self) -> None:
+		nn.init.zeros_(self.projection.weight)
+		nn.init.zeros_(self.projection.bias)
+
+	def forward(self, condition: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+		if condition.ndim != 2:
+			raise ValueError("condition must have shape [B, condition_dim]")
+
+		gamma, beta, gate = self.projection(condition).chunk(3, dim=-1)
+		return gamma.unsqueeze(1), beta.unsqueeze(1), gate.unsqueeze(1)
+
+
+"""AdaRMSNorm 条件归一化模块。
+
+输入：
+	__init__:
+		hidden_dim: int，输入隐藏维度。
+		condition_dim: int，条件向量维度。
+		eps: float，RMSNorm 数值稳定项。
+	forward:
+		x: [B, T, C]
+		condition: [B, condition_dim]
+
+输出：
+	forward:
+		conditioned_x: [B, T, C]
+		gate: [B, 1, C]
+"""
+class AdaRMSNorm(nn.Module):
+
+	def __init__(self, hidden_dim: int, condition_dim: int, eps: float = 1e-6) -> None:
+		super().__init__()
+		self.norm = RMSNorm(hidden_dim, eps=eps)
+		self.modulation = AdaptiveModulation(condition_dim, hidden_dim)
+
+	def forward(self, x: torch.Tensor, condition: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+		gamma, beta, gate = self.modulation(condition)
+		conditioned_x = (1.0 + gamma) * self.norm(x) + beta
+		return conditioned_x, gate
+
 """动作轨迹投影模块。
 
 输入：
