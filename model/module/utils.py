@@ -66,8 +66,6 @@ def build_norm_layer(feature_dim: int, norm_type: str, eps: float = 1e-6) -> nn.
 	masked_tensor: [B, T, C]
 """
 def apply_sequence_mask(sequence_tensor: torch.Tensor, trajectory_mask: torch.Tensor) -> torch.Tensor:
-	if trajectory_mask.ndim != 2:
-		raise ValueError("trajectory_mask must have shape [B, T]")
 	if sequence_tensor.shape[:2] != trajectory_mask.shape:
 		raise ValueError("sequence_tensor and trajectory_mask must share the same [B, T] shape")
 
