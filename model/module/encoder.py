@@ -21,29 +21,41 @@ SUPPORTED_DINOV2_MODELS = {
 }
 
 
-"""DINOv2 CLS 特征提取器。
+"""DINOv2 特征提取器。
 
 输入：
 	__init__:
 		model_name: DINOv2 模型名称。
 		repo: torch.hub 仓库地址。
 		input_size: 输入图像尺寸。
-		feature_dim: CLS 特征维度。
+		feature_dim: 输出特征维度。
+		feature_type: 输出特征类型，`cls` 或 `patch`。
+		patch_pooling: 当 `feature_type=patch` 时，对 patch token 的池化方式。
 	forward:
 		images: [N, 3, H, W]
 
 输出：
 	forward:
-		cls_features: [N, feature_dim]
+		image_features: [N, feature_dim]
 """
 class DINO_FeatureExtractor(nn.Module):
 
-	def __init__(self, model_name: str, repo: str, input_size: int, feature_dim: int) -> None:
+	def __init__(
+		self,
+		model_name: str,
+		repo: str,
+		input_size: int,
+		feature_dim: int,
+		feature_type: str = "cls",
+		patch_pooling: str = "mean",
+	) -> None:
 		super().__init__()
 		self.model_name = str(model_name)
 		self.repo = str(repo)
 		self.input_size = int(input_size)
 		self.feature_dim = int(feature_dim)
+		self.feature_type = str(feature_type).strip().lower()
+		self.patch_pooling = str(patch_pooling).strip().lower()
 		self._validate_model_config()
 
 		try:
@@ -68,6 +80,10 @@ class DINO_FeatureExtractor(nn.Module):
 			)
 		if self.input_size <= 0 or self.input_size % 14 != 0:
 			raise ValueError("input_size must be a positive multiple of 14 for DINOv2")
+		if self.feature_type not in {"cls", "patch"}:
+			raise ValueError("feature_type must be either 'cls' or 'patch'")
+		if self.patch_pooling not in {"mean", "max"}:
+			raise ValueError("patch_pooling must be either 'mean' or 'max'")
 
 	@property
 	def device(self) -> torch.device:
@@ -76,6 +92,42 @@ class DINO_FeatureExtractor(nn.Module):
 	@property
 	def dtype(self) -> torch.dtype:
 		return next(self.backbone.parameters()).dtype
+
+	"""对 patch 特征进行池化。"""
+	def _pool_patch_features(self, patch_features: torch.Tensor) -> torch.Tensor:
+		if patch_features.ndim != 3:
+			raise ValueError(
+				"Expected patch features with shape [N, num_patches, feature_dim], "
+				f"got {tuple(patch_features.shape)}"
+			)
+		if patch_features.shape[-1] != self.feature_dim:
+			raise ValueError(
+				f"Expected patch features with last dim {self.feature_dim}, got {tuple(patch_features.shape)}"
+			)
+
+		if self.patch_pooling == "mean":
+			return patch_features.mean(dim=1)
+		return patch_features.max(dim=1).values
+
+	"""从 DINOv2 forward_features 输出中提取 CLS token 特征。"""
+	def _extract_cls_features(self, features: Any) -> torch.Tensor:
+		if isinstance(features, dict):
+			if "x_norm_clstoken" in features:
+				return features["x_norm_clstoken"]
+			if "x_prenorm" in features:
+				return features["x_prenorm"][:, 0]
+			raise ValueError("DINOv2 forward_features output does not contain CLS features")
+		return features
+
+	"""从 DINOv2 forward_features 输出中提取 patch token 特征，并进行池化。"""
+	def _extract_patch_features(self, features: Any) -> torch.Tensor:
+		if not isinstance(features, dict):
+			raise ValueError("Patch feature extraction requires dict output from DINOv2 forward_features")
+		if "x_norm_patchtokens" in features:
+			return self._pool_patch_features(features["x_norm_patchtokens"])
+		if "x_prenorm" in features and features["x_prenorm"].ndim == 3 and features["x_prenorm"].shape[1] > 1:
+			return self._pool_patch_features(features["x_prenorm"][:, 1:])
+		raise ValueError("DINOv2 forward_features output does not contain patch features")
 
 	def forward(self, images: torch.Tensor) -> torch.Tensor:
 		if images.ndim != 4 or images.shape[1] != 3:
@@ -87,21 +139,16 @@ class DINO_FeatureExtractor(nn.Module):
 
 		images = images.to(device=self.device, dtype=self.dtype)
 		features = self.backbone.forward_features(images)
-		if isinstance(features, dict):
-			if "x_norm_clstoken" in features:
-				cls_features = features["x_norm_clstoken"]
-			elif "x_prenorm" in features:
-				cls_features = features["x_prenorm"][:, 0]
-			else:
-				raise ValueError("DINOv2 forward_features output does not contain CLS features")
+		if self.feature_type == "cls":
+			image_features = self._extract_cls_features(features)
 		else:
-			cls_features = features
+			image_features = self._extract_patch_features(features)
 
-		if cls_features.ndim != 2 or cls_features.shape[-1] != self.feature_dim:
+		if image_features.ndim != 2 or image_features.shape[-1] != self.feature_dim:
 			raise ValueError(
-				f"Expected CLS features with shape [N, {self.feature_dim}], got {tuple(cls_features.shape)}"
+				f"Expected image features with shape [N, {self.feature_dim}], got {tuple(image_features.shape)}"
 			)
-		return cls_features
+		return image_features
 
 
 """多视角图像 CLS 编码器。
@@ -128,6 +175,8 @@ class ImageEncoder(nn.Module):
 			repo=str(dinov2_cfg["repo"]),
 			input_size=int(dinov2_cfg["input_size"]),
 			feature_dim=self.feature_dim,
+			feature_type=str(dinov2_cfg.get("feature_type", "cls")),
+			patch_pooling=str(dinov2_cfg.get("patch_pooling", "mean")),
 		)
 
 	"""检测输入的 selected_views 是否符合预期的批次格式，并返回每个样本的视角数量 K。"""
