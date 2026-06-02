@@ -8,7 +8,7 @@ from .encoder import ImageEncoder
 
 """VASA 模块。
 
-当前仅实现多视角 CLS 特征提取与融合。
+当前仅实现多视角图像特征提取与融合，支持 CLS / patch 两种 DINOv2 输出模式。
 
 输入：
 	__init__:
@@ -18,8 +18,8 @@ from .encoder import ImageEncoder
 
 输出：
 	forward:
-		fused_start_cls_features: [B, 768]
-		fused_end_cls_features: [B, 768]
+		start_img_features: [B, 768] (feature_type=cls) 或 [B, P, 768] (feature_type=patch)，其中 P 是 patch 数量。
+		end_img_features: [B, 768] (feature_type=cls) 或 [B, P, 768] (feature_type=patch)
 		view_weights: [B, K]
 """
 class VASA(nn.Module):

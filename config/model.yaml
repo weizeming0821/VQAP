@@ -69,5 +69,4 @@ VASA:
     model_name: dinov2_vitb14
     input_size: 224
     feature_dim: 768
-    feature_type: cls
-    patch_pooling: mean
+    feature_type: patch

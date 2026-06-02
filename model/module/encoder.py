@@ -30,13 +30,13 @@ SUPPORTED_DINOV2_MODELS = {
 		input_size: 输入图像尺寸。
 		feature_dim: 输出特征维度。
 		feature_type: 输出特征类型，`cls` 或 `patch`。
-		patch_pooling: 当 `feature_type=patch` 时，对 patch token 的池化方式。
 	forward:
 		images: [N, 3, H, W]
 
 输出：
 	forward:
-		image_features: [N, feature_dim]
+		feature_type=cls: image_features: [N, feature_dim]
+		feature_type=patch: image_features: [N, num_patches, feature_dim]
 """
 class DINO_FeatureExtractor(nn.Module):
 
@@ -47,7 +47,6 @@ class DINO_FeatureExtractor(nn.Module):
 		input_size: int,
 		feature_dim: int,
 		feature_type: str = "cls",
-		patch_pooling: str = "mean",
 	) -> None:
 		super().__init__()
 		self.model_name = str(model_name)
@@ -55,7 +54,6 @@ class DINO_FeatureExtractor(nn.Module):
 		self.input_size = int(input_size)
 		self.feature_dim = int(feature_dim)
 		self.feature_type = str(feature_type).strip().lower()
-		self.patch_pooling = str(patch_pooling).strip().lower()
 		self._validate_model_config()
 
 		try:
@@ -66,6 +64,7 @@ class DINO_FeatureExtractor(nn.Module):
 				f"repo={self.repo}, model={self.model_name}"
 			) from exc
 
+	"""验证 DINOv2 模型配置的合法性。"""
 	def _validate_model_config(self) -> None:
 		if self.repo != "facebookresearch/dinov2":
 			raise ValueError(
@@ -82,8 +81,6 @@ class DINO_FeatureExtractor(nn.Module):
 			raise ValueError("input_size must be a positive multiple of 14 for DINOv2")
 		if self.feature_type not in {"cls", "patch"}:
 			raise ValueError("feature_type must be either 'cls' or 'patch'")
-		if self.patch_pooling not in {"mean", "max"}:
-			raise ValueError("patch_pooling must be either 'mean' or 'max'")
 
 	@property
 	def device(self) -> torch.device:
@@ -92,22 +89,6 @@ class DINO_FeatureExtractor(nn.Module):
 	@property
 	def dtype(self) -> torch.dtype:
 		return next(self.backbone.parameters()).dtype
-
-	"""对 patch 特征进行池化。"""
-	def _pool_patch_features(self, patch_features: torch.Tensor) -> torch.Tensor:
-		if patch_features.ndim != 3:
-			raise ValueError(
-				"Expected patch features with shape [N, num_patches, feature_dim], "
-				f"got {tuple(patch_features.shape)}"
-			)
-		if patch_features.shape[-1] != self.feature_dim:
-			raise ValueError(
-				f"Expected patch features with last dim {self.feature_dim}, got {tuple(patch_features.shape)}"
-			)
-
-		if self.patch_pooling == "mean":
-			return patch_features.mean(dim=1)
-		return patch_features.max(dim=1).values
 
 	"""从 DINOv2 forward_features 输出中提取 CLS token 特征。"""
 	def _extract_cls_features(self, features: Any) -> torch.Tensor:
@@ -119,14 +100,12 @@ class DINO_FeatureExtractor(nn.Module):
 			raise ValueError("DINOv2 forward_features output does not contain CLS features")
 		return features
 
-	"""从 DINOv2 forward_features 输出中提取 patch token 特征，并进行池化。"""
+	"""从 DINOv2 forward_features 输出中提取 x_norm_patchtokens。"""
 	def _extract_patch_features(self, features: Any) -> torch.Tensor:
 		if not isinstance(features, dict):
 			raise ValueError("Patch feature extraction requires dict output from DINOv2 forward_features")
 		if "x_norm_patchtokens" in features:
-			return self._pool_patch_features(features["x_norm_patchtokens"])
-		if "x_prenorm" in features and features["x_prenorm"].ndim == 3 and features["x_prenorm"].shape[1] > 1:
-			return self._pool_patch_features(features["x_prenorm"][:, 1:])
+			return features["x_norm_patchtokens"]
 		raise ValueError("DINOv2 forward_features output does not contain patch features")
 
 	def forward(self, images: torch.Tensor) -> torch.Tensor:
@@ -141,17 +120,21 @@ class DINO_FeatureExtractor(nn.Module):
 		features = self.backbone.forward_features(images)
 		if self.feature_type == "cls":
 			image_features = self._extract_cls_features(features)
+			if image_features.ndim != 2 or image_features.shape[-1] != self.feature_dim:
+				raise ValueError(
+					f"Expected CLS features with shape [N, {self.feature_dim}], got {tuple(image_features.shape)}"
+				)
 		else:
 			image_features = self._extract_patch_features(features)
-
-		if image_features.ndim != 2 or image_features.shape[-1] != self.feature_dim:
-			raise ValueError(
-				f"Expected image features with shape [N, {self.feature_dim}], got {tuple(image_features.shape)}"
-			)
+			if image_features.ndim != 3 or image_features.shape[-1] != self.feature_dim:
+				raise ValueError(
+					"Expected patch features with shape "
+					f"[N, num_patches, {self.feature_dim}], got {tuple(image_features.shape)}"
+				)
 		return image_features
 
 
-"""多视角图像 CLS 编码器。
+"""多视角图像编码器。
 
 输入：
 	__init__:
@@ -161,8 +144,8 @@ class DINO_FeatureExtractor(nn.Module):
 
 输出：
 	forward:
-		fused_start_cls_features: [B, D]
-		fused_end_cls_features: [B, D]
+		fused_start_img_features: [B, 768] (feature_type=cls) 或 [B, P, 768] (feature_type=patch)，其中 P 是 patch 数量。
+		fused_end_img_features: [B, 768] (feature_type=cls) 或 [B, P, 768] (feature_type=patch)		feature_type=patch: fused_start_img_features / fused_end_img_features: [B, P, D]
 		view_weights: [B, K]
 """
 class ImageEncoder(nn.Module):
@@ -176,7 +159,6 @@ class ImageEncoder(nn.Module):
 			input_size=int(dinov2_cfg["input_size"]),
 			feature_dim=self.feature_dim,
 			feature_type=str(dinov2_cfg.get("feature_type", "cls")),
-			patch_pooling=str(dinov2_cfg.get("patch_pooling", "mean")),
 		)
 
 	"""检测输入的 selected_views 是否符合预期的批次格式，并返回每个样本的视角数量 K。"""
@@ -210,6 +192,7 @@ class ImageEncoder(nn.Module):
 				f"Failed to stack {image_key} from selected_views. All images must share shape [3, H, W]"
 			) from exc
 
+	"""从 selected_views 中提取 best_score，并堆叠成 [B, K] 的张量。"""
 	def _stack_score_batch(self, selected_views: Sequence[Sequence[Dict[str, Any]]]) -> torch.Tensor:
 		score_rows = []
 		for sample_views in selected_views:
@@ -233,19 +216,34 @@ class ImageEncoder(nn.Module):
 		flat_start_images = start_images.reshape(batch_size * num_views, channels, height, width)
 		flat_end_images = end_images.reshape(batch_size * num_views, channels, height, width)
 
-		start_cls_features = self.feature_extractor(flat_start_images).reshape(batch_size, num_views, self.feature_dim)
-		end_cls_features = self.feature_extractor(flat_end_images).reshape(batch_size, num_views, self.feature_dim)
+		start_img_features = self.feature_extractor(flat_start_images)
+		end_img_features = self.feature_extractor(flat_end_images)
 
-		if num_views == 1:
-			view_weights = torch.ones(batch_size, 1, device=start_cls_features.device, dtype=start_cls_features.dtype)
+		# 根据 feature_type 调整特征维度，准备后续的视角融合。
+		if self.feature_extractor.feature_type == "cls":
+			start_img_features = start_img_features.reshape(batch_size, num_views, self.feature_dim)
+			end_img_features = end_img_features.reshape(batch_size, num_views, self.feature_dim)
 		else:
-			view_scores = self._stack_score_batch(selected_views).to(device=start_cls_features.device, dtype=start_cls_features.dtype)
+			num_patches = start_img_features.shape[1]
+			start_img_features = start_img_features.reshape(batch_size, num_views, num_patches, self.feature_dim)
+			end_img_features = end_img_features.reshape(batch_size, num_views, num_patches, self.feature_dim)
+
+		# 如果只有一个视角，则直接使用该视角的特征作为融合结果，权重为 1。
+		if num_views == 1:
+			view_weights = torch.ones(batch_size, 1, device=start_img_features.device, dtype=start_img_features.dtype)
+		else:
+			view_scores = self._stack_score_batch(selected_views).to(device=start_img_features.device, dtype=start_img_features.dtype)
 			view_weights = view_scores / view_scores.sum(dim=1, keepdim=True).clamp_min(1e-6)
 
-		fused_start_cls_features = (start_cls_features * view_weights.unsqueeze(-1)).sum(dim=1)
-		fused_end_cls_features = (end_cls_features * view_weights.unsqueeze(-1)).sum(dim=1)
+		# 根据 feature_type 进行加权融合，得到最终的图像特征表示。
+		if self.feature_extractor.feature_type == "cls":
+			fused_start_img_features = (start_img_features * view_weights.unsqueeze(-1)).sum(dim=1)
+			fused_end_img_features = (end_img_features * view_weights.unsqueeze(-1)).sum(dim=1)
+		else:
+			fused_start_img_features = (start_img_features * view_weights[:, :, None, None]).sum(dim=1)
+			fused_end_img_features = (end_img_features * view_weights[:, :, None, None]).sum(dim=1)
 
-		return fused_start_cls_features, fused_end_cls_features, view_weights
+		return fused_start_img_features, fused_end_img_features, view_weights
 		
 
 """通道编码模块。
