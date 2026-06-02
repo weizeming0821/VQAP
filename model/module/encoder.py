@@ -261,7 +261,7 @@ class ImageEncoder(nn.Module):
 
 输出：
 	forward:
-		updated_query_features: [B, T, C]
+		query_features: [B, T, C]
 """
 class VisualSelfAttentionLayer(nn.Module):
 
@@ -312,7 +312,8 @@ class VisualSelfAttentionLayer(nn.Module):
 
 		ffn_input = self.ffn_norm(query_features)	# [B, T, C] -> [B, T, C]
 		ffn_output = self.ffn(ffn_input)	# [B, T, C] -> [B, T, C]
-		query_features = query_features + self.ffn_dropout(ffn_output)	# [B, T, C] -> [B, T, C]
+		query_features = self.ffn_dropout(ffn_output)	# [B, T, C] -> [B, T, C]
+		
 		return query_features
 
 
@@ -356,8 +357,7 @@ class VisualTransformerEncoder(nn.Module):
 		self.num_self_attention_layers = int(num_self_attention_layers)
 		self.num_heads = int(num_heads)
 		self.norm_type = str(norm_type).strip().lower()
-		if self.num_self_attention_layers <= 0:
-			raise ValueError("num_self_attention_layers must be positive")
+
 		if self.norm_type not in {"layernorm", "rmsnorm"}:
 			raise ValueError("norm_type must be either 'layernorm' or 'rmsnorm'")
 
@@ -411,14 +411,14 @@ class VisualTransformerEncoder(nn.Module):
 		end_tokens = self._to_token_sequence(end_img_features, feature_name="end_img_features")	# [B, 768]/[B, T, 768] -> [B, T, 768]
 		start_tokens = self._to_token_sequence(start_img_features, feature_name="start_img_features")	# [B, 768]/[B, T, 768] -> [B, T, 768]
 
-		if end_tokens.shape[0] != start_tokens.shape[0]:
-			raise ValueError("end_img_features and start_img_features must share the same batch size")
 		if end_tokens.shape != start_tokens.shape:
 			raise ValueError("end_img_features and start_img_features must share the same [B, T, C] shape")
 
+		delta_tokens = self.delta_projection(end_tokens - start_tokens)	# [B, T, 768] -> [B, T, hidden_dim]
+
 		query_tokens = self.query_projection(end_tokens)	# [B, T, 768] -> [B, T, hidden_dim]
 		key_value_tokens = self.key_value_projection(start_tokens)	# [B, T, 768] -> [B, T, hidden_dim]
-		delta_tokens = self.delta_projection(end_tokens - start_tokens)	# [B, T, 768] -> [B, T, hidden_dim]
+
 		key_value_mask = torch.ones(
 			key_value_tokens.shape[0],
 			key_value_tokens.shape[1],
