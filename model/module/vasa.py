@@ -30,13 +30,12 @@ class VASA(nn.Module):
 		self.image_encoder = ImageEncoder(dinov2_cfg=self.model_args["dinov2"])
 
 	def forward(self, selected_views: Sequence[Sequence[Dict[str, Any]]]) -> Dict[str, torch.Tensor]:
+		start_img_features, end_img_features, view_weights = self.image_encoder(selected_views)
 		
-        start_img_features, end_img_features, view_weights = self.image_encoder(selected_views)
+		model_outputs = {
+			"start_img_features": start_img_features,
+			"end_img_features": end_img_features,
+			"view_weights": view_weights,
+		}
 		
-        model_outputs = {
-            "start_img_features": start_img_features,
-            "end_img_features": end_img_features,
-            "view_weights": view_weights,
-        }
-		
-        return model_outputs
+		return model_outputs
