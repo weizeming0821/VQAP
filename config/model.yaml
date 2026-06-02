@@ -77,3 +77,29 @@ VASA:
     ffn_dim: 2048
     dropout: 0.1
     norm_type: layernorm
+  flow_matching_head:
+    input_dim: 9
+    hidden_dim: 512
+    time_embed_dim: 256
+    time_min_period: 0.004
+    time_max_period: 4.0
+    visual_condition_dim: 512
+    condition_hidden_dim: 512
+    num_layers: 8
+    num_heads: 8
+    ffn_dim: 2048
+    dropout: 0.1
+    rope_theta: 10000.0
+    rope_max_seq_len: 2048
+    condition_injection_layers: [1, 2, 3, 4, 5, 6, 7, 8]
+    position_branch:
+      num_layers: 2
+      ffn_dim: 2048
+      output_dim: 3
+    rotation_branch:
+      num_layers: 2
+      ffn_dim: 2048
+      output_dim: 6
+    gripper_branch:
+      hidden_dim: 512
+      output_dim: 1
