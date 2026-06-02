@@ -22,8 +22,6 @@ class RMSNorm(nn.Module):
 
 	def __init__(self, feature_dim: int, eps: float = 1e-6) -> None:
 		super().__init__()
-		if feature_dim <= 0:
-			raise ValueError("feature_dim must be positive")
 
 		self.feature_dim = int(feature_dim)
 		self.eps = float(eps)
@@ -93,8 +91,6 @@ class SinusoidalTimestepEmbedding(nn.Module):
 		super().__init__()
 		if embedding_dim <= 0 or embedding_dim % 2 != 0:
 			raise ValueError("embedding_dim must be a positive even integer")
-		if min_period <= 0 or max_period <= 0:
-			raise ValueError("min_period and max_period must be positive")
 
 		self.embedding_dim = int(embedding_dim)
 		self.min_period = float(min_period)
@@ -416,7 +412,7 @@ class MultiHeadAttention(nn.Module):
 		query: [B, T_q, C]
 		key/value: [B, T_k, C]
 		trajectory_mask: [B, T_k]
-		rope_cos/sin: [1, T, D_h]
+		rope_cos/sin: 可选，[1, T, D_h]；当为 None 时不使用 RoPE
 	输出：
 		attention_output: [B, T_q, C]
 	"""
@@ -426,29 +422,32 @@ class MultiHeadAttention(nn.Module):
 		key: torch.Tensor,
 		value: torch.Tensor,
 		trajectory_mask: torch.Tensor,
-		rope_cos: torch.Tensor,
-		rope_sin: torch.Tensor,
+		rope_cos: Optional[torch.Tensor] = None,
+		rope_sin: Optional[torch.Tensor] = None,
 	) -> torch.Tensor:
 
 		batch_size, query_length, _ = query.shape
 		key_length = key.shape[1]
+		if (rope_cos is None) != (rope_sin is None):
+			raise ValueError("rope_cos and rope_sin must both be provided or both be None")
 
 		# [B, T, C] -> [B, H, T, D_h]
 		query_states = self.q_proj(query).view(batch_size, query_length, self.num_heads, self.head_dim).transpose(1, 2)
 		key_states = self.k_proj(key).view(batch_size, key_length, self.num_heads, self.head_dim).transpose(1, 2)
 		value_states = self.v_proj(value).view(batch_size, key_length, self.num_heads, self.head_dim).transpose(1, 2)
 
-		# RoPE 位置编码
-		query_states = RotaryPositionEncoding1D.apply_rotary(
-			query_states,
-			rope_cos[:, :query_length],
-			rope_sin[:, :query_length],
-		)
-		key_states = RotaryPositionEncoding1D.apply_rotary(
-			key_states,
-			rope_cos[:, :key_length],
-			rope_sin[:, :key_length],
-		)
+		# RoPE 为可选项；视觉 patch 交互编码器默认不使用额外位置编码。
+		if rope_cos is not None and rope_sin is not None:
+			query_states = RotaryPositionEncoding1D.apply_rotary(
+				query_states,
+				rope_cos[:, :query_length],
+				rope_sin[:, :query_length],
+			)
+			key_states = RotaryPositionEncoding1D.apply_rotary(
+				key_states,
+				rope_cos[:, :key_length],
+				rope_sin[:, :key_length],
+			)
 
 		# [B, H, T_q, D_h] x [B, H, D_h, T_k] -> [B, H, T_q, T_k]
 		attention_scores = torch.matmul(query_states, key_states.transpose(-1, -2)) / math.sqrt(self.head_dim)

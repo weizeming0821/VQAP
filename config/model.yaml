@@ -70,3 +70,10 @@ VASA:
     input_size: 224
     feature_dim: 768
     feature_type: patch
+  transformer_encoder:
+    hidden_dim: 512
+    num_self_attention_layers: 2
+    num_heads: 8
+    ffn_dim: 2048
+    dropout: 0.1
+    norm_type: layernorm

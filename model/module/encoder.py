@@ -1,4 +1,4 @@
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -145,7 +145,7 @@ class DINO_FeatureExtractor(nn.Module):
 输出：
 	forward:
 		fused_start_img_features: [B, 768] (feature_type=cls) 或 [B, P, 768] (feature_type=patch)，其中 P 是 patch 数量。
-		fused_end_img_features: [B, 768] (feature_type=cls) 或 [B, P, 768] (feature_type=patch)		feature_type=patch: fused_start_img_features / fused_end_img_features: [B, P, D]
+		fused_end_img_features: [B, 768] (feature_type=cls) 或 [B, P, 768] (feature_type=patch)
 		view_weights: [B, K]
 """
 class ImageEncoder(nn.Module):
@@ -207,7 +207,7 @@ class ImageEncoder(nn.Module):
 			)
 		return torch.stack(score_rows, dim=0)
 
-	def forward(self, selected_views: Sequence[Sequence[Dict[str, Any]]]) -> Dict[str, torch.Tensor]:
+	def forward(self, selected_views: Sequence[Sequence[Dict[str, Any]]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 		num_views = self._validate_batch(selected_views)
 		start_images = self._stack_image_batch(selected_views, image_key="best_start_image")
 		end_images = self._stack_image_batch(selected_views, image_key="best_end_image")
@@ -245,6 +245,204 @@ class ImageEncoder(nn.Module):
 
 		return fused_start_img_features, fused_end_img_features, view_weights
 		
+
+"""视觉 Self-Attention 单层。
+
+输入：
+	__init__:
+		hidden_dim: int，输入与输出维度 C。
+		num_heads: int，注意力头数 H。
+		ffn_dim: int，前馈网络中间维度。
+		dropout: float，dropout 概率。
+		norm_type: str，`layernorm` 或 `rmsnorm`。
+	forward:
+		query_features: [B, T, C]
+		attention_mask: [B, T]，True 表示有效 token。
+
+输出：
+	forward:
+		updated_query_features: [B, T, C]
+"""
+class VisualSelfAttentionLayer(nn.Module):
+
+	def __init__(
+		self,
+		hidden_dim: int,
+		num_heads: int,
+		ffn_dim: int,
+		dropout: float = 0.0,
+		norm_type: str = "layernorm",
+	) -> None:
+		super().__init__()
+		self.attention_norm = build_norm_layer(hidden_dim, norm_type)
+		self.self_attention = MultiHeadAttention(
+			hidden_dim=hidden_dim,
+			num_heads=num_heads,
+			dropout=dropout,
+		)
+		self.attention_dropout = nn.Dropout(dropout)
+
+		self.ffn_norm = build_norm_layer(hidden_dim, norm_type)
+		self.ffn = nn.Sequential(
+			nn.Linear(hidden_dim, ffn_dim),
+			nn.GELU(),
+			nn.Dropout(dropout),
+			nn.Linear(ffn_dim, hidden_dim),
+		)
+		self.ffn_dropout = nn.Dropout(dropout)
+
+	def forward(
+		self,
+		query_features: torch.Tensor,
+		attention_mask: torch.Tensor,
+	) -> torch.Tensor:
+		if query_features.ndim != 3:
+			raise ValueError("query_features must have shape [B, T, C]")
+		if attention_mask.ndim != 2 or attention_mask.shape != query_features.shape[:2]:
+			raise ValueError("attention_mask must have shape [B, T] matching query_features")
+
+		attention_input = self.attention_norm(query_features)	# [B, T, C] -> [B, T, C]
+		attention_output = self.self_attention(
+			query=attention_input,
+			key=attention_input,
+			value=attention_input,
+			trajectory_mask=attention_mask,
+		)	# [B, T, C] -> [B, T, C]
+		query_features = query_features + self.attention_dropout(attention_output)	# [B, T, C] -> [B, T, C]
+
+		ffn_input = self.ffn_norm(query_features)	# [B, T, C] -> [B, T, C]
+		ffn_output = self.ffn(ffn_input)	# [B, T, C] -> [B, T, C]
+		query_features = query_features + self.ffn_dropout(ffn_output)	# [B, T, C] -> [B, T, C]
+		return query_features
+
+
+"""VASA 视觉交互 Transformer Encoder。
+
+输入：
+	__init__:
+		input_dim: int，图像特征维度，默认来自 DINOv2 的 768 维输出。
+		hidden_dim: int，视觉交互隐藏维度 C。
+		num_self_attention_layers: int，cross-attention 之后的 self-attention 层数。
+		num_heads: int，注意力头数 H。
+		ffn_dim: int，前馈网络中间维度。
+		dropout: float，dropout 概率。
+		norm_type: str，`layernorm` 或 `rmsnorm`。
+	forward:
+		end_img_features: [B, 768] 或 [B, T, 768]
+		start_img_features: [B, 768] 或 [B, T, 768]
+
+输出：
+	forward:
+		img_diff_features: [B, 1, hidden_dim] (CLS 模式) 或 [B, P, hidden_dim] (patch 模式)
+"""
+class VisualTransformerEncoder(nn.Module):
+
+	def __init__(
+		self,
+		input_dim: int,
+		hidden_dim: int,
+		num_self_attention_layers: int,
+		num_heads: int,
+		ffn_dim: int,
+		dropout: float = 0.0,
+		norm_type: str = "layernorm",
+	) -> None:
+		super().__init__()
+		if hidden_dim % num_heads != 0:
+			raise ValueError("hidden_dim must be divisible by num_heads")
+
+		self.input_dim = int(input_dim)
+		self.hidden_dim = int(hidden_dim)
+		self.num_self_attention_layers = int(num_self_attention_layers)
+		self.num_heads = int(num_heads)
+		self.norm_type = str(norm_type).strip().lower()
+		if self.num_self_attention_layers <= 0:
+			raise ValueError("num_self_attention_layers must be positive")
+		if self.norm_type not in {"layernorm", "rmsnorm"}:
+			raise ValueError("norm_type must be either 'layernorm' or 'rmsnorm'")
+
+		self.query_projection = nn.Linear(self.input_dim, self.hidden_dim)
+		self.key_value_projection = nn.Linear(self.input_dim, self.hidden_dim)
+		self.delta_projection = nn.Linear(self.input_dim, self.hidden_dim)
+
+		self.cross_attention_query_norm = build_norm_layer(self.hidden_dim, self.norm_type)
+		self.cross_attention_key_value_norm = build_norm_layer(self.hidden_dim, self.norm_type)
+		self.cross_attention = MultiHeadAttention(
+			hidden_dim=self.hidden_dim,
+			num_heads=self.num_heads,
+			dropout=float(dropout),
+		)
+		self.cross_attention_dropout = nn.Dropout(dropout)
+		self.self_attention_layers = nn.ModuleList(
+			[
+				VisualSelfAttentionLayer(
+					hidden_dim=self.hidden_dim,
+					num_heads=self.num_heads,
+					ffn_dim=int(ffn_dim),
+					dropout=float(dropout),
+					norm_type=self.norm_type,
+				)
+				for _ in range(self.num_self_attention_layers)
+			]
+		)
+
+	"""将 [B, C] 或 [B, T, C] 图像特征统一整理为序列形式。
+
+	维度变化：
+		[B, C] -> [B, 1, C]
+		[B, T, C] -> [B, T, C]
+	"""
+	def _to_token_sequence(self, image_features: torch.Tensor, feature_name: str) -> torch.Tensor:
+		if image_features.ndim == 2:
+			if image_features.shape[-1] != self.input_dim:
+				raise ValueError(f"{feature_name} last dim must be {self.input_dim}")
+			return image_features.unsqueeze(1)
+		if image_features.ndim == 3:
+			if image_features.shape[-1] != self.input_dim:
+				raise ValueError(f"{feature_name} last dim must be {self.input_dim}")
+			return image_features
+		raise ValueError(f"{feature_name} must have shape [B, {self.input_dim}] or [B, T, {self.input_dim}]")
+
+	def forward(
+		self,
+		end_img_features: torch.Tensor,
+		start_img_features: torch.Tensor,
+	) -> torch.Tensor:
+		end_tokens = self._to_token_sequence(end_img_features, feature_name="end_img_features")	# [B, 768]/[B, T, 768] -> [B, T, 768]
+		start_tokens = self._to_token_sequence(start_img_features, feature_name="start_img_features")	# [B, 768]/[B, T, 768] -> [B, T, 768]
+
+		if end_tokens.shape[0] != start_tokens.shape[0]:
+			raise ValueError("end_img_features and start_img_features must share the same batch size")
+		if end_tokens.shape != start_tokens.shape:
+			raise ValueError("end_img_features and start_img_features must share the same [B, T, C] shape")
+
+		query_tokens = self.query_projection(end_tokens)	# [B, T, 768] -> [B, T, hidden_dim]
+		key_value_tokens = self.key_value_projection(start_tokens)	# [B, T, 768] -> [B, T, hidden_dim]
+		delta_tokens = self.delta_projection(end_tokens - start_tokens)	# [B, T, 768] -> [B, T, hidden_dim]
+		key_value_mask = torch.ones(
+			key_value_tokens.shape[0],
+			key_value_tokens.shape[1],
+			device=key_value_tokens.device,
+			dtype=torch.bool,
+		)	# [B, T]
+
+		cross_attention_query = self.cross_attention_query_norm(query_tokens)	# [B, T, hidden_dim] -> [B, T, hidden_dim]
+		cross_attention_key_value = self.cross_attention_key_value_norm(key_value_tokens)	# [B, T, hidden_dim] -> [B, T, hidden_dim]
+		cross_attention_output = self.cross_attention(
+			query=cross_attention_query,
+			key=cross_attention_key_value,
+			value=cross_attention_key_value,
+			trajectory_mask=key_value_mask,
+		)	# [B, T, hidden_dim] -> [B, T, hidden_dim]
+		img_diff_features = self.cross_attention_dropout(cross_attention_output) + delta_tokens	# [B, T, hidden_dim] + [B, T, hidden_dim] -> [B, T, hidden_dim]
+
+		for layer in self.self_attention_layers:
+			img_diff_features = layer(
+				query_features=img_diff_features,
+				attention_mask=key_value_mask,
+			)	# [B, T, hidden_dim] -> [B, T, hidden_dim]
+		return img_diff_features
+
 
 """通道编码模块。
 
