@@ -77,6 +77,10 @@ VASA:
     ffn_dim: 2048
     dropout: 0.1
     norm_type: layernorm
+  future_predictor:
+    global_code_dim: 256
+    image_feature_dim: 768
+    ffn_hidden_dim: 3072
   flow_matching_head:
     input_dim: 9
     hidden_dim: 512
