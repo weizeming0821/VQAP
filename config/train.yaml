@@ -1,0 +1,13 @@
+flow_matching:
+  noise_std: 1.0
+
+loss:
+  lambda_ap: 1.0
+  lambda_ag: 0.5
+  lambda_rot: 1.0
+  lambda_grip: 1.0
+  lambda_sep: 0.01
+  future_weight_min: 0.05
+  future_weight_max: 0.5
+  future_warmup_steps: 100000
+  future_ramp_steps: 50000

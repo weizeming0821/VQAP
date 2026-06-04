@@ -244,6 +244,7 @@ class NSVQQuantizer(nn.Module):
 
 输出：
 	特征量化路径：
+		pooled_global_features: [B, C]，masked average pooling 后、投影前的全局特征。
 		global_feature: [B, D]，投影到码本空间后的全局特征。
 		global_codeword: [B, D]，NSVQ 量化后的全局码向量。
 		global_codeindex: [B]，全局码索引。
@@ -325,6 +326,7 @@ class GlobalCodebookModule(nn.Module):
 			codebook_indices=codebook_indices,
 		)
 		return {
+			"pooled_global_features": pooled_global_features,
 			"global_feature": projected_global_features,
 			"global_codeword": quantized_global_features,
 			"global_codeindex": global_codebook_indices,
@@ -345,13 +347,14 @@ class GlobalCodebookModule(nn.Module):
 
 输出：
 	特征量化路径：
+		detail_query_features: [B, N_detail, C]，cross-attention 后、投影前的细节 query 特征。
 		detail_features: [B, N_detail, D]，投影到码本空间后的细节特征。
 		detail_codewords: [B, N_detail, D]，NSVQ 量化后的细节码向量。
-		detail_codeindexs: [B, N_detail]，细节码索引矩阵。
+		detail_codeindices: [B, N_detail]，细节码索引矩阵。
 		detail_perplexity: 标量 tensor。
 	独立查表路径：
 		detail_codewords: [B, N_detail, D]
-		detail_codeindexs: [B, N_detail]
+		detail_codeindices: [B, N_detail]
 		detail_perplexity: 标量 tensor。
 """
 class DetailCodebookModule(nn.Module):
@@ -413,6 +416,7 @@ class DetailCodebookModule(nn.Module):
 		)
 		return {
 			"detail_codewords": quantized_detail_features,
+			"detail_codeindices": detail_codebook_indices,
 			"detail_codeindexs": detail_codebook_indices,
 			"detail_perplexity": detail_perplexity,
 		}
@@ -466,8 +470,10 @@ class DetailCodebookModule(nn.Module):
 		detail_codebook_indices = flat_detail_codebook_indices.view(batch_size, self.num_queries)	# [B, N_detail]
 
 		return {
+			"detail_query_features": detail_query_features,
 			"detail_features": projected_detail_features,
 			"detail_codewords": quantized_detail_features,
+			"detail_codeindices": detail_codebook_indices,
 			"detail_codeindexs": detail_codebook_indices,
 			"detail_perplexity": detail_perplexity,
 		}

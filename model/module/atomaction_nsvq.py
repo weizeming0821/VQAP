@@ -28,10 +28,12 @@ GRIPPER_OPEN_NUM_CLASSES = 2
 
 输出：
     forward:
+        pooled_global_features: [B, C]
         global_feature: [B, D]
         global_codeword: [B, D]
         global_codeindex: [B]
         global_perplexity: 标量
+        detail_query_features: [B, N_detail, C]
         detail_features: [B, N_detail, D]
         detail_codewords: [B, N_detail, D]
         detail_codeindices: [B, N_detail]
@@ -192,15 +194,17 @@ class AtomAction_NSVQ(nn.Module):
             trajectory_mask,
         )
 
-        global_feature = global_codebook_outputs["global_feature"]          # [ B, D ]
-        global_codeword = global_codebook_outputs["global_codeword"]        # [ B, D ]
-        global_codeindex = global_codebook_outputs["global_codeindex"]      # [ B ]
-        global_perplexity = global_codebook_outputs["global_perplexity"]    # 标量
+        pooled_global_features = global_codebook_outputs["pooled_global_features"]   # [B, C]
+        global_feature = global_codebook_outputs["global_feature"]                   # [B, D]
+        global_codeword = global_codebook_outputs["global_codeword"]                 # [B, D]
+        global_codeindex = global_codebook_outputs["global_codeindex"]               # [B]
+        global_perplexity = global_codebook_outputs["global_perplexity"]             # 标量
 
-        detail_features = detail_codebook_outputs["detail_features"]        # [B, N_detail, D]
-        detail_codewords = detail_codebook_outputs["detail_codewords"]      # [B, N_detail, D]
-        detail_codeindices = detail_codebook_outputs["detail_codeindexs"]   # [B, N_detail]
-        detail_perplexity = detail_codebook_outputs["detail_perplexity"]    # 标量
+        detail_query_features = detail_codebook_outputs["detail_query_features"]     # [B, N_detail, C]
+        detail_features = detail_codebook_outputs["detail_features"]                 # [B, N_detail, D]
+        detail_codewords = detail_codebook_outputs["detail_codewords"]               # [B, N_detail, D]
+        detail_codeindices = detail_codebook_outputs["detail_codeindices"]           # [B, N_detail]
+        detail_perplexity = detail_codebook_outputs["detail_perplexity"]             # 标量
 
         # Flow Matching Head：[B, T, 9] + [B] + 码本条件 -> 向量场 / 夹爪预测
         flow_matching_outputs = self.flow_matching_head(
@@ -212,10 +216,12 @@ class AtomAction_NSVQ(nn.Module):
         )
 
         model_outputs = {
+            "pooled_global_features": pooled_global_features,
             "global_feature": global_feature,
             "global_codeword": global_codeword,
             "global_codeindex": global_codeindex,
             "global_perplexity": global_perplexity,
+            "detail_query_features": detail_query_features,
             "detail_features": detail_features,
             "detail_codewords": detail_codewords,
             "detail_codeindices": detail_codeindices,
