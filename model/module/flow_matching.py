@@ -527,6 +527,15 @@ class FlowMatchingPredictionBranch(nn.Module):
 			nn.Linear(int(ffn_dim), int(output_dim)),
 		)
 
+	"""执行向量场输出头的项目特化初始化。"""
+	def init_parameters(self) -> None:
+		first_linear = self.output_mlp[0]
+		last_linear = self.output_mlp[-1]
+		nn.init.kaiming_normal_(first_linear.weight, mode="fan_in", nonlinearity="relu")
+		nn.init.zeros_(first_linear.bias)
+		nn.init.normal_(last_linear.weight, std=0.01)
+		nn.init.zeros_(last_linear.bias)
+
 	def forward(self, hidden_states: torch.Tensor, trajectory_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 		branch_hidden = apply_sequence_mask(hidden_states, trajectory_mask)
 		rope_cos, rope_sin = self.rope(seq_len=branch_hidden.shape[1], device=branch_hidden.device, dtype=branch_hidden.dtype)
@@ -565,6 +574,15 @@ class GripperPredictionBranch(nn.Module):
 			nn.Dropout(dropout),
 			nn.Linear(int(hidden_dim), int(output_dim)),
 		)
+
+	"""执行夹爪预测分支的项目特化初始化。"""
+	def init_parameters(self) -> None:
+		first_linear = self.network[0]
+		last_linear = self.network[-1]
+		nn.init.kaiming_normal_(first_linear.weight, mode="fan_in", nonlinearity="relu")
+		nn.init.zeros_(first_linear.bias)
+		nn.init.zeros_(last_linear.weight)
+		nn.init.zeros_(last_linear.bias)
 
 	def forward(self, position_hidden: torch.Tensor, trajectory_mask: torch.Tensor) -> torch.Tensor:
 		gripper_logit = self.network(position_hidden)
@@ -658,6 +676,12 @@ class FlowMatchingHead(nn.Module):
 			output_dim=int(gripper_branch_cfg["output_dim"]),
 			dropout=self.dropout,
 		)
+
+	"""执行 Flow Matching 条件融合层的项目特化初始化。"""
+	def init_parameters(self) -> None:
+		first_linear = self.condition_fusion[0]
+		nn.init.kaiming_normal_(first_linear.weight, mode="fan_in", nonlinearity="relu")
+		nn.init.zeros_(first_linear.bias)
 
 	def forward(
 		self,
@@ -784,6 +808,12 @@ class VisualFlowMatchingHead(nn.Module):
 			output_dim=int(gripper_branch_cfg["output_dim"]),
 			dropout=self.dropout,
 		)
+
+	"""执行视觉 Flow Matching 条件融合层的项目特化初始化。"""
+	def init_parameters(self) -> None:
+		first_linear = self.condition_fusion[0]
+		nn.init.kaiming_normal_(first_linear.weight, mode="fan_in", nonlinearity="relu")
+		nn.init.zeros_(first_linear.bias)
 
 	def forward(
 		self,

@@ -132,6 +132,11 @@ class TransformerFFN(nn.Module):
 		self.dropout = nn.Dropout(dropout)
 		self.output_linear = nn.Linear(ffn_dim, hidden_dim)
 
+	"""执行 TransformerFFN 的初始化。"""
+	def init_parameters(self) -> None:
+		nn.init.kaiming_normal_(self.input_linear.weight, mode="fan_in", nonlinearity="relu")
+		nn.init.zeros_(self.input_linear.bias)
+
 	def forward(self, x: torch.Tensor) -> torch.Tensor:
 		x = self.input_linear(x)
 		x = self.activation(x)
@@ -160,11 +165,14 @@ class AdaptiveModulation(nn.Module):
 		super().__init__()
 		self.hidden_dim = int(hidden_dim)
 		self.projection = nn.Linear(int(condition_dim), self.hidden_dim * 3)
-		self.reset_parameters()
 
 	def reset_parameters(self) -> None:
 		nn.init.zeros_(self.projection.weight)
 		nn.init.zeros_(self.projection.bias)
+
+	"""执行 AdaRMSNorm 调制层的初始化。"""
+	def init_parameters(self) -> None:
+		self.reset_parameters()
 
 	def forward(self, condition: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 		if condition.ndim != 2:
@@ -226,6 +234,12 @@ class TrajectoryProjectionMLP(nn.Module):
 			nn.Linear(hidden_dim, output_dim),
 		)
 
+	"""执行动作轨迹投影模块的初始化。"""
+	def init_parameters(self) -> None:
+		first_linear = self.network[0]
+		nn.init.kaiming_normal_(first_linear.weight, mode="fan_in", nonlinearity="relu")
+		nn.init.zeros_(first_linear.bias)
+
 	def forward(self, x: torch.Tensor) -> torch.Tensor:
 		return self.network(x)
 
@@ -256,6 +270,15 @@ class ChannelAttention(nn.Module):
 			nn.Linear(self.bottleneck_dim, self.feature_dim),
 			nn.Sigmoid(),
 		)
+
+	"""执行通道注意力门控的初始化。"""
+	def init_parameters(self) -> None:
+		first_linear = self.channel_gate[0]
+		last_linear = self.channel_gate[2]
+		nn.init.kaiming_normal_(first_linear.weight, mode="fan_in", nonlinearity="relu")
+		nn.init.zeros_(first_linear.bias)
+		nn.init.zeros_(last_linear.weight)
+		nn.init.constant_(last_linear.bias, -4.0)
 
 	"""对每个时间步独立执行通道注意力。
 
@@ -464,5 +487,3 @@ class MultiHeadAttention(nn.Module):
 		# [B, H, T_q, D_h] -> [B, T_q, C]
 		attention_output = attention_output.transpose(1, 2).contiguous().view(batch_size, query_length, self.hidden_dim)
 		return self.out_proj(attention_output)
-
-

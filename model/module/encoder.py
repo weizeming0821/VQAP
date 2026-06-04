@@ -291,6 +291,12 @@ class VisualSelfAttentionLayer(nn.Module):
 		)
 		self.ffn_dropout = nn.Dropout(dropout)
 
+	"""执行单层视觉自注意力 FFN 的项目特化初始化。"""
+	def init_parameters(self) -> None:
+		first_linear = self.ffn[0]
+		nn.init.kaiming_normal_(first_linear.weight, mode="fan_in", nonlinearity="relu")
+		nn.init.zeros_(first_linear.bias)
+
 	def forward(
 		self,
 		query_features: torch.Tensor,
@@ -474,6 +480,15 @@ class ChannelEncoder(nn.Module):
 			nn.Linear(self.hidden_dim, self.hidden_dim),
 		)
 
+	"""执行通道编码残差 FFN 的项目特化初始化。"""
+	def init_parameters(self) -> None:
+		first_linear = self.output_ffn[0]
+		last_linear = self.output_ffn[-1]
+		nn.init.kaiming_normal_(first_linear.weight, mode="fan_in", nonlinearity="relu")
+		nn.init.zeros_(first_linear.bias)
+		nn.init.zeros_(last_linear.weight)
+		nn.init.zeros_(last_linear.bias)
+
 	"""先做逐帧通道注意力，再用 trajectory_mask 屏蔽 padding 位置。
 
 	维度变化：
@@ -540,6 +555,12 @@ class TransformerEncoderLayer(nn.Module):
 			nn.Linear(ffn_dim, hidden_dim),
 		)
 		self.ffn_dropout = nn.Dropout(dropout)
+
+	"""执行单层 Transformer 编码 FFN 的项目特化初始化。"""
+	def init_parameters(self) -> None:
+		first_linear = self.ffn[0]
+		nn.init.kaiming_normal_(first_linear.weight, mode="fan_in", nonlinearity="relu")
+		nn.init.zeros_(first_linear.bias)
 
 	"""执行单层 Pre-LN Transformer 编码。
 

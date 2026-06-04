@@ -104,12 +104,15 @@ class NSVQQuantizer(nn.Module):
 			torch.zeros(self.codebook_size, dtype=torch.long),
 			persistent=True,
 		)
-		self.reset_parameters()
 
 	"""均匀分布初始化，范围与码本大小成反比。码本越大，初始化值越接近 0。"""
 	def reset_parameters(self) -> None:
 		init_bound = 1.0 / float(self.codebook_size)
 		nn.init.uniform_(self.codebooks, -init_bound, init_bound)
+
+	"""执行 NSVQ 码本的项目特化初始化。"""
+	def init_parameters(self) -> None:
+		self.reset_parameters()
 
 	"""计算输入与整张码本的平方欧氏距离。
 
@@ -406,6 +409,10 @@ class DetailCodebookModule(nn.Module):
 			replace_noise_scale=float(replace_noise_scale),
 			eps=float(eps),
 		)
+
+	"""执行细节查询槽位的项目特化初始化。"""
+	def init_parameters(self) -> None:
+		nn.init.normal_(self.learnable_queries, mean=0.0, std=0.02)
 
 	def lookup_codewords(self, codebook_indices: torch.Tensor) -> Dict[str, torch.Tensor]:
 		if codebook_indices.ndim != 2 or codebook_indices.shape[1] != self.num_queries:

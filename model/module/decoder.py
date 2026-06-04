@@ -27,6 +27,15 @@ class FuturePredictionFFN(nn.Module):
 		self.act2 = nn.GELU()
 		self.fc3 = nn.Linear(self.hidden_dim, self.feature_dim)
 
+	"""执行未来帧预测 FFN 的项目特化初始化。"""
+	def init_parameters(self) -> None:
+		nn.init.kaiming_normal_(self.fc1.weight, mode="fan_in", nonlinearity="relu")
+		nn.init.zeros_(self.fc1.bias)
+		nn.init.kaiming_normal_(self.fc2.weight, mode="fan_in", nonlinearity="relu")
+		nn.init.zeros_(self.fc2.bias)
+		nn.init.normal_(self.fc3.weight, std=0.01)
+		nn.init.zeros_(self.fc3.bias)
+
 	def forward(self, patch_features: torch.Tensor) -> torch.Tensor:
 		hidden_features = self.act1(self.fc1(patch_features))	# [B, P, C] -> [B, P, H]
 		hidden_features = self.act2(self.fc2(hidden_features))	# [B, P, H] -> [B, P, H]
@@ -61,6 +70,11 @@ class FutureFramePredictor(nn.Module):
 			feature_dim=self.image_feature_dim,
 			hidden_dim=int(ffn_hidden_dim),
 		)
+
+	"""执行未来帧预测器 FiLM 调制层的项目特化初始化。"""
+	def init_parameters(self) -> None:
+		nn.init.zeros_(self.film_linear.weight)
+		nn.init.zeros_(self.film_linear.bias)
 
 	"""将 CLS 或 patch 特征统一整理为 patch 序列形式。
 
