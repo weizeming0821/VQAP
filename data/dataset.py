@@ -389,7 +389,7 @@ class AtomActionDataset(Dataset):
 
 # 简单测试
 if __name__ == "__main__":
-	dataset = AtomActionDataset(dataset_root="AtomAction_Dataset_re", views=["front"])
+	dataset = AtomActionDataset(dataset_root="AtomAction_Dataset", views=["front"])
 	print(f"Dataset contains {len(dataset)} samples.")
 	sample = dataset[0]
 	print(f"Sample 0 action: {sample['Action']}")

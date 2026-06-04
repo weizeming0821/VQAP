@@ -342,16 +342,16 @@ ViewSelector = View_Selector
 # 简单测试
 if __name__ == "__main__":
     selector = View_Selector()
-    start_paths = ["AtomAction_Dataset_re/approach/close_grill/Variation0/Phase_001/front_rgb/0.png", 
-                   "AtomAction_Dataset_re/approach/close_grill/Variation0/Phase_001/left_shoulder_rgb/0.png",
-                   "AtomAction_Dataset_re/approach/close_grill/Variation0/Phase_001/right_shoulder_rgb/0.png",
-                   "AtomAction_Dataset_re/approach/close_grill/Variation0/Phase_001/overhead_rgb/0.png",
-                   "AtomAction_Dataset_re/approach/close_grill/Variation0/Phase_001/wrist_rgb/0.png"]
-    end_paths = ["AtomAction_Dataset_re/approach/close_grill/Variation0/Phase_001/front_rgb/67.png", 
-                 "AtomAction_Dataset_re/approach/close_grill/Variation0/Phase_001/left_shoulder_rgb/67.png",
-                 "AtomAction_Dataset_re/approach/close_grill/Variation0/Phase_001/right_shoulder_rgb/67.png",
-                 "AtomAction_Dataset_re/approach/close_grill/Variation0/Phase_001/overhead_rgb/67.png",
-                 "AtomAction_Dataset_re/approach/close_grill/Variation0/Phase_001/wrist_rgb/67.png"]
+    start_paths = ["AtomAction_Dataset/approach/close_grill/variation0/phase_001/front_rgb/0.png", 
+                   "AtomAction_Dataset/approach/close_grill/variation0/phase_001/left_shoulder_rgb/0.png",
+                   "AtomAction_Dataset/approach/close_grill/variation0/phase_001/right_shoulder_rgb/0.png",
+                   "AtomAction_Dataset/approach/close_grill/variation0/phase_001/overhead_rgb/0.png",
+                   "AtomAction_Dataset/approach/close_grill/variation0/phase_001/wrist_rgb/0.png"]
+    end_paths = ["AtomAction_Dataset/approach/close_grill/variation0/phase_001/front_rgb/67.png", 
+                 "AtomAction_Dataset/approach/close_grill/variation0/phase_001/left_shoulder_rgb/67.png",
+                 "AtomAction_Dataset/approach/close_grill/variation0/phase_001/right_shoulder_rgb/67.png",
+                 "AtomAction_Dataset/approach/close_grill/variation0/phase_001/overhead_rgb/67.png",
+                 "AtomAction_Dataset/approach/close_grill/variation0/phase_001/wrist_rgb/67.png"]
     view_names = ["front", "left_shoulder", "right_shoulder", "overhead", "wrist"]
 
     try:

@@ -28,6 +28,7 @@ train_act_dim:
 
 # AtomAction_Dataset 相关配置
 atomactiondataset:
+  dataset_root: "AtomAction_Dataset"
   tok_k: 1
   view_selector:
     model_name: "dinov2_vits14_reg"
