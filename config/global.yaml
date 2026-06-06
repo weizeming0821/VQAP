@@ -7,14 +7,19 @@ train_actions:
   - flip-close
   - flip-open
   - grasp
+  - hang
+  - insert
   - lift
   - place
   - press
   - pull
   - push
+  - revolve-in
   - revolve-out
   - rotate
+  - slide
   - transfer
+  - wipe
 
 # VQAP 输入的动作维度白名单
 train_act_dim:
