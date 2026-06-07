@@ -574,12 +574,11 @@ class VQAPTrainer:
 			model.vasa.visual_transformer_encoder.eval()
 			model.vasa.flow_matching_head.eval()
 
-		metric_sums = {metric_name: 0.0 for metric_name in EPOCH_METRIC_KEYS}
-		num_steps = 0
-		last_grad_norm_value = 0.0
+		metric_sums = {metric_name: 0.0 for metric_name in EPOCH_METRIC_KEYS}	# 累积指标总和的字典
+		num_steps = 0	# 记录当前 epoch 跑了多少个 batch，用于后续计算平均指标
+		last_grad_norm_value = 0.0	# 记录最后一个 batch 的 grad norm，用于日志记录和死码替换决策
 
 		for batch in self.train_loader:
-			# `selected_views` 保持列表结构，只有轨迹张量会被搬到 device 上。
 			batch = move_batch_to_device(batch, self.device)
 			self.optimizer.zero_grad(set_to_none=True)
 			with self._get_autocast_context():
