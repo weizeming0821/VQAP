@@ -253,12 +253,16 @@ class VQAPTrainer:
 			self.logger.info(f"Loading checkpoint from {self.resume_path}")
 		return torch.load(self.resume_path, map_location="cpu")
 
-	"""构建唯一训练集与 DataLoader，数据集超参全部来自 global.yaml。"""
+	"""构建训练集与 DataLoader"""
 	def _init_dataset(self) -> tuple[AtomActionDataset, Optional[DistributedSampler], DataLoader]:
+
+		# 加载参数配置
 		dataset_cfg = self.global_args["atomactiondataset"]
 		top_k = int(dataset_cfg.get("top_k", dataset_cfg.get("tok_k", 1)))
 		views = dataset_cfg.get("views")
 		view_selector_kwargs = dict(dataset_cfg.get("view_selector", {}))
+
+		# 构建数据集
 		dataset = AtomActionDataset(
 			dataset_root=str(dataset_cfg["dataset_root"]),
 			views=views,
@@ -266,6 +270,7 @@ class VQAPTrainer:
 			view_selector_kwargs=view_selector_kwargs,
 		)
 
+		# 构建 DistributedSampler
 		data_cfg = self.train_args["data"]
 		sampler: Optional[DistributedSampler]
 		if self.distributed:
@@ -288,6 +293,7 @@ class VQAPTrainer:
 		if num_workers > 0 and "prefetch_factor" in data_cfg:
 			dataloader_kwargs["prefetch_factor"] = int(data_cfg["prefetch_factor"])
 
+		# 构建 DataLoader
 		dataloader = DataLoader(dataset, **dataloader_kwargs)
 		return dataset, sampler, dataloader
 
@@ -355,13 +361,6 @@ class VQAPTrainer:
 		self._set_module_requires_grad(model.vasa.future_predictor, True)
 		self._set_module_requires_grad(model.atomaction_nsvq, True)
 
-	"""Stage 1 中把冻结的视觉子模块切到 eval，避免 dropout 等训练态扰动。"""
-	def _set_stage1_eval_modes(self) -> None:
-		model = self._get_model_module()
-		self._get_dinov2_backbone(model).eval()
-		model.vasa.visual_transformer_encoder.eval()
-		model.vasa.flow_matching_head.eval()
-
 	"""判断某个参数是否应当跳过 weight decay。"""
 	def _should_skip_weight_decay(self, name: str, parameter: torch.nn.Parameter) -> bool:
 		name_lower = name.lower()
@@ -422,7 +421,6 @@ class VQAPTrainer:
 		return param_groups
 
 	"""按当前 stage 构建优化器。
-
 	Stage 0:
 		main 参数组 + LoRA 参数组
 	Stage 1:
@@ -494,14 +492,6 @@ class VQAPTrainer:
 			return nullcontext()
 		return torch.autocast(device_type="cuda", dtype=self.autocast_dtype)
 
-	"""读取当前 epoch 对应的 future loss 权重。"""
-	def _get_lambda_future(self, epoch: int) -> float:
-		return compute_future_weight_schedule(
-			loss_cfg=self.train_args["loss"],
-			stage_cfg=self.train_args["stage"],
-			epoch=epoch,
-		)
-
 	"""执行一次完整前向，并按当前 stage 组装总损失。
 
 	关键点：
@@ -529,7 +519,11 @@ class VQAPTrainer:
 			pred_end_patch_features=vasa_outputs["pred_end_patch_features"],
 			end_img_features=vasa_outputs["end_img_features"],
 		)
-		lambda_future = self._get_lambda_future(epoch)
+		lambda_future = compute_future_weight_schedule(
+			loss_cfg=self.train_args["loss"],
+			stage_cfg=self.train_args["stage"],
+			epoch=epoch,
+		)
 
 		# 总损失从动作重构主线开始，再按训练阶段决定是否叠加视觉对齐分支。
 		loss_total = float(loss_cfg["lambda_ap"]) * atomaction_loss_outputs["loss_ap"] + lambda_future * loss_future
@@ -570,15 +564,15 @@ class VQAPTrainer:
 				lr_logs["lr/lora"] = float(param_group["lr"])
 		return lr_logs
 
-	"""把 epoch 转成更直观的 1-based 记录步数，供 wandb / checkpoint 日志复用。"""
-	def _get_epoch_log_step(self, epoch: int) -> int:
-		return int(epoch) + 1
-
 	"""执行单个 epoch 的训练循环，并聚合 epoch 级平均指标。"""
 	def _train_epoch(self, epoch: int) -> Dict[str, float]:
 		self.model.train()
 		if self.current_stage == 1:
-			self._set_stage1_eval_modes()
+			# Stage 1 中这些模块虽然仍会参与前向，但参数已经冻结，切到 eval 可避免训练态扰动。
+			model = self._get_model_module()
+			self._get_dinov2_backbone(model).eval()
+			model.vasa.visual_transformer_encoder.eval()
+			model.vasa.flow_matching_head.eval()
 
 		metric_sums = {metric_name: 0.0 for metric_name in EPOCH_METRIC_KEYS}
 		num_steps = 0
@@ -630,13 +624,12 @@ class VQAPTrainer:
 			dist.all_reduce(grad_norm_tensor, op=dist.ReduceOp.SUM)
 			grad_norm_tensor /= float(self.world_size)
 		epoch_metrics["grad_norm"] = float(grad_norm_tensor.item())
-		epoch_metrics["lambda_future"] = self._get_lambda_future(epoch)
+		epoch_metrics["lambda_future"] = compute_future_weight_schedule(
+			loss_cfg=self.train_args["loss"],
+			stage_cfg=self.train_args["stage"],
+			epoch=epoch,
+		)
 		return epoch_metrics
-
-	"""在多卡模式下广播主进程更新后的张量状态。"""
-	def _broadcast_tensor(self, tensor: torch.Tensor) -> None:
-		if self.distributed:
-			dist.broadcast(tensor, src=0)
 
 	"""执行一次真实的死码替换，并把更新后的码本同步给所有进程。"""
 	def _replace_dead_codebooks(self) -> Dict[str, int]:
@@ -656,11 +649,12 @@ class VQAPTrainer:
 			replaced_d = int(replace_outputs["replaced_codebooks_d"].item())
 
 		replaced_tensor = torch.tensor([replaced_g, replaced_d], device=self.device, dtype=torch.long)
-		self._broadcast_tensor(replaced_tensor)
-		self._broadcast_tensor(global_quantizer.codebooks)
-		self._broadcast_tensor(global_quantizer.codebooks_used)
-		self._broadcast_tensor(detail_quantizer.codebooks)
-		self._broadcast_tensor(detail_quantizer.codebooks_used)
+		if self.distributed:
+			dist.broadcast(replaced_tensor, src=0)
+			dist.broadcast(global_quantizer.codebooks, src=0)
+			dist.broadcast(global_quantizer.codebooks_used, src=0)
+			dist.broadcast(detail_quantizer.codebooks, src=0)
+			dist.broadcast(detail_quantizer.codebooks_used, src=0)
 		return {
 			"replaced_codebooks_g": int(replaced_tensor[0].item()),
 			"replaced_codebooks_d": int(replaced_tensor[1].item()),
@@ -697,7 +691,7 @@ class VQAPTrainer:
 			return
 
 		model = self._get_model_module()
-		log_step = self._get_epoch_log_step(epoch)
+		log_step = int(epoch) + 1
 		checkpoint_payload = {
 			"epoch": epoch + 1,
 			"global_step": self.global_step,
@@ -743,19 +737,17 @@ class VQAPTrainer:
 		self._atomic_torch_save(codebook_payload, self.ckpt_dir / "codebook.pth")
 
 	"""执行 Stage 0 -> Stage 1 切换。
-
-	关键步骤：
-	- merge 并移除 LoRA 结构
-	- 冻结视觉对齐支路
-	- 重建 optimizer / scheduler
-	- 重置 best 指标，避免跨 stage 直接比较
+		- merge 并移除 LoRA 结构
+		- 冻结视觉对齐支路
+		- 重建 optimizer / scheduler
+		- 重置 best 指标，避免跨 stage 直接比较
 	"""
 	def _setup_stage1(self, epoch: int) -> None:
 		if self.current_stage != 0:
 			return
 
 		if self.rank == 0:
-			self.logger.info("Switching from Stage 0 to Stage 1")
+			self.logger.info("-"*20 + " Switching from Stage 0 to Stage 1 " + "-"*20)
 		if self.distributed:
 			dist.barrier()
 
@@ -776,7 +768,7 @@ class VQAPTrainer:
 		self.best_ltotal = float("inf")
 
 		if self.rank == 0 and self.wandb_run is not None:
-			self.wandb_run.log({"train/stage": 1.0}, step=self._get_epoch_log_step(epoch))
+			self.wandb_run.log({"train/stage": 1.0}, step=int(epoch) + 1)
 		if self.distributed:
 			dist.barrier()
 
@@ -803,7 +795,7 @@ class VQAPTrainer:
 		}
 		log_payload.update(self._get_lr_logs())
 		if self.wandb_run is not None:
-			self.wandb_run.log(log_payload, step=self._get_epoch_log_step(epoch))
+			self.wandb_run.log(log_payload, step=int(epoch) + 1)
 
 		self.logger.info(
 			f"epoch={epoch + 1}/{self.total_epochs} | stage={self.current_stage} | "
@@ -814,9 +806,11 @@ class VQAPTrainer:
 			f"time={epoch_time_seconds:.2f}s"
 		)
 
-	"""外层训练循环：stage 切换、epoch 训练、scheduler 更新、码本维护与保存。"""
+	"""外层训练循环"""
 	def train(self) -> None:
 		for epoch in range(self.start_epoch, self.total_epochs):
+
+			# Stage 0 -> Stage 1 切换
 			if self.current_stage == 0 and epoch >= self.stage0_epochs:
 				self._setup_stage1(epoch)
 
@@ -844,7 +838,7 @@ class VQAPTrainer:
 								replace_metrics["replaced_codebooks_g"] > 0 or replace_metrics["replaced_codebooks_d"] > 0
 							),
 						},
-						step=self._get_epoch_log_step(epoch),
+						step=int(epoch) + 1,
 					)
 
 			self._log_epoch_summary(
