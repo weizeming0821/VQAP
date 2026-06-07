@@ -127,22 +127,35 @@ def compute_future_patch_loss(
 	return (1.0 - patch_cosine).mean()
 
 
-"""计算未来帧分支权重调度。"""
-def compute_future_weight_schedule(loss_cfg: Dict[str, Any], global_step: int) -> float:
-	future_weight_min = float(loss_cfg["future_weight_min"])
-	future_weight_max = float(loss_cfg["future_weight_max"])
-	future_warmup_steps = int(loss_cfg["future_warmup_steps"])
-	future_ramp_steps = int(loss_cfg["future_ramp_steps"])
+"""按 epoch 计算未来帧分支权重调度。
 
-	if global_step < future_warmup_steps:
-		return future_weight_min
-	if future_ramp_steps <= 0:
-		return future_weight_max
-	if global_step >= future_warmup_steps + future_ramp_steps:
-		return future_weight_max
+	Stage 0: 线性从 0 增长到 future_stage0_max
+	Stage 1 前 future_stage1_ramp_epochs 个 epoch: 线性从 future_stage0_max 增长到 future_stage1_max
+	Stage 1 后续 epoch: 固定为 future_stage1_max
+"""
+def compute_future_weight_schedule(
+	loss_cfg: Dict[str, Any],
+	stage_cfg: Dict[str, Any],
+	epoch: int,
+) -> float:
+	stage0_epochs = int(stage_cfg["stage0_epochs"])
+	stage1_ramp_epochs = int(loss_cfg["future_stage1_ramp_epochs"])
+	future_stage0_max = float(loss_cfg["future_stage0_max"])
+	future_stage1_max = float(loss_cfg["future_stage1_max"])
+	epoch_index = int(epoch) + 1
 
-	ramp_ratio = float(global_step - future_warmup_steps) / float(future_ramp_steps)
-	return future_weight_min + (future_weight_max - future_weight_min) * ramp_ratio
+	if stage0_epochs <= 0:
+		raise ValueError("stage0_epochs must be positive")
+	if epoch_index <= stage0_epochs:
+		return future_stage0_max * float(epoch_index) / float(stage0_epochs)
+
+	stage1_epoch = epoch_index - stage0_epochs
+	if stage1_ramp_epochs <= 0:
+		return future_stage1_max
+	if stage1_epoch <= stage1_ramp_epochs:
+		ramp_ratio = float(stage1_epoch) / float(stage1_ramp_epochs)
+		return future_stage0_max + (future_stage1_max - future_stage0_max) * ramp_ratio
+	return future_stage1_max
 
 
 """计算 AtomAction-NSVQ 动作重构损失 L_AP。"""
@@ -217,46 +230,3 @@ def compute_action_grounding_loss(
 		"loss_bce_grip_ag": loss_bce_grip_ag,
 		"loss_ag": loss_ag,
 	}
-
-
-"""计算 VQAP 总损失。"""
-def compute_vqap_total_loss(
-	model_outputs: Dict[str, Dict[str, torch.Tensor]],
-	loss_cfg: Dict[str, Any],
-	global_step: int,
-) -> Dict[str, torch.Tensor]:
-	shared_outputs = model_outputs["shared_outputs"]
-	atomaction_outputs = model_outputs["atomaction_outputs"]
-	vasa_outputs = model_outputs["vasa_outputs"]
-
-	atomaction_loss_outputs = compute_atomaction_reconstruction_loss(
-		shared_outputs=shared_outputs,
-		atomaction_outputs=atomaction_outputs,
-		loss_cfg=loss_cfg,
-	)
-	action_grounding_loss_outputs = compute_action_grounding_loss(
-		shared_outputs=shared_outputs,
-		vasa_outputs=vasa_outputs,
-		loss_cfg=loss_cfg,
-	)
-	loss_future = compute_future_patch_loss(
-		pred_end_patch_features=vasa_outputs["pred_end_patch_features"],
-		end_img_features=vasa_outputs["end_img_features"],
-	)
-	lambda_future = compute_future_weight_schedule(loss_cfg=loss_cfg, global_step=global_step)
-
-	lambda_ap = float(loss_cfg["lambda_ap"])
-	lambda_ag = float(loss_cfg["lambda_ag"])
-	loss_total = (
-		lambda_ap * atomaction_loss_outputs["loss_ap"]
-		+ lambda_ag * action_grounding_loss_outputs["loss_ag"]
-		+ lambda_future * loss_future
-	)
-
-	loss_outputs: Dict[str, torch.Tensor] = {}
-	loss_outputs.update(atomaction_loss_outputs)
-	loss_outputs.update(action_grounding_loss_outputs)
-	loss_outputs["loss_future"] = loss_future
-	loss_outputs["lambda_future"] = loss_future.new_tensor(lambda_future)
-	loss_outputs["loss_total"] = loss_total
-	return loss_outputs
