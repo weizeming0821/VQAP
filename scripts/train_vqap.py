@@ -605,6 +605,8 @@ class VQAPTrainer:
 			self.global_step += 1
 
 		metric_names = list(EPOCH_METRIC_KEYS)
+
+		# 分布式训练中本地指标的收集和张量化
 		local_metrics = torch.tensor(
 			[metric_sums[metric_name] for metric_name in metric_names] + [float(num_steps)],
 			device=self.device,
@@ -613,16 +615,20 @@ class VQAPTrainer:
 		if self.distributed:
 			dist.all_reduce(local_metrics, op=dist.ReduceOp.SUM)
 
-		global_batch_count = max(local_metrics[-1].item(), 1.0)
+		# 以全局总 batch 数为分母计算加权均值，而非先各卡求均值再平均，避免各卡 batch 数不等带来的偏差。
+		global_batch_count = max(local_metrics[-1].item(), 1.0)  # max 防止空 epoch 除零
 		epoch_metrics = {
 			metric_name: local_metrics[index].item() / global_batch_count
 			for index, metric_name in enumerate(metric_names)
 		}
+		# grad_norm 取末批次值（非累加），语义是"本 epoch 末段梯度大小"，
+		# 因此跨卡取算术平均而非 SUM/总batch。
 		grad_norm_tensor = torch.tensor([last_grad_norm_value], device=self.device, dtype=torch.float64)
 		if self.distributed:
 			dist.all_reduce(grad_norm_tensor, op=dist.ReduceOp.SUM)
 			grad_norm_tensor /= float(self.world_size)
 		epoch_metrics["grad_norm"] = float(grad_norm_tensor.item())
+		# λ_future 是仅依赖 epoch 的确定性函数，各卡值相同，无需跨卡聚合。
 		epoch_metrics["lambda_future"] = compute_future_weight_schedule(
 			loss_cfg=self.train_args["loss"],
 			stage_cfg=self.train_args["stage"],
