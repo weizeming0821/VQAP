@@ -105,8 +105,9 @@ def move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[st
 
 class VQAPTrainer:
 
-	"""封装 VQAP 预训练的完整生命周期：初始化、训练、stage 切换、保存与续训。"""
 	def __init__(self, args: argparse.Namespace):
+
+		# 训练配置参数读取
 		self.args = args
 		self.model_args = load_yaml_config(args.model_config)
 		self.train_args = load_yaml_config(args.config)
@@ -119,17 +120,22 @@ class VQAPTrainer:
 		self.world_size = 1
 		self.distributed = False
 		self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+		# 分布式环境初始化
 		self._init_distributed()
 
+		# 随机种子设置
 		self.seed = int(experiment_cfg.get("seed", 42))
 		set_random_seed(self.seed + self.rank)
 
+		# CUDA 性能优化设置
 		runtime_cfg = self.train_args["runtime"]
 		if self.device.type == "cuda":
 			torch.backends.cudnn.benchmark = bool(runtime_cfg.get("cudnn_benchmark", True))
 			torch.backends.cuda.matmul.allow_tf32 = bool(runtime_cfg.get("allow_tf32", True))
 			os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+		# 混合精度设置
 		self.precision = str(runtime_cfg.get("precision", "bf16")).lower()
 		self.autocast_dtype: Optional[torch.dtype]
 		if self.device.type != "cuda" or self.precision == "fp32":
@@ -145,6 +151,7 @@ class VQAPTrainer:
 			enabled=self.device.type == "cuda" and self.precision == "fp16",
 		)
 
+		# 日志与 checkpoint 目录初始化
 		checkpoint_cfg = self.train_args["checkpoint"]
 		logging_cfg = self.train_args["logging"]
 		self.ckpt_dir = Path(checkpoint_cfg["root_dir"]).expanduser() / self.exp_name
@@ -156,12 +163,14 @@ class VQAPTrainer:
 			is_resume=bool(args.resume),
 		)
 
+		# 训练阶段与优化器调度设置
 		self.stage0_epochs = int(self.train_args["stage"]["stage0_epochs"])
 		self.stage1_epochs = int(self.train_args["stage"]["stage1_epochs"])
 		self.total_epochs = self.stage0_epochs + self.stage1_epochs
 		self.save_every_epochs = int(checkpoint_cfg["save_every_epochs"])
 		self.grad_clip_norm = float(runtime_cfg["grad_clip_norm"])
 
+		# 断点续训设置
 		self.resume_path = self._resolve_resume_path()
 		self.resume_state = self._load_resume_state()
 		self.current_stage = int(self.resume_state["stage"]) if self.resume_state is not None else 0
@@ -183,6 +192,7 @@ class VQAPTrainer:
 			is_resume=self.resume_state is not None,
 		)
 
+		# 模型、数据、优化器的初始化
 		self.train_dataset, self.train_sampler, self.train_loader = self._init_dataset()
 		self.model = self._init_model(apply_lora=self.current_stage == 0)
 		if self.resume_state is not None:
