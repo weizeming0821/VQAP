@@ -327,14 +327,10 @@ class VQAPTrainer:
 				gradient_as_bucket_view=True,
 			)
 
-	"""返回唯一允许挂 LoRA 的位置：VASA 内部 DINOv2 backbone。"""
-	def _get_dinov2_backbone(self, model: VQAP) -> torch.nn.Module:
-		return model.vasa.image_encoder.feature_extractor.backbone
-
 	"""用 PEFT 把 LoRA 仅挂到 DINOv2 backbone 的目标注意力层。"""
 	def _apply_dinov2_lora(self, model: VQAP) -> None:
 		lora_cfg = self.train_args["lora"]
-		backbone = self._get_dinov2_backbone(model)
+		backbone = model.vasa.image_encoder.feature_extractor.backbone
 		peft_config = LoraConfig(
 			r=int(lora_cfg["r"]),
 			lora_alpha=int(lora_cfg["alpha"]),
@@ -355,7 +351,7 @@ class VQAPTrainer:
 
 	"""进入 Stage 1 后冻结视觉对齐支路，只保留码本路径与 future predictor 继续训练。"""
 	def _freeze_stage1_modules(self, model: VQAP) -> None:
-		self._set_module_requires_grad(self._get_dinov2_backbone(model), False)
+		self._set_module_requires_grad(model.vasa.image_encoder.feature_extractor.backbone, False)
 		self._set_module_requires_grad(model.vasa.visual_transformer_encoder, False)
 		self._set_module_requires_grad(model.vasa.flow_matching_head, False)
 		self._set_module_requires_grad(model.vasa.future_predictor, True)
@@ -570,7 +566,7 @@ class VQAPTrainer:
 		if self.current_stage == 1:
 			# Stage 1 中这些模块虽然仍会参与前向，但参数已经冻结，切到 eval 可避免训练态扰动。
 			model = self._get_model_module()
-			self._get_dinov2_backbone(model).eval()
+			model.vasa.image_encoder.feature_extractor.backbone.eval()
 			model.vasa.visual_transformer_encoder.eval()
 			model.vasa.flow_matching_head.eval()
 
@@ -757,7 +753,7 @@ class VQAPTrainer:
 			dist.barrier()
 
 		model = self._unwrap_ddp_model()
-		backbone = self._get_dinov2_backbone(model)
+		backbone = model.vasa.image_encoder.feature_extractor.backbone
 		if not isinstance(backbone, PeftModel):
 			raise TypeError("Stage 1 setup expects the DINOv2 backbone to be a PeftModel before merge")
 
