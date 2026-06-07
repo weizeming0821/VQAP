@@ -1,13 +1,79 @@
+experiment:
+  exp_name: "vqap_pretrain"
+  seed: 42
+
+runtime:
+  precision: "bf16"
+  grad_clip_norm: 1.0
+  allow_tf32: true
+  cudnn_benchmark: true
+
 flow_matching:
   noise_std: 1.0
 
+data:
+  batch_size: 64
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  drop_last: false
+  prefetch_factor: 2
+
+stage:
+  stage0_epochs: 60
+  stage1_epochs: 40
+
+lr:
+  stage0_main: 3.0e-4
+  stage0_lora: 5.0e-5
+  stage1_main: 1.0e-4
+
+optimizer:
+  beta1: 0.9
+  main_beta2: 0.99
+  lora_beta2: 0.99
+  eps: 1.0e-8
+  weight_decay: 1.0e-3
+
+scheduler:
+  warmup_epochs: 2
+  min_lr_ratio: 0.05
+
 loss:
   lambda_ap: 1.0
-  lambda_ag: 0.5
+  lambda_ag: 1.0
   lambda_rot: 1.0
   lambda_grip: 1.0
   lambda_sep: 0.01
-  future_weight_min: 0.05
-  future_weight_max: 0.5
-  future_warmup_steps: 100000
-  future_ramp_steps: 50000
+  future_stage0_max: 0.1
+  future_stage1_max: 1.0
+  future_stage1_ramp_epochs: 20
+
+codebook:
+  perplexity_g_threshold: 9.0
+  perplexity_d_threshold: 64.0
+  replace_interval_epochs: 20
+
+checkpoint:
+  root_dir: "checkpoints/vqap"
+  save_every_epochs: 2
+
+logging:
+  log_dir: "log"
+
+wandb:
+  enable: true
+  project: "VQAP"
+  group: null
+  tags: []
+
+resume:
+  path: null
+
+lora:
+  r: 8
+  alpha: 16
+  dropout: 0.1
+  bias: "none"
+  target_modules:
+    - "attn.qkv"
