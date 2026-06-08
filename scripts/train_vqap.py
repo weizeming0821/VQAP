@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 import yaml
 from peft import LoraConfig, PeftModel, get_peft_model
+from tqdm import tqdm
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
@@ -574,7 +575,19 @@ class VQAPTrainer:
 		num_steps = 0	# 记录当前 epoch 跑了多少个 batch，用于后续计算平均指标
 		last_grad_norm_value = 0.0	# 记录最后一个 batch 的 grad norm，用于日志记录和死码替换决策
 
-		for batch in self.train_loader:
+		# 仅 rank 0 显示 tqdm 进度条；非 rank 0 保持原始迭代器，避免多进程输出交错
+		stage_label = f"S{self.current_stage}"
+		loader_iter = self.train_loader
+		if self.rank == 0:
+			loader_iter = tqdm(
+				self.train_loader,
+				desc=f"Epoch {epoch + 1}/{self.total_epochs} [{stage_label}]",
+				unit="batch",
+				dynamic_ncols=True,
+				leave=False,
+			)
+
+		for batch in loader_iter:
 			batch = move_batch_to_device(batch, self.device)
 			self.optimizer.zero_grad(set_to_none=True)
 			with self._get_autocast_context():
@@ -599,6 +612,14 @@ class VQAPTrainer:
 			num_steps += 1
 
 			self.global_step += 1
+
+			if self.rank == 0 and isinstance(loader_iter, tqdm):
+				loader_iter.set_postfix({
+					"loss_total": f"{loss_outputs['loss_total'].item():.3f}",
+					"loss_ap": f"{loss_outputs['loss_ap'].item():.3f}",
+					"perplexity_g": f"{loss_outputs['perplexity_g'].item():.1f}",
+					"perplexity_d": f"{loss_outputs['perplexity_d'].item():.1f}",
+				}, refresh=False)
 
 		metric_names = list(EPOCH_METRIC_KEYS)
 
@@ -820,7 +841,23 @@ class VQAPTrainer:
 
 	"""外层训练循环"""
 	def train(self) -> None:
-		for epoch in range(self.start_epoch, self.total_epochs):
+		epoch_range = range(self.start_epoch, self.total_epochs)
+		if self.rank == 0:
+			stage_label = f"S{self.current_stage}"
+			epoch_range = tqdm(
+				epoch_range,
+				desc=f"Training [{stage_label}]",
+				unit="epoch",
+				dynamic_ncols=True,
+				position=0,
+				leave=True,
+			)
+
+		for epoch in epoch_range:
+			# 更新 epoch 级进度条描述中的 stage（切换时自动反映）
+			if self.rank == 0 and isinstance(epoch_range, tqdm):
+				stage_label = f"S{self.current_stage}"
+				epoch_range.set_description(f"Training [{stage_label}]")
 
 			# Stage 0 -> Stage 1 切换
 			if self.current_stage == 0 and epoch >= self.stage0_epochs:
@@ -856,6 +893,14 @@ class VQAPTrainer:
 				epoch_metrics=epoch_metrics,
 				epoch_time_seconds=time.time() - epoch_start_time,
 			)
+
+			if self.rank == 0 and isinstance(epoch_range, tqdm):
+				epoch_range.set_postfix({
+					"loss_total": f"{epoch_metrics['loss_total']:.3f}",
+					"loss_ap": f"{epoch_metrics['loss_ap']:.3f}",
+					"perplexity_g": f"{epoch_metrics['perplexity_g']:.1f}",
+					"perplexity_d": f"{epoch_metrics['perplexity_d']:.1f}",
+				}, refresh=False)
 
 
 def parse_args() -> argparse.Namespace:
