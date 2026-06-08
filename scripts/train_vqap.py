@@ -26,7 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 from data.dataset import AtomActionDataset
 from data.utils import AtomActionDataset_collate_fn
 from model.vqap import VQAP
-from utils.init_logger_wandb import finish_wandb, init_logger, init_wandb
+from utils.init_logger_tensorboard import finish_tensorboard, init_logger, init_tensorboard
 from utils.loss_func import (
 	compute_action_grounding_loss,
 	compute_atomaction_reconstruction_loss,
@@ -179,15 +179,15 @@ class VQAPTrainer:
 		self.best_lap = float(self.resume_state.get("best_lap", float("inf"))) if self.resume_state is not None else float("inf")
 		self.best_ltotal = float(self.resume_state.get("best_ltotal", float("inf"))) if self.resume_state is not None else float("inf")
 
-		# wandb 的启停只影响实验记录，不影响训练主逻辑。
-		wandb_cfg = dict(self.train_args)
-		if args.disable_wandb:
-			wandb_cfg["wandb"] = dict(wandb_cfg.get("wandb", {}))
-			wandb_cfg["wandb"]["enable"] = False
-		self.wandb_run = init_wandb(
+		# TensorBoard 的启停只影响实验记录，不影响训练主逻辑。
+		tb_cfg = dict(self.train_args)
+		if args.disable_tensorboard:
+			tb_cfg["tensorboard"] = dict(tb_cfg.get("tensorboard", {}))
+			tb_cfg["tensorboard"]["enable"] = False
+		self.tb_writer = init_tensorboard(
 			rank=self.rank,
 			exp_name=self.exp_name,
-			cfg=wandb_cfg,
+			cfg=tb_cfg,
 			ckpt_dir=str(self.ckpt_dir),
 			is_resume=self.resume_state is not None,
 		)
@@ -611,19 +611,20 @@ class VQAPTrainer:
 		if self.distributed:
 			dist.all_reduce(local_metrics, op=dist.ReduceOp.SUM)
 
-		# 以全局总 batch 数为分母计算加权均值，而非先各卡求均值再平均，避免各卡 batch 数不等带来的偏差。
+		# 以全局总 batch 数为分母计算均值
 		global_batch_count = max(local_metrics[-1].item(), 1.0)  # max 防止空 epoch 除零
 		epoch_metrics = {
 			metric_name: local_metrics[index].item() / global_batch_count
 			for index, metric_name in enumerate(metric_names)
 		}
-		# grad_norm 取末批次值（非累加），语义是"本 epoch 末段梯度大小"，
-		# 因此跨卡取算术平均而非 SUM/总batch。
+
+		# grad_norm 取末批次值（非累加），表示本 epoch 末段梯度大小
 		grad_norm_tensor = torch.tensor([last_grad_norm_value], device=self.device, dtype=torch.float64)
 		if self.distributed:
 			dist.all_reduce(grad_norm_tensor, op=dist.ReduceOp.SUM)
 			grad_norm_tensor /= float(self.world_size)
 		epoch_metrics["grad_norm"] = float(grad_norm_tensor.item())
+
 		# λ_future 是仅依赖 epoch 的确定性函数，各卡值相同，无需跨卡聚合。
 		epoch_metrics["lambda_future"] = compute_future_weight_schedule(
 			loss_cfg=self.train_args["loss"],
@@ -666,13 +667,17 @@ class VQAPTrainer:
 		codebook_cfg = self.train_args["codebook"]
 		perplexity_g_threshold = float(codebook_cfg["perplexity_g_threshold"])
 		perplexity_d_threshold = float(codebook_cfg["perplexity_d_threshold"])
-		replace_interval_epochs = int(codebook_cfg["replace_interval_epochs"])
+		replace_interval_epochs = float(codebook_cfg["replace_interval_epochs"])
 
 		trigger_by_perplexity = (
 			epoch_metrics["perplexity_g"] < perplexity_g_threshold
 			or epoch_metrics["perplexity_d"] < perplexity_d_threshold
 		)
-		trigger_by_interval = replace_interval_epochs > 0 and (epoch + 1) % replace_interval_epochs == 0
+		trigger_by_interval = (
+			math.isfinite(replace_interval_epochs)
+			and replace_interval_epochs > 0
+			and (epoch + 1) % int(replace_interval_epochs) == 0
+		)
 		if not (trigger_by_perplexity or trigger_by_interval):
 			return {
 				"replaced_codebooks_g": 0,
@@ -691,6 +696,7 @@ class VQAPTrainer:
 		if self.rank != 0:
 			return
 
+		# 保存最新 checkpiont
 		model = self._get_model_module()
 		log_step = int(epoch) + 1
 		checkpoint_payload = {
@@ -705,27 +711,29 @@ class VQAPTrainer:
 			"model_args": self.model_args,
 			"train_args": self.train_args,
 			"global_args": self.global_args,
-			"wandb_run_id": getattr(self.wandb_run, "id", None),
+			"tb_log_dir": getattr(self.tb_writer, "log_dir", None),
 		}
 		self._atomic_torch_save(checkpoint_payload, self.ckpt_dir / "latest.pth")
 
-		# `best_lap` 更关注动作重构质量，`best_ltotal` 则保留当前训练目标下的综合最优。
+		# 保存 loss_ap 最佳 checkpoint
 		if epoch_metrics["loss_ap"] < self.best_lap:
 			self.best_lap = epoch_metrics["loss_ap"]
 			checkpoint_payload["best_lap"] = self.best_lap
-			checkpoint_payload["best_ltotal"] = self.best_ltotal
-			self._atomic_torch_save(checkpoint_payload, self.ckpt_dir / "best_lap.pth")
-			if self.wandb_run is not None:
-				self.wandb_run.log({"ckpt/best_lap": self.best_lap}, step=log_step)
 
+			self._atomic_torch_save(checkpoint_payload, self.ckpt_dir / "best_lap.pth")
+			if self.tb_writer is not None:
+				self.tb_writer.add_scalar("ckpt/best_lap", self.best_lap, log_step)
+
+		# 保存 loss_total 最佳 checkpoint
 		if epoch_metrics["loss_total"] < self.best_ltotal:
 			self.best_ltotal = epoch_metrics["loss_total"]
-			checkpoint_payload["best_lap"] = self.best_lap
 			checkpoint_payload["best_ltotal"] = self.best_ltotal
-			self._atomic_torch_save(checkpoint_payload, self.ckpt_dir / "best_ltotal.pth")
-			if self.wandb_run is not None:
-				self.wandb_run.log({"ckpt/best_ltotal": self.best_ltotal}, step=log_step)
 
+			self._atomic_torch_save(checkpoint_payload, self.ckpt_dir / "best_ltotal.pth")
+			if self.tb_writer is not None:
+				self.tb_writer.add_scalar("ckpt/best_ltotal", self.best_ltotal, log_step)
+
+		# 保存码本 checkpoint（包含死码替换后的更新）
 		codebook_payload = {
 			"epoch": epoch + 1,
 			"global_step": self.global_step,
@@ -768,12 +776,12 @@ class VQAPTrainer:
 		self.best_lap = float("inf")
 		self.best_ltotal = float("inf")
 
-		if self.rank == 0 and self.wandb_run is not None:
-			self.wandb_run.log({"train/stage": 1.0}, step=int(epoch) + 1)
+		if self.rank == 0 and self.tb_writer is not None:
+			self.tb_writer.add_scalar("train/stage", 1.0, int(epoch) + 1)
 		if self.distributed:
 			dist.barrier()
 
-	"""记录 epoch 级摘要日志，并同步到 wandb。"""
+	"""记录 epoch 级摘要日志，并同步到 TensorBoard。"""
 	def _log_epoch_summary(self, epoch: int, epoch_metrics: Dict[str, float], epoch_time_seconds: float) -> None:
 		if self.rank != 0:
 			return
@@ -794,9 +802,12 @@ class VQAPTrainer:
 			"train/lambda_future": epoch_metrics["lambda_future"],
 			"train/stage": float(self.current_stage),
 		}
+		
 		log_payload.update(self._get_lr_logs())
-		if self.wandb_run is not None:
-			self.wandb_run.log(log_payload, step=int(epoch) + 1)
+		if self.tb_writer is not None:
+			step = int(epoch) + 1
+			for key, value in log_payload.items():
+				self.tb_writer.add_scalar(key, value, step)
 
 		self.logger.info(
 			f"epoch={epoch + 1}/{self.total_epochs} | stage={self.current_stage} | "
@@ -828,18 +839,16 @@ class VQAPTrainer:
 				replace_metrics = self._maybe_replace_dead_codebooks(epoch, epoch_metrics)
 				epoch_metrics.update(replace_metrics)
 				self._save_checkpoint(epoch, epoch_metrics)
-				if self.rank == 0 and self.wandb_run is not None:
-					self.wandb_run.log(
-						{
-							"codebook/perplexity_g": epoch_metrics["perplexity_g"],
-							"codebook/perplexity_d": epoch_metrics["perplexity_d"],
-							"codebook/replaced_codebooks_g": float(replace_metrics["replaced_codebooks_g"]),
-							"codebook/replaced_codebooks_d": float(replace_metrics["replaced_codebooks_d"]),
-							"codebook/replace_triggered": float(
-								replace_metrics["replaced_codebooks_g"] > 0 or replace_metrics["replaced_codebooks_d"] > 0
-							),
-						},
-						step=int(epoch) + 1,
+				if self.rank == 0 and self.tb_writer is not None:
+					step = int(epoch) + 1
+					self.tb_writer.add_scalar("codebook/perplexity_g", epoch_metrics["perplexity_g"], step)
+					self.tb_writer.add_scalar("codebook/perplexity_d", epoch_metrics["perplexity_d"], step)
+					self.tb_writer.add_scalar("codebook/replaced_codebooks_g", float(replace_metrics["replaced_codebooks_g"]), step)
+					self.tb_writer.add_scalar("codebook/replaced_codebooks_d", float(replace_metrics["replaced_codebooks_d"]), step)
+					self.tb_writer.add_scalar(
+						"codebook/replace_triggered",
+						float(replace_metrics["replaced_codebooks_g"] > 0 or replace_metrics["replaced_codebooks_d"] > 0),
+						step,
 					)
 
 			self._log_epoch_summary(
@@ -857,7 +866,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--exp-name", type=str, default=None, help="Override experiment name in train.yaml")
 	parser.add_argument("--resume", action="store_true", help="Resume from latest.pth or --resume-path")
 	parser.add_argument("--resume-path", type=str, default=None, help="Explicit checkpoint path for resuming")
-	parser.add_argument("--disable-wandb", action="store_true", help="Disable wandb even if train.yaml enables it")
+	parser.add_argument("--disable-tensorboard", action="store_true", help="Disable TensorBoard even if train.yaml enables it")
 	return parser.parse_args()
 
 
@@ -867,7 +876,7 @@ def main() -> None:
 	try:
 		trainer.train()
 	finally:
-		finish_wandb(rank=trainer.rank, run=trainer.wandb_run)
+		finish_tensorboard(rank=trainer.rank, writer=trainer.tb_writer)
 		if trainer.distributed and dist.is_initialized():
 			dist.destroy_process_group()
 

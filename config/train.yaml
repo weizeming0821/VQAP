@@ -52,7 +52,7 @@ loss:
 codebook:
   perplexity_g_threshold: 9.0
   perplexity_d_threshold: 64.0
-  replace_interval_epochs: 20
+  replace_interval_epochs: 20  # 设为 inf 则保留 perplexity 触发
 
 checkpoint:
   root_dir: "checkpoints/vqap"
@@ -61,11 +61,9 @@ checkpoint:
 logging:
   log_dir: "log"
 
-wandb:
+tensorboard:
   enable: true
-  project: "VQAP"
-  group: null
-  tags: []
+  log_dir: "tensorboard"
 
 resume:
   path: null
