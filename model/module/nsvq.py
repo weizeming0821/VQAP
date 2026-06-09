@@ -183,7 +183,7 @@ class NSVQQuantizer(nn.Module):
 
 		# [N, D] x [K, D] -> [N, K]，随后沿 K 维做硬最近邻分配。
 		squared_distances = self.compute_codebook_distances(inputs)
-		codebook_indices = torch.argmin(squared_distances, dim=-1)
+		codebook_indices = torch.argmin(squared_distances, dim=-1)	# [N]，每个输入样本分配到的最近邻码字索引
 
 		# [N] -> [N, D]，得到最近邻码本向量 e_{k*}。
 		nearest_codewords = self.lookup_codewords(codebook_indices)
@@ -324,7 +324,7 @@ class GlobalCodebookModule(nn.Module):
 		# [B, C] -> [B, D]
 		projected_global_features = self.projection(pooled_global_features)
 
-		# [B, D] -> [B, D] + [B]
+		# [B, D] + [B] -> [B, D] + [B] + Tensor
 		quantized_global_features, global_codebook_indices, global_perplexity = self.quantizer(
 			projected_global_features,
 			codebook_indices=codebook_indices,
