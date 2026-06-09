@@ -98,10 +98,10 @@ class NSVQQuantizer(nn.Module):
 		self.eps = float(eps)
 
 		# 码本直接作为可训练参数存在，不使用 EMA。
-		self.codebooks = nn.Parameter(torch.empty(self.codebook_size, self.codebook_dim))
+		self.codebooks = nn.Parameter(torch.empty(self.codebook_size, self.codebook_dim))  # [K, D]
 		self.register_buffer(
 			"codebooks_used",
-			torch.zeros(self.codebook_size, dtype=torch.long),
+			torch.zeros(self.codebook_size, dtype=torch.long),  # [K]，每个码字累计被分配的次数
 			persistent=True,
 		)
 
@@ -132,9 +132,9 @@ class NSVQQuantizer(nn.Module):
 
 	"""按离散索引查表取码本向量。"""
 	def lookup_codewords(self, codebook_indices: torch.Tensor) -> torch.Tensor:
-		flat_indices = codebook_indices.reshape(-1)	
-		selected_codewords = self.codebooks.index_select(dim=0, index=flat_indices)
-		return selected_codewords.view(*codebook_indices.shape, self.codebook_dim)
+		flat_indices = codebook_indices.reshape(-1)                                   # [...] -> [N]
+		selected_codewords = self.codebooks.index_select(dim=0, index=flat_indices)   # [N] -> [N, D]
+		return selected_codewords.view(*codebook_indices.shape, self.codebook_dim)    # [N, D] -> [..., D]
 
 	"""输入检查与索引规范化。确保 codebook_indices 是整数类型且在合法范围内。"""
 	def normalize_codebook_indices(self, codebook_indices: torch.Tensor) -> torch.Tensor:
@@ -149,11 +149,12 @@ class NSVQQuantizer(nn.Module):
 			raise ValueError("codebook_indices must be in [0, codebook_size)")
 		return normalized_indices
 
+	"""统计本批次码字使用频次并累加到全局计数 buffer，供死码检测使用。"""
 	@torch.no_grad()
 	def update_codebook_usage(self, codebook_indices: torch.Tensor) -> None:
-		flat_indices = codebook_indices.reshape(-1)
-		usage_increment = torch.bincount(flat_indices, minlength=self.codebook_size)
-		self.codebooks_used.add_(usage_increment.to(dtype=self.codebooks_used.dtype, device=self.codebooks_used.device))
+		flat_indices = codebook_indices.reshape(-1)		# [N]，展平为一维，N = 批次内所有样本数
+		usage_increment = torch.bincount(flat_indices, minlength=self.codebook_size) 	# [K]，第 k 位 = 码字 k 在本批次中被分配到的次数
+		self.codebooks_used.add_(usage_increment.to(dtype=self.codebooks_used.dtype, device=self.codebooks_used.device))	# [K]
 
 	"""训练时执行 NSVQ；推理时要求按给定索引直接查表。"""
 	def forward(
@@ -188,14 +189,14 @@ class NSVQQuantizer(nn.Module):
 		nearest_codewords = self.lookup_codewords(codebook_indices)
 
 		# NSVQ：用与量化残差等范数的随机噪声替代不可微的硬量化残差。
-		residual = inputs - nearest_codewords
-		random_noise = torch.randn_like(inputs)
-		residual_norm = residual.norm(dim=-1, keepdim=True)
-		noise_norm = random_noise.norm(dim=-1, keepdim=True)
-		vq_error = residual_norm / (noise_norm + self.eps) * random_noise
+		residual = inputs - nearest_codewords                                 # [N, D]，量化残差 h - e_{k*}
+		random_noise = torch.randn_like(inputs)                               # [N, D]，标准正态噪声
+		residual_norm = residual.norm(dim=-1, keepdim=True)                   # [N, 1]，每个样本的残差 L2 范数
+		noise_norm = random_noise.norm(dim=-1, keepdim=True)                  # [N, 1]，每个样本的噪声 L2 范数
+		vq_error = residual_norm / (noise_norm + self.eps) * random_noise     # [N, D]，缩放至与残差等范数，替代不可微的硬量化误差
 
 		# 训练时返回 q = h + vq_error。
-		quantized_features = inputs + vq_error
+		quantized_features = inputs + vq_error                                # [N, D]
 		self.update_codebook_usage(codebook_indices)
 
 		perplexity = compute_perplexity(codebook_indices, self.codebook_size)
@@ -207,19 +208,19 @@ class NSVQQuantizer(nn.Module):
 		if self.replace_every <= 0:
 			raise ValueError("replace_every must be positive when replace_unused_codebooks is enabled")
 
-		usage_ratio = self.codebooks_used.to(dtype=torch.float32) / float(self.replace_every)
-		unused_mask = usage_ratio < self.discard_threshold
-		dead_code_indices = unused_mask.nonzero(as_tuple=False).squeeze(-1)
-		num_replaced = dead_code_indices.numel()
+		usage_ratio = self.codebooks_used.to(dtype=torch.float32) / float(self.replace_every)  # [K]，每个码字在过去 replace_every 步内的平均使用率
+		unused_mask = usage_ratio < self.discard_threshold                                      # [K]，bool，True = 低利用率死码
+		dead_code_indices = unused_mask.nonzero(as_tuple=False).squeeze(-1)                    # [M]，死码下标，M = 死码数量
+		num_replaced = dead_code_indices.numel()                                                # 标量，本次需替换的死码数
 
 		if num_replaced == 0:
 			self.codebooks_used.zero_()
 			return torch.zeros((), device=self.codebooks.device, dtype=torch.long)
 
-		active_code_indices = (~unused_mask).nonzero(as_tuple=False).squeeze(-1)
+		active_code_indices = (~unused_mask).nonzero(as_tuple=False).squeeze(-1)               # [A]，活跃码字下标，A = 活跃码字数
 		if active_code_indices.numel() == 0:
 			# 若整张码本都低利用率，则整体加小扰动，避免从空活跃集合采样。
-			self.codebooks.add_(self.replace_noise_scale * torch.randn_like(self.codebooks))
+			self.codebooks.add_(self.replace_noise_scale * torch.randn_like(self.codebooks))   # [K, D]，in-place 加扰动
 		else:
 			# 从活跃码本中随机采样替换死码，添加小扰动后直接覆盖。这样做既能保持码本多样性，又能避免死码长期不更新。
 			sampled_active_indices = active_code_indices[
@@ -229,10 +230,10 @@ class NSVQQuantizer(nn.Module):
 					size=(num_replaced,),
 					device=self.codebooks.device,
 				)
-			]
-			replacement_codewords = self.codebooks.index_select(0, sampled_active_indices)
-			replacement_codewords = replacement_codewords + self.replace_noise_scale * torch.randn_like(replacement_codewords)
-			self.codebooks.data.index_copy_(0, dead_code_indices, replacement_codewords)
+			]                                                                                   # [M]，从活跃集中有放回采样的下标
+			replacement_codewords = self.codebooks.index_select(0, sampled_active_indices)     # [M, D]，对应的活跃码字
+			replacement_codewords = replacement_codewords + self.replace_noise_scale * torch.randn_like(replacement_codewords)  # [M, D]，加小扰动避免完全重复
+			self.codebooks.data.index_copy_(0, dead_code_indices, replacement_codewords)       # [K, D]，将死码位置覆盖为扰动后的替换码字
 
 		self.codebooks_used.zero_()
 		return torch.tensor(num_replaced, device=self.codebooks.device, dtype=torch.long)
