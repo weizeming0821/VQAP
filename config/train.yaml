@@ -55,7 +55,7 @@ codebook:
   replace_interval_epochs: 20  # 设为 inf 则保留 perplexity 触发
 
 checkpoint:
-  root_dir: "checkpoints/vqap"
+  root_dir: "checkpoints"
   save_every_epochs: 2
 
 logging:
