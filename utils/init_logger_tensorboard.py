@@ -5,6 +5,7 @@
 """
 
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -25,8 +26,10 @@ def init_logger(rank: int, exp_name: str, log_dir: str, is_resume: bool) -> logg
 
 	log_root = Path(log_dir).expanduser()
 	log_root.mkdir(parents=True, exist_ok=True)
-	log_path = log_root / f"vqap_{exp_name}.log"
-	file_mode = "a" if is_resume else "w"
+	ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+	suffix = "_resume" if is_resume else ""
+	log_path = log_root / f"{exp_name}{suffix}_{ts}.log"
+	file_mode = "w"
 
 	formatter = logging.Formatter(
 		fmt="%(asctime)s | %(levelname)s | %(message)s",
@@ -51,7 +54,7 @@ def init_logger(rank: int, exp_name: str, log_dir: str, is_resume: bool) -> logg
         rank         : 当前进程 rank，仅 rank 0 创建 writer
         exp_name     : 实验名称，作为 TensorBoard 日志子目录名
         cfg          : 完整训练配置字典，含 "tensorboard" 子节
-        ckpt_dir     : checkpoint 根目录，TensorBoard 日志存于其下
+        ckpt_dir     : 保留参数以兼容调用方，当前未使用（日志按 log_dir/exp_name 存放）
         is_resume    : 是否为续训（保留参数以保持接口兼容，TensorBoard 无需特殊处理）
 
     Output:
@@ -69,8 +72,8 @@ def init_tensorboard(
 		return None
 
 	logger = logging.getLogger(f"vqap.{exp_name}")
-	# ckpt_dir 已含 exp_name，这里不再拼接，避免路径中 exp_name 重复两层。
-	tb_log_dir = Path(ckpt_dir).expanduser() / str(tb_cfg.get("log_dir", "tensorboard"))
+	# TensorBoard 日志直接放在项目根目录下的 log_dir/exp_name，避免与 checkpoint 目录嵌套过深。
+	tb_log_dir = Path(str(tb_cfg.get("log_dir", "tensorboard"))).expanduser() / exp_name
 	tb_log_dir.mkdir(parents=True, exist_ok=True)
 
 	try:

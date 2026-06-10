@@ -1,1 +1,1 @@
-CUDA_VISIBLE_DEVICES="1,7" torchrun --nproc_per_node=2 scripts/train_vqap.py
+CUDA_VISIBLE_DEVICES="1,5,6,7" torchrun --nproc_per_node=4 scripts/train_vqap.py
