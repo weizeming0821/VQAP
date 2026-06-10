@@ -109,7 +109,6 @@ class AtomAction_NSVQ(nn.Module):
             hidden_dim=int(encoder_cfg["hidden_dim"]),
             codebook_dim=int(global_codebook_cfg["codebook_dim"]),
             codebook_size=int(global_codebook_cfg["codebook_size"]),
-            replace_every=int(nsvq_cfg["replace_every"]),
             discard_threshold=float(nsvq_cfg["discard_threshold"]),
             replace_noise_scale=float(nsvq_cfg["replace_noise_scale"]),
             eps=float(nsvq_cfg["eps"]),
@@ -125,7 +124,6 @@ class AtomAction_NSVQ(nn.Module):
             dropout=float(detail_codebook_cfg["dropout"]),
             rope_theta=float(rope_cfg["theta"]),
             rope_max_seq_len=int(rope_cfg["max_seq_len"]),
-            replace_every=int(nsvq_cfg["replace_every"]),
             discard_threshold=float(nsvq_cfg["discard_threshold"]),
             replace_noise_scale=float(nsvq_cfg["replace_noise_scale"]),
             eps=float(nsvq_cfg["eps"]),
@@ -246,10 +244,10 @@ class AtomAction_NSVQ(nn.Module):
 
     """显式触发全局码本与细节码本的死码替换。"""
     @torch.no_grad()
-    def replace_unused_codebooks(self):
+    def replace_unused_codebooks(self, used_steps: int):
         return {
-            "replaced_codebooks_g": self.global_codebook_module.replace_unused_codebooks(),
-            "replaced_codebooks_d": self.detail_codebook_module.replace_unused_codebooks(),
+            "replaced_codebooks_g": self.global_codebook_module.replace_unused_codebooks(used_steps=used_steps),
+            "replaced_codebooks_d": self.detail_codebook_module.replace_unused_codebooks(used_steps=used_steps),
         }
 
 

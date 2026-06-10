@@ -198,6 +198,7 @@ class VQAPTrainer:
 		self.model = self._init_model(apply_lora=self.current_stage == 0)
 		if self.resume_state is not None:
 			self.model.load_state_dict(self.resume_state["model"], strict=True)
+			self._reset_codebook_usage_counters()
 		if self.current_stage == 1:
 			# Stage 1 续训时不会再恢复 LoRA 结构，而是直接基于 merge 后的主干继续训练。
 			self._freeze_stage1_modules(self.model)
@@ -235,14 +236,15 @@ class VQAPTrainer:
 
 	"""解析断点续训路径：显式传参优先，其次读取 train.yaml，最后回退到 latest.pth。"""
 	def _resolve_resume_path(self) -> Optional[Path]:
+		if self.args.resume_path:
+			return Path(self.args.resume_path).expanduser()
+		if self.args.resume:
+			return self.ckpt_dir / "latest.pth"
 		resume_cfg = self.train_args.get("resume", {})
 		config_resume_path = resume_cfg.get("path")
-		resume_path = self.args.resume_path or config_resume_path
-		if resume_path is None:
-			if self.args.resume:
-				return self.ckpt_dir / "latest.pth"
-			return None
-		return Path(resume_path).expanduser()
+		if config_resume_path:
+			return Path(config_resume_path).expanduser()
+		return None
 
 	"""按需加载 checkpoint 状态，但不在这里做 model/optimizer 的恢复。"""
 	def _load_resume_state(self) -> Optional[Dict[str, Any]]:
@@ -324,9 +326,25 @@ class VQAPTrainer:
 				self.model,
 				device_ids=[self.local_rank],
 				output_device=self.local_rank,
+				broadcast_buffers=False,
 				find_unused_parameters=True,
 				gradient_as_bucket_view=True,
 			)
+
+	"""统一拿到全局码本与细节码本的量化器，便于复用死码统计相关逻辑。"""
+	def _get_codebook_quantizers(self) -> tuple[Any, Any]:
+		model = self._get_model_module()
+		return (
+			model.atomaction_nsvq.global_codebook_module.quantizer,
+			model.atomaction_nsvq.detail_codebook_module.quantizer,
+		)
+
+	"""清空当前统计窗口内的码字使用计数，避免把上一窗口残留带到下一轮。"""
+	@torch.no_grad()
+	def _reset_codebook_usage_counters(self) -> None:
+		global_quantizer, detail_quantizer = self._get_codebook_quantizers()
+		global_quantizer.codebooks_used.zero_()
+		detail_quantizer.codebooks_used.zero_()
 
 	"""用 PEFT 把 LoRA 仅挂到 DINOv2 backbone 的目标注意力层。"""
 	def _apply_dinov2_lora(self, model: VQAP) -> None:
@@ -562,7 +580,7 @@ class VQAPTrainer:
 		return lr_logs
 
 	"""执行单个 epoch 的训练循环，并聚合 epoch 级平均指标。"""
-	def _train_epoch(self, epoch: int) -> Dict[str, float]:
+	def _train_epoch(self, epoch: int) -> tuple[Dict[str, float], int]:
 		self.model.train()
 		if self.current_stage == 1:
 			# Stage 1 中这些模块虽然仍会参与前向，但参数已经冻结，切到 eval 可避免训练态扰动。
@@ -652,13 +670,12 @@ class VQAPTrainer:
 			stage_cfg=self.train_args["stage"],
 			epoch=epoch,
 		)
-		return epoch_metrics
+		return epoch_metrics, num_steps
 
 	"""执行一次真实的死码替换，并把更新后的码本同步给所有进程。"""
-	def _replace_dead_codebooks(self) -> Dict[str, int]:
+	def _replace_dead_codebooks(self, used_steps: int) -> Dict[str, int]:
 		model = self._get_model_module()
-		global_quantizer = model.atomaction_nsvq.global_codebook_module.quantizer
-		detail_quantizer = model.atomaction_nsvq.detail_codebook_module.quantizer
+		global_quantizer, detail_quantizer = self._get_codebook_quantizers()
 
 		if self.distributed:
 			dist.all_reduce(global_quantizer.codebooks_used, op=dist.ReduceOp.AVG)
@@ -667,7 +684,7 @@ class VQAPTrainer:
 		replaced_g = 0
 		replaced_d = 0
 		if self.rank == 0:
-			replace_outputs = model.replace_unused_codebooks()
+			replace_outputs = model.replace_unused_codebooks(used_steps=used_steps)
 			replaced_g = int(replace_outputs["replaced_codebooks_g"].item())
 			replaced_d = int(replace_outputs["replaced_codebooks_d"].item())
 
@@ -675,16 +692,20 @@ class VQAPTrainer:
 		if self.distributed:
 			dist.broadcast(replaced_tensor, src=0)
 			dist.broadcast(global_quantizer.codebooks, src=0)
-			dist.broadcast(global_quantizer.codebooks_used, src=0)
 			dist.broadcast(detail_quantizer.codebooks, src=0)
-			dist.broadcast(detail_quantizer.codebooks_used, src=0)
 		return {
 			"replaced_codebooks_g": int(replaced_tensor[0].item()),
 			"replaced_codebooks_d": int(replaced_tensor[1].item()),
 		}
 
 	"""根据 perplexity 阈值或固定间隔，决定当前 epoch 是否执行死码替换。"""
-	def _maybe_replace_dead_codebooks(self, epoch: int, epoch_metrics: Dict[str, float]) -> Dict[str, int]:
+	def _maybe_replace_dead_codebooks(self, epoch: int, epoch_metrics: Dict[str, float], used_steps: int) -> Dict[str, int]:
+		if used_steps <= 0:
+			return {
+				"replaced_codebooks_g": 0,
+				"replaced_codebooks_d": 0,
+			}
+
 		codebook_cfg = self.train_args["codebook"]
 		perplexity_g_threshold = float(codebook_cfg["perplexity_g_threshold"])
 		perplexity_d_threshold = float(codebook_cfg["perplexity_d_threshold"])
@@ -707,7 +728,7 @@ class VQAPTrainer:
 				"replaced_codebooks_d": 0,
 			}
 
-		return self._replace_dead_codebooks()
+		return self._replace_dead_codebooks(used_steps=used_steps)
 
 	"""用先写临时文件再原子替换的方式保存 checkpoint，避免中途中断写坏文件。"""
 	def _atomic_torch_save(self, payload: Dict[str, Any], path: Path) -> None:
@@ -871,26 +892,28 @@ class VQAPTrainer:
 				self.train_sampler.set_epoch(epoch)
 
 			epoch_start_time = time.time()
-			epoch_metrics = self._train_epoch(epoch)
+			epoch_metrics, used_steps = self._train_epoch(epoch)
 			self.scheduler.step()
 
-			# 先根据当前 perplexity 决定是否替换死码，再把更新后的状态一起保存。
-			replace_metrics = self._maybe_replace_dead_codebooks(epoch, epoch_metrics)
+			# 每个 epoch 都独立决定一次是否触发死码替换，触发后使用当前 epoch 的真实统计窗口。
+			replace_metrics = self._maybe_replace_dead_codebooks(epoch, epoch_metrics, used_steps)
+			epoch_metrics.update(replace_metrics)
+			self._reset_codebook_usage_counters()
+
+			if self.rank == 0 and self.tb_writer is not None:
+				step = int(epoch) + 1
+				self.tb_writer.add_scalar("codebook/perplexity_g", epoch_metrics["perplexity_g"], step)
+				self.tb_writer.add_scalar("codebook/perplexity_d", epoch_metrics["perplexity_d"], step)
+				self.tb_writer.add_scalar("codebook/replaced_codebooks_g", float(replace_metrics["replaced_codebooks_g"]), step)
+				self.tb_writer.add_scalar("codebook/replaced_codebooks_d", float(replace_metrics["replaced_codebooks_d"]), step)
+				self.tb_writer.add_scalar(
+					"codebook/replace_triggered",
+					float(replace_metrics["replaced_codebooks_g"] > 0 or replace_metrics["replaced_codebooks_d"] > 0),
+					step,
+				)
 
 			if (epoch + 1) % self.save_every_epochs == 0 or (epoch + 1) == self.total_epochs:
-				epoch_metrics.update(replace_metrics)
 				self._save_checkpoint(epoch, epoch_metrics)
-				if self.rank == 0 and self.tb_writer is not None:
-					step = int(epoch) + 1
-					self.tb_writer.add_scalar("codebook/perplexity_g", epoch_metrics["perplexity_g"], step)
-					self.tb_writer.add_scalar("codebook/perplexity_d", epoch_metrics["perplexity_d"], step)
-					self.tb_writer.add_scalar("codebook/replaced_codebooks_g", float(replace_metrics["replaced_codebooks_g"]), step)
-					self.tb_writer.add_scalar("codebook/replaced_codebooks_d", float(replace_metrics["replaced_codebooks_d"]), step)
-					self.tb_writer.add_scalar(
-						"codebook/replace_triggered",
-						float(replace_metrics["replaced_codebooks_g"] > 0 or replace_metrics["replaced_codebooks_d"] > 0),
-						step,
-					)
 
 			self._log_epoch_summary(
 				epoch=epoch,
@@ -905,10 +928,6 @@ class VQAPTrainer:
 					"perplexity_g": f"{epoch_metrics['perplexity_g']:.1f}",
 					"perplexity_d": f"{epoch_metrics['perplexity_d']:.1f}",
 				}, refresh=False)
-
-			# 每个 epoch 结束，codebooks_used 清 0
-			self.model.module.atomaction_nsvq.global_codebook_module.quantizer.codebooks_used.zero_()
-			self.model.module.atomaction_nsvq.detail_codebook_module.quantizer.codebooks_used.zero_() 
 
 
 def parse_args() -> argparse.Namespace:

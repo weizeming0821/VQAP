@@ -12,7 +12,7 @@ flow_matching:
   noise_std: 1.0
 
 data:
-  batch_size: 64
+  batch_size: 32
   num_workers: 8
   pin_memory: true
   persistent_workers: true

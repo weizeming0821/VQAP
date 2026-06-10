@@ -148,5 +148,5 @@ class VQAP(nn.Module):
 
 	"""显式触发 AtomAction 双码本的死码替换。"""
 	@torch.no_grad()
-	def replace_unused_codebooks(self) -> Dict[str, torch.Tensor]:
-		return self.atomaction_nsvq.replace_unused_codebooks()
+	def replace_unused_codebooks(self, used_steps: int) -> Dict[str, torch.Tensor]:
+		return self.atomaction_nsvq.replace_unused_codebooks(used_steps=used_steps)

@@ -56,14 +56,13 @@ def compute_perplexity(codebook_indices: torch.Tensor, codebook_size: int) -> to
 
 """NSVQ 量化器。
 
-输入：
-	__init__:
-		codebook_size: int，码本大小 K。
-		codebook_dim: int，码本向量维度 D。
-		replace_every: int，死码替换周期。
-		discard_threshold: float，低利用率判定阈值。
-		replace_noise_scale: float，替换时添加的小噪声尺度。
-		eps: float，数值稳定项。
+	输入：
+		__init__:
+			codebook_size: int，码本大小 K。
+			codebook_dim: int，码本向量维度 D。
+			discard_threshold: float，低利用率判定阈值。
+			replace_noise_scale: float，替换时添加的小噪声尺度。
+			eps: float，数值稳定项。
 	forward:
 		inputs: [N, D]
 
@@ -79,7 +78,6 @@ class NSVQQuantizer(nn.Module):
 		self,
 		codebook_size: int,
 		codebook_dim: int,
-		replace_every: int,
 		discard_threshold: float,
 		replace_noise_scale: float,
 		eps: float = 1e-6,
@@ -92,7 +90,6 @@ class NSVQQuantizer(nn.Module):
 
 		self.codebook_size = int(codebook_size)
 		self.codebook_dim = int(codebook_dim)
-		self.replace_every = int(replace_every)
 		self.discard_threshold = float(discard_threshold)
 		self.replace_noise_scale = float(replace_noise_scale)
 		self.eps = float(eps)
@@ -101,7 +98,7 @@ class NSVQQuantizer(nn.Module):
 		self.codebooks = nn.Parameter(torch.empty(self.codebook_size, self.codebook_dim))  # [K, D]
 		self.register_buffer(
 			"codebooks_used",
-			torch.zeros(self.codebook_size, dtype=torch.float32),  # [K]，每个码字累计被分配的次数
+			torch.zeros(self.codebook_size, dtype=torch.float32),  # [K]，当前统计窗口内每个码字累计被分配的次数
 			persistent=True,
 		)
 
@@ -202,16 +199,16 @@ class NSVQQuantizer(nn.Module):
 		perplexity = compute_perplexity(codebook_indices, self.codebook_size)
 		return quantized_features, codebook_indices, perplexity
 
-	"""每 replace_every 步检查一次码本使用情况，替换掉使用率低于 discard_threshold 的码本。"""
+	"""根据当前统计窗口内的累计使用次数，替换掉平均每步命中次数低于阈值的码字。"""
 	@torch.no_grad()
-	def replace_unused_codebooks(self) -> torch.Tensor:
-		if self.replace_every <= 0:
-			raise ValueError("replace_every must be positive when replace_unused_codebooks is enabled")
+	def replace_unused_codebooks(self, used_steps: int) -> torch.Tensor:
+		if used_steps <= 0:
+			raise ValueError("used_steps must be positive when replace_unused_codebooks is enabled")
 
-		usage_ratio = self.codebooks_used.to(dtype=torch.float32) / float(self.replace_every)  # [K]，每个码字在过去 replace_every 步内的平均使用率
-		unused_mask = usage_ratio < self.discard_threshold                                      # [K]，bool，True = 低利用率死码
-		dead_code_indices = unused_mask.nonzero(as_tuple=False).squeeze(-1)                    # [M]，死码下标，M = 死码数量
-		num_replaced = dead_code_indices.numel()                                                # 标量，本次需替换的死码数
+		usage_ratio = self.codebooks_used / float(used_steps)                                # [K]，每个码字在当前统计窗口内平均每步的命中次数
+		unused_mask = usage_ratio < self.discard_threshold                                   # [K]，bool，True = 低利用率死码
+		dead_code_indices = unused_mask.nonzero(as_tuple=False).squeeze(-1)                 # [M]，死码下标，M = 死码数量
+		num_replaced = dead_code_indices.numel()                                             # 标量，本次需替换的死码数
 
 		if num_replaced == 0:
 			self.codebooks_used.zero_()
@@ -265,7 +262,6 @@ class GlobalCodebookModule(nn.Module):
 		hidden_dim: int,
 		codebook_dim: int,
 		codebook_size: int,
-		replace_every: int,
 		discard_threshold: float,
 		replace_noise_scale: float,
 		eps: float,
@@ -278,7 +274,6 @@ class GlobalCodebookModule(nn.Module):
 		self.quantizer = NSVQQuantizer(
 			codebook_size=int(codebook_size),
 			codebook_dim=self.codebook_dim,
-			replace_every=int(replace_every),
 			discard_threshold=float(discard_threshold),
 			replace_noise_scale=float(replace_noise_scale),
 			eps=float(eps),
@@ -338,8 +333,8 @@ class GlobalCodebookModule(nn.Module):
 		}
 
 	@torch.no_grad()
-	def replace_unused_codebooks(self) -> torch.Tensor:
-		return self.quantizer.replace_unused_codebooks()
+	def replace_unused_codebooks(self, used_steps: int) -> torch.Tensor:
+		return self.quantizer.replace_unused_codebooks(used_steps=used_steps)
 
 
 """细节码本模块。
@@ -373,7 +368,6 @@ class DetailCodebookModule(nn.Module):
 		dropout: float,
 		rope_theta: float,
 		rope_max_seq_len: int,
-		replace_every: int,
 		discard_threshold: float,
 		replace_noise_scale: float,
 		eps: float,
@@ -405,7 +399,6 @@ class DetailCodebookModule(nn.Module):
 		self.quantizer = NSVQQuantizer(
 			codebook_size=self.codebook_size,
 			codebook_dim=self.codebook_dim,
-			replace_every=int(replace_every),
 			discard_threshold=float(discard_threshold),
 			replace_noise_scale=float(replace_noise_scale),
 			eps=float(eps),
@@ -482,10 +475,9 @@ class DetailCodebookModule(nn.Module):
 			"detail_features": projected_detail_features,
 			"detail_codewords": quantized_detail_features,
 			"detail_codeindices": detail_codebook_indices,
-			"detail_codeindexs": detail_codebook_indices,
 			"detail_perplexity": detail_perplexity,
 		}
 
 	@torch.no_grad()
-	def replace_unused_codebooks(self) -> torch.Tensor:
-		return self.quantizer.replace_unused_codebooks()
+	def replace_unused_codebooks(self, used_steps: int) -> torch.Tensor:
+		return self.quantizer.replace_unused_codebooks(used_steps=used_steps)

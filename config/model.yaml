@@ -58,7 +58,6 @@ AtomAction_NSVQ:
       hidden_dim: 512
       output_dim: 1
   nsvq:
-    replace_every: 1000
     discard_threshold: 0.1
     replace_noise_scale: 1.0e-5
     eps: 1.0e-6

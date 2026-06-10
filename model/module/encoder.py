@@ -318,8 +318,8 @@ class VisualSelfAttentionLayer(nn.Module):
 
 		ffn_input = self.ffn_norm(query_features)	# [B, T, C] -> [B, T, C]
 		ffn_output = self.ffn(ffn_input)	# [B, T, C] -> [B, T, C]
-		query_features = self.ffn_dropout(ffn_output)	# [B, T, C] -> [B, T, C]
-		
+		query_features = query_features + self.ffn_dropout(ffn_output)	# [B, T, C] -> [B, T, C]
+
 		return query_features
 
 
@@ -503,7 +503,7 @@ class ChannelEncoder(nn.Module):
 		x = x * valid_mask
 
 		# [B, T, C] -> [B, T, C]
-		x = self.output_ffn(x)
+		x = x + self.output_ffn(x)
 		x = x * valid_mask
 		return x
 
