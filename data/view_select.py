@@ -1,9 +1,11 @@
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 from PIL import Image
+from torch.utils.data import get_worker_info
 
 try:
     from .utils import build_dinov2_transform, get_configured_tensor_dtype
@@ -59,6 +61,7 @@ class View_Selector:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.input_size = input_size
         self.selection_model = None
+        self._model_device: Optional[str] = None
         self.transform = None
         self.tensor_dtype = get_configured_tensor_dtype()
         self._validate_model_config()
@@ -92,15 +95,22 @@ class View_Selector:
         if self.selection_model is not None:
             return
 
+        # fork 出的 DataLoader worker 进程无法初始化 CUDA，自动降级到 CPU 打分。
+        device = self.device
+        if str(device).startswith("cuda") and get_worker_info() is not None:
+            device = "cpu"
+
         try:
-            self.selection_model = torch.hub.load(self.repo, self.model_name).to(self.device)
+            self.selection_model = torch.hub.load(self.repo, self.model_name).to(device)
             self.selection_model.eval()
             for param in self.selection_model.parameters():
                 param.requires_grad = False
+            self._model_device = device
 
             self._ensure_transform_ready()
         except Exception as exc:
             self.selection_model = None
+            self._model_device = None
             self.transform = None
             raise RuntimeError(
                 "Failed to load DINOv2 view selection model from torch.hub. "
@@ -160,13 +170,20 @@ class View_Selector:
             raise ValueError(f"Phase metadata must contain a top-level mapping: {phase_metadata_path}")
         return metadata
 
-    """把更新后的 phase 元数据写回磁盘。"""
+    """把更新后的 phase 元数据写回磁盘。
+
+    临时文件名带 pid，避免多 worker / 多 rank 并发写同一 tmp 文件导致 JSON 损坏；
+    rename 的原子性保证 last-writer-wins。
+    """
     def _write_phase_metadata(self, phase_metadata_path: Path, metadata: Dict[str, Any]) -> None:
-        temp_path = phase_metadata_path.with_suffix(f"{phase_metadata_path.suffix}.tmp")
-        with temp_path.open("w", encoding="utf-8") as file:
-            json.dump(metadata, file, ensure_ascii=False, indent=2)
-            file.write("\n")
-        temp_path.replace(phase_metadata_path)
+        temp_path = phase_metadata_path.with_suffix(f"{phase_metadata_path.suffix}.{os.getpid()}.tmp")
+        try:
+            with temp_path.open("w", encoding="utf-8") as file:
+                json.dump(metadata, file, ensure_ascii=False, indent=2)
+                file.write("\n")
+            temp_path.replace(phase_metadata_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
     """获取或创建当前 phase 的视角缓存块。"""
     def _get_or_create_view_selection_cache(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
@@ -232,7 +249,7 @@ class View_Selector:
             img = img.convert("RGB")
 
         with torch.no_grad():
-            x = self.transform(img).unsqueeze(0).to(self.device)
+            x = self.transform(img).unsqueeze(0).to(self._model_device)
             features = self.selection_model.forward_features(x)
             if isinstance(features, dict) and "x_norm_clstoken" in features:
                 feat = features["x_norm_clstoken"]

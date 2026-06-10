@@ -69,7 +69,8 @@ def init_tensorboard(
 		return None
 
 	logger = logging.getLogger(f"vqap.{exp_name}")
-	tb_log_dir = Path(ckpt_dir).expanduser() / str(tb_cfg.get("log_dir", "tensorboard")) / exp_name
+	# ckpt_dir 已含 exp_name，这里不再拼接，避免路径中 exp_name 重复两层。
+	tb_log_dir = Path(ckpt_dir).expanduser() / str(tb_cfg.get("log_dir", "tensorboard"))
 	tb_log_dir.mkdir(parents=True, exist_ok=True)
 
 	try:

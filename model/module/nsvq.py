@@ -4,9 +4,9 @@ import torch
 import torch.nn as nn
 
 try:
-	from .utils import MultiHeadAttention, RotaryPositionEncoding1D
+	from .utils import MultiHeadAttention
 except ImportError:
-	from utils import MultiHeadAttention, RotaryPositionEncoding1D
+	from utils import MultiHeadAttention
 
 
 """带 padding mask 的平均池化。
@@ -366,8 +366,6 @@ class DetailCodebookModule(nn.Module):
 		codebook_dim: int,
 		codebook_size: int,
 		dropout: float,
-		rope_theta: float,
-		rope_max_seq_len: int,
 		discard_threshold: float,
 		replace_noise_scale: float,
 		eps: float,
@@ -381,7 +379,6 @@ class DetailCodebookModule(nn.Module):
 		self.num_heads = int(num_heads)
 		self.codebook_dim = int(codebook_dim)
 		self.codebook_size = int(codebook_size)
-		self.head_dim = self.hidden_dim // self.num_heads
 
 		# Learnable query 本身就承担“细节槽位”的语义承载与位置区分作用。
 		self.learnable_queries = nn.Parameter(torch.randn(self.num_queries, self.hidden_dim) * 0.02)
@@ -389,11 +386,6 @@ class DetailCodebookModule(nn.Module):
 			hidden_dim=self.hidden_dim,
 			num_heads=self.num_heads,
 			dropout=float(dropout),
-		)
-		self.rope = RotaryPositionEncoding1D(
-			feature_dim=self.head_dim,
-			theta=float(rope_theta),
-			max_seq_len=max(int(rope_max_seq_len), self.num_queries),
 		)
 		self.projection = nn.Linear(self.hidden_dim, self.codebook_dim)
 		self.quantizer = NSVQQuantizer(
@@ -439,25 +431,21 @@ class DetailCodebookModule(nn.Module):
 				"encoded_trajectory_features and trajectory_mask must be provided when using the feature quantization path"
 			)
 
-		batch_size, seq_len, _ = encoded_trajectory_features.shape
+		batch_size = encoded_trajectory_features.shape[0]
 		if codebook_indices is not None and codebook_indices.shape != (batch_size, self.num_queries):
 			raise ValueError("detail codebook_indices must have shape [B, num_queries]")
 
 		# [N_detail, C] -> [1, N_detail, C] -> [B, N_detail, C]
 		detail_queries = self.learnable_queries.unsqueeze(0).expand(batch_size, -1, -1)
 
-		# query 长度为 N_detail，key/value 长度为 T；RoPE 统一按较长序列缓存后再切片。
-		rope_seq_len = max(self.num_queries, seq_len)
-		rope_cos, rope_sin = self.rope(seq_len=rope_seq_len, device=encoded_trajectory_features.device, dtype=encoded_trajectory_features.dtype)
-
+		# detail 槽位无序，且轨迹帧的时序信息已由带 RoPE 的 transformer encoder 编码进 key 特征，
+		# 因此 cross-attention 不再施加 RoPE，与 VASA 视觉 cross-attention 的做法保持一致。
 		# [B, N_detail, C] x [B, T, C] -> [B, N_detail, C]
 		detail_query_features = self.cross_attention(
 			query=detail_queries,
 			key=encoded_trajectory_features,
 			value=encoded_trajectory_features,
 			trajectory_mask=trajectory_mask,
-			rope_cos=rope_cos,
-			rope_sin=rope_sin,
 		)
 
 		# [B, N_detail, C] -> [B, N_detail, D]

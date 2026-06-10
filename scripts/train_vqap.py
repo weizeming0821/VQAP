@@ -8,6 +8,9 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
+# 在 import torch 之前设置，否则 CUDA 缓存分配器可能已按默认配置初始化而不再生效。
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import torch.distributed as dist
 import yaml
@@ -134,7 +137,6 @@ class VQAPTrainer:
 		if self.device.type == "cuda":
 			torch.backends.cudnn.benchmark = bool(runtime_cfg.get("cudnn_benchmark", True))
 			torch.backends.cuda.matmul.allow_tf32 = bool(runtime_cfg.get("allow_tf32", True))
-			os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 		# 混合精度设置
 		self.precision = str(runtime_cfg.get("precision", "bf16")).lower()
@@ -152,16 +154,17 @@ class VQAPTrainer:
 			enabled=self.device.type == "cuda" and self.precision == "fp16",
 		)
 
-		# 日志与 checkpoint 目录初始化
+		# 日志与 checkpoint 目录初始化；resume 路径先于 logger 解析，保证续训时日志以 append 模式打开。
 		checkpoint_cfg = self.train_args["checkpoint"]
 		logging_cfg = self.train_args["logging"]
 		self.ckpt_dir = Path(checkpoint_cfg["root_dir"]).expanduser() / self.exp_name
 		self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+		self.resume_path = self._resolve_resume_path()
 		self.logger = init_logger(
 			rank=self.rank,
 			exp_name=self.exp_name,
 			log_dir=str(logging_cfg.get("log_dir", "log")),
-			is_resume=bool(args.resume),
+			is_resume=self.resume_path is not None,
 		)
 
 		# 训练阶段与优化器调度设置
@@ -172,7 +175,6 @@ class VQAPTrainer:
 		self.grad_clip_norm = float(runtime_cfg["grad_clip_norm"])
 
 		# 断点续训设置
-		self.resume_path = self._resolve_resume_path()
 		self.resume_state = self._load_resume_state()
 		self.current_stage = int(self.resume_state["stage"]) if self.resume_state is not None else 0
 		self.start_epoch = int(self.resume_state["epoch"]) if self.resume_state is not None else 0
@@ -234,17 +236,18 @@ class VQAPTrainer:
 		torch.cuda.set_device(self.local_rank)
 		dist.init_process_group(backend="nccl", init_method="env://")
 
-	"""解析断点续训路径：显式传参优先，其次读取 train.yaml，最后回退到 latest.pth。"""
+	"""解析断点续训路径。
+
+	仅当命令行显式给出 --resume 时才进入续训；
+	路径优先级：--resume-path > train.yaml 的 resume.path > latest.pth。
+	"""
 	def _resolve_resume_path(self) -> Optional[Path]:
-		if self.args.resume_path:
-			return Path(self.args.resume_path).expanduser()
-		if self.args.resume:
+		if not self.args.resume:
+			return None
+		resume_path = self.args.resume_path or self.train_args.get("resume", {}).get("path")
+		if resume_path is None:
 			return self.ckpt_dir / "latest.pth"
-		resume_cfg = self.train_args.get("resume", {})
-		config_resume_path = resume_cfg.get("path")
-		if config_resume_path:
-			return Path(config_resume_path).expanduser()
-		return None
+		return Path(resume_path).expanduser()
 
 	"""按需加载 checkpoint 状态，但不在这里做 model/optimizer 的恢复。"""
 	def _load_resume_state(self) -> Optional[Dict[str, Any]]:

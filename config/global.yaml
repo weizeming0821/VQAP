@@ -38,5 +38,5 @@ atomactiondataset:
   view_selector:
     model_name: "dinov2_vits14_reg"
     repo: "facebookresearch/dinov2"
-    device: None
+    device: null
     input_size: 224

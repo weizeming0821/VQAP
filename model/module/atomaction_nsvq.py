@@ -122,8 +122,6 @@ class AtomAction_NSVQ(nn.Module):
             codebook_dim=int(detail_codebook_cfg["codebook_dim"]),
             codebook_size=int(detail_codebook_cfg["codebook_size"]),
             dropout=float(detail_codebook_cfg["dropout"]),
-            rope_theta=float(rope_cfg["theta"]),
-            rope_max_seq_len=int(rope_cfg["max_seq_len"]),
             discard_threshold=float(nsvq_cfg["discard_threshold"]),
             replace_noise_scale=float(nsvq_cfg["replace_noise_scale"]),
             eps=float(nsvq_cfg["eps"]),
