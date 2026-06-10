@@ -181,6 +181,7 @@ class VQAPTrainer:
 		self.global_step = int(self.resume_state.get("global_step", 0)) if self.resume_state is not None else 0
 		self.best_lap = float(self.resume_state.get("best_lap", float("inf"))) if self.resume_state is not None else float("inf")
 		self.best_ltotal = float(self.resume_state.get("best_ltotal", float("inf"))) if self.resume_state is not None else float("inf")
+		self._validate_resume_config()
 
 		# TensorBoard 的启停只影响实验记录，不影响训练主逻辑。
 		tb_cfg = dict(self.train_args)
@@ -213,9 +214,56 @@ class VQAPTrainer:
 			self.scheduler.load_state_dict(self.resume_state["scheduler"])
 
 		if self.rank == 0:
+			if self.resume_state is not None:
+				stage_epoch, stage_total = self._stage_progress(self.start_epoch)
+				self.logger.info(
+					f"Resuming stage {self.current_stage} from {self.resume_path} | "
+					f"global epoch {self.start_epoch}/{self.total_epochs} "
+					f"(S{self.current_stage} {stage_epoch}/{stage_total}) | global_step={self.global_step}"
+				)
 			self.logger.info(
 				f"Trainer initialized | stage={self.current_stage} | start_epoch={self.start_epoch} | "
 				f"global_step={self.global_step} | dataset_size={len(self.train_dataset)}"
+			)
+
+	"""把全局 epoch 换算成所在 stage 内的进度 (stage_epoch, stage_total)。"""
+	def _stage_progress(self, global_epoch: int) -> tuple[int, int]:
+		if int(global_epoch) < self.stage0_epochs:
+			return int(global_epoch), self.stage0_epochs
+		return int(global_epoch) - self.stage0_epochs, self.stage1_epochs
+
+	"""续训配置一致性校验：禁止 Stage 1 改 stage0_epochs，禁止把当前 stage 的 epoch 改小。"""
+	def _validate_resume_config(self) -> None:
+		if self.resume_state is None:
+			return
+
+		ckpt_stage_cfg = self.resume_state.get("train_args", {}).get("stage", {})
+		ckpt_stage0_epochs = int(ckpt_stage_cfg.get("stage0_epochs", self.stage0_epochs))
+		ckpt_stage1_epochs = int(ckpt_stage_cfg.get("stage1_epochs", self.stage1_epochs))
+
+		# Raise A：进入 Stage 1 后，stage0_epochs 已是既成事实，改动会让 λ_future 调度与全局 epoch 语义错位。
+		if self.current_stage == 1 and self.stage0_epochs != ckpt_stage0_epochs:
+			raise ValueError(
+				f"checkpoint 已进入 Stage 1，stage0_epochs 不可更改"
+				f"（checkpoint={ckpt_stage0_epochs}, 当前配置={self.stage0_epochs}）；"
+				f"延长训练请只增大 stage1_epochs。"
+			)
+
+		# Raise B：当前所在 stage 的 epoch 数只能持平或增大，不能改小。
+		if self.current_stage == 0 and self.stage0_epochs < ckpt_stage0_epochs:
+			raise ValueError(
+				f"stage0_epochs 不可改小（checkpoint={ckpt_stage0_epochs} -> 当前={self.stage0_epochs}），请增大。"
+			)
+		if self.current_stage == 1 and self.stage1_epochs < ckpt_stage1_epochs:
+			raise ValueError(
+				f"stage1_epochs 不可改小（checkpoint={ckpt_stage1_epochs} -> 当前={self.stage1_epochs}），请增大。"
+			)
+
+		# 安全网：任何手改导致没有可训练的 epoch。
+		if self.start_epoch >= self.total_epochs:
+			raise ValueError(
+				f"无可训练 epoch（start_epoch={self.start_epoch} >= total_epochs={self.total_epochs}），"
+				f"请增大对应 stage 的 epochs。"
 			)
 
 	"""初始化单机/多卡训练环境，并设置当前进程使用的 GPU。"""
@@ -236,28 +284,46 @@ class VQAPTrainer:
 		torch.cuda.set_device(self.local_rank)
 		dist.init_process_group(backend="nccl", init_method="env://")
 
+	"""返回指定 stage 的 checkpoint 子目录（不创建，仅拼路径）。"""
+	def _stage_ckpt_dir(self, stage: int) -> Path:
+		return self.ckpt_dir / f"stage{int(stage)}"
+
 	"""解析断点续训路径。
 
-	仅当命令行显式给出 --resume 时才进入续训；
-	路径优先级：--resume-path > train.yaml 的 resume.path > latest.pth。
+	仅当命令行显式给出 --resume-stage {0,1} 时才进入续训；
+	路径优先级：--resume-path > stage{N}/latest.pth。
+	--resume-path 必须配合 --resume-stage 使用。
 	"""
 	def _resolve_resume_path(self) -> Optional[Path]:
-		if not self.args.resume:
+		if self.args.resume_stage is None:
+			if self.args.resume_path is not None:
+				raise ValueError("--resume-path must be used together with --resume-stage")
 			return None
-		resume_path = self.args.resume_path or self.train_args.get("resume", {}).get("path")
-		if resume_path is None:
-			return self.ckpt_dir / "latest.pth"
-		return Path(resume_path).expanduser()
+		if self.args.resume_path:
+			return Path(self.args.resume_path).expanduser()
+		return self._stage_ckpt_dir(int(self.args.resume_stage)) / "latest.pth"
 
 	"""按需加载 checkpoint 状态，但不在这里做 model/optimizer 的恢复。"""
 	def _load_resume_state(self) -> Optional[Dict[str, Any]]:
 		if self.resume_path is None:
 			return None
 		if not self.resume_path.is_file():
-			raise FileNotFoundError(f"Resume checkpoint not found: {self.resume_path}")
+			raise FileNotFoundError(
+				f"Resume checkpoint not found: {self.resume_path}. "
+				f"如需从 Stage 0 末尾续训并自动切入 Stage 1，请使用 --resume-stage 0。"
+			)
 		if self.rank == 0:
 			self.logger.info(f"Loading checkpoint from {self.resume_path}")
-		return torch.load(self.resume_path, map_location="cpu")
+		state = torch.load(self.resume_path, map_location="cpu")
+
+		# 防止 --resume-path 指错文件：checkpoint 内 stage 必须与 --resume-stage 一致。
+		ckpt_stage = int(state.get("stage", 0))
+		if ckpt_stage != int(self.args.resume_stage):
+			raise ValueError(
+				f"--resume-stage={self.args.resume_stage} 与 checkpoint 内 stage={ckpt_stage} 不一致："
+				f"{self.resume_path}"
+			)
+		return state
 
 	"""构建训练集与 DataLoader"""
 	def _init_dataset(self) -> tuple[AtomActionDataset, Optional[DistributedSampler], DataLoader]:
@@ -739,14 +805,34 @@ class VQAPTrainer:
 		torch.save(payload, tmp_path)
 		tmp_path.replace(path)
 
-	"""保存 latest / best / codebook 三类 checkpoint。"""
-	def _save_checkpoint(self, epoch: int, epoch_metrics: Dict[str, float]) -> None:
+	"""保存 checkpoint。
+
+	- best 判定每个 epoch 都执行（与 save_latest 解耦），避免漏掉非保存间隔上的最优。
+	- best 比较先于 payload 构建，保证写入文件里的 best_lap/best_ltotal 是最新值。
+	- latest / codebook 仅在 save_latest=True 时写；按当前 stage 写入 stage{N}/ 子目录。
+	"""
+	def _save_checkpoint(self, epoch: int, epoch_metrics: Dict[str, float], save_latest: bool) -> None:
 		if self.rank != 0:
 			return
 
-		# 保存最新 checkpiont
-		model = self._get_model_module()
 		log_step = int(epoch) + 1
+
+		# 先判定 best 并更新内部记录，再构建 payload。
+		best_lap_improved = epoch_metrics["loss_ap"] < self.best_lap
+		if best_lap_improved:
+			self.best_lap = epoch_metrics["loss_ap"]
+		best_ltotal_improved = epoch_metrics["loss_total"] < self.best_ltotal
+		if best_ltotal_improved:
+			self.best_ltotal = epoch_metrics["loss_total"]
+
+		# 三类文件都不需要写时，直接返回，省去全模型 state_dict 拷贝。
+		if not (save_latest or best_lap_improved or best_ltotal_improved):
+			return
+
+		model = self._get_model_module()
+		stage_dir = self._stage_ckpt_dir(self.current_stage)
+		stage_dir.mkdir(parents=True, exist_ok=True)
+
 		checkpoint_payload = {
 			"epoch": epoch + 1,
 			"global_step": self.global_step,
@@ -761,37 +847,34 @@ class VQAPTrainer:
 			"global_args": self.global_args,
 			"tb_log_dir": getattr(self.tb_writer, "log_dir", None),
 		}
-		self._atomic_torch_save(checkpoint_payload, self.ckpt_dir / "latest.pth")
 
-		# 保存 loss_ap 最佳 checkpoint
-		if epoch_metrics["loss_ap"] < self.best_lap:
-			self.best_lap = epoch_metrics["loss_ap"]
-			checkpoint_payload["best_lap"] = self.best_lap
+		if save_latest:
+			self._atomic_torch_save(checkpoint_payload, stage_dir / "latest.pth")
 
-			self._atomic_torch_save(checkpoint_payload, self.ckpt_dir / "best_lap.pth")
+			# 保持码本模块和码本权重
+			codebook_payload = {
+				"epoch": epoch + 1,
+				"global_step": self.global_step,
+				"stage": self.current_stage,
+				"perplexity_g": epoch_metrics["perplexity_g"],
+				"perplexity_d": epoch_metrics["perplexity_d"],
+				"model_args": self.model_args,
+				"global_codebook_module": model.atomaction_nsvq.global_codebook_module.state_dict(),
+				"detail_codebook_module": model.atomaction_nsvq.detail_codebook_module.state_dict(),
+				"global_codebook": model.atomaction_nsvq.global_codebook_module.quantizer.state_dict(),
+				"detail_codebook": model.atomaction_nsvq.detail_codebook_module.quantizer.state_dict(),
+			}
+			self._atomic_torch_save(codebook_payload, stage_dir / "codebook.pth")
+
+		if best_lap_improved:
+			self._atomic_torch_save(checkpoint_payload, stage_dir / "best_lap.pth")
 			if self.tb_writer is not None:
-				self.tb_writer.add_scalar("ckpt/best_lap", self.best_lap, log_step)
+				self.tb_writer.add_scalar(f"best/lap_s{self.current_stage}", self.best_lap, log_step)
 
-		# 保存 loss_total 最佳 checkpoint
-		if epoch_metrics["loss_total"] < self.best_ltotal:
-			self.best_ltotal = epoch_metrics["loss_total"]
-			checkpoint_payload["best_ltotal"] = self.best_ltotal
-
-			self._atomic_torch_save(checkpoint_payload, self.ckpt_dir / "best_ltotal.pth")
+		if best_ltotal_improved:
+			self._atomic_torch_save(checkpoint_payload, stage_dir / "best_ltotal.pth")
 			if self.tb_writer is not None:
-				self.tb_writer.add_scalar("ckpt/best_ltotal", self.best_ltotal, log_step)
-
-		# 保存码本 checkpoint（包含死码替换后的更新）
-		codebook_payload = {
-			"epoch": epoch + 1,
-			"global_step": self.global_step,
-			"stage": self.current_stage,
-			"perplexity_g": epoch_metrics["perplexity_g"],
-			"perplexity_d": epoch_metrics["perplexity_d"],
-			"global_codebook": model.atomaction_nsvq.global_codebook_module.quantizer.state_dict(),
-			"detail_codebook": model.atomaction_nsvq.detail_codebook_module.quantizer.state_dict(),
-		}
-		self._atomic_torch_save(codebook_payload, self.ckpt_dir / "codebook.pth")
+				self.tb_writer.add_scalar(f"best/ltotal_s{self.current_stage}", self.best_ltotal, log_step)
 
 	"""执行 Stage 0 -> Stage 1 切换。
 		- merge 并移除 LoRA 结构
@@ -825,7 +908,11 @@ class VQAPTrainer:
 		self.best_ltotal = float("inf")
 
 		if self.rank == 0 and self.tb_writer is not None:
-			self.tb_writer.add_scalar("train/stage", 1.0, int(epoch) + 1)
+			self.tb_writer.add_text(
+				"stage_transition",
+				f"epoch {int(epoch) + 1}: stage0 -> stage1 (LoRA merged, optimizer/scheduler rebuilt)",
+				int(epoch) + 1,
+			)
 		if self.distributed:
 			dist.barrier()
 
@@ -835,30 +922,39 @@ class VQAPTrainer:
 			return
 
 		log_payload = {
-			"train/loss_total": epoch_metrics["loss_total"],
-			"train/loss_ap": epoch_metrics["loss_ap"],
-			"train/loss_fm_pos_ap": epoch_metrics["loss_fm_pos_ap"],
-			"train/loss_fm_rot_ap": epoch_metrics["loss_fm_rot_ap"],
-			"train/loss_bce_grip_ap": epoch_metrics["loss_bce_grip_ap"],
-			"train/loss_sep": epoch_metrics["loss_sep"],
-			"train/loss_ag": epoch_metrics["loss_ag"],
-			"train/loss_fm_pos_ag": epoch_metrics["loss_fm_pos_ag"],
-			"train/loss_fm_rot_ag": epoch_metrics["loss_fm_rot_ag"],
-			"train/loss_bce_grip_ag": epoch_metrics["loss_bce_grip_ag"],
-			"train/loss_future": epoch_metrics["loss_future"],
-			"train/grad_norm": epoch_metrics["grad_norm"],
-			"train/lambda_future": epoch_metrics["lambda_future"],
-			"train/stage": float(self.current_stage),
+			# 损失总览 → 面板 "loss"
+			"loss/total": epoch_metrics["loss_total"],
+			"loss/ap": epoch_metrics["loss_ap"],
+			"loss/sep": epoch_metrics["loss_sep"],
+			"loss/ag": epoch_metrics["loss_ag"],
+			"loss/future": epoch_metrics["loss_future"],
+
+			# AP 分解损失 → 面板 "loss_ap"
+			"loss_ap/fm_pos": epoch_metrics["loss_fm_pos_ap"],
+			"loss_ap/fm_rot": epoch_metrics["loss_fm_rot_ap"],
+			"loss_ap/bce_grip": epoch_metrics["loss_bce_grip_ap"],
+
+			# AG 分解损失 → 面板 "loss_ag"
+			"loss_ag/fm_pos": epoch_metrics["loss_fm_pos_ag"],
+			"loss_ag/fm_rot": epoch_metrics["loss_fm_rot_ag"],
+			"loss_ag/bce_grip": epoch_metrics["loss_bce_grip_ag"],
+
+			# 训练状态 → 面板 "train_state"
+			"train_state/grad_norm": epoch_metrics["grad_norm"],
+			"train_state/lambda_future": epoch_metrics["lambda_future"],
+			"train_state/stage": float(self.current_stage),
 		}
-		
+
+		# 学习率 → 面板 "lr"（lr/main、lr/lora）
 		log_payload.update(self._get_lr_logs())
 		if self.tb_writer is not None:
 			step = int(epoch) + 1
 			for key, value in log_payload.items():
 				self.tb_writer.add_scalar(key, value, step)
 
+		stage_epoch, stage_total = self._stage_progress(int(epoch))
 		self.logger.info(
-			f"epoch={epoch + 1}/{self.total_epochs} | stage={self.current_stage} | "
+			f"epoch={epoch + 1}/{self.total_epochs} (S{self.current_stage} {stage_epoch + 1}/{stage_total}) | "
 			f"loss_total={epoch_metrics['loss_total']:.4f} | loss_ap={epoch_metrics['loss_ap']:.4f} | "
 			f"loss_ag={epoch_metrics['loss_ag']:.4f} | loss_future={epoch_metrics['loss_future']:.4f} | "
 			f"lambda_future={epoch_metrics['lambda_future']:.4f} | "
@@ -907,16 +1003,17 @@ class VQAPTrainer:
 				step = int(epoch) + 1
 				self.tb_writer.add_scalar("codebook/perplexity_g", epoch_metrics["perplexity_g"], step)
 				self.tb_writer.add_scalar("codebook/perplexity_d", epoch_metrics["perplexity_d"], step)
-				self.tb_writer.add_scalar("codebook/replaced_codebooks_g", float(replace_metrics["replaced_codebooks_g"]), step)
-				self.tb_writer.add_scalar("codebook/replaced_codebooks_d", float(replace_metrics["replaced_codebooks_d"]), step)
-				self.tb_writer.add_scalar(
-					"codebook/replace_triggered",
-					float(replace_metrics["replaced_codebooks_g"] > 0 or replace_metrics["replaced_codebooks_d"] > 0),
-					step,
-				)
+				self.tb_writer.add_scalar("codebook/replaced_g", float(replace_metrics["replaced_codebooks_g"]), step)
+				self.tb_writer.add_scalar("codebook/replaced_d", float(replace_metrics["replaced_codebooks_d"]), step)
 
-			if (epoch + 1) % self.save_every_epochs == 0 or (epoch + 1) == self.total_epochs:
-				self._save_checkpoint(epoch, epoch_metrics)
+			# latest / codebook 按保存间隔节流，并在每个 stage 的最后一个 epoch 强制保存（保证 stage0 末状态可续训）；
+			# best 判定在 _save_checkpoint 内部每 epoch 都会执行。
+			save_latest = (
+				(epoch + 1) % self.save_every_epochs == 0
+				or (epoch + 1) == self.stage0_epochs
+				or (epoch + 1) == self.total_epochs
+			)
+			self._save_checkpoint(epoch, epoch_metrics, save_latest=save_latest)
 
 			self._log_epoch_summary(
 				epoch=epoch,
@@ -939,8 +1036,19 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--model-config", type=str, default="config/model.yaml", help="Path to model.yaml")
 	parser.add_argument("--global-config", type=str, default="config/global.yaml", help="Path to global.yaml")
 	parser.add_argument("--exp-name", type=str, default=None, help="Override experiment name in train.yaml")
-	parser.add_argument("--resume", action="store_true", help="Resume from latest.pth or --resume-path")
-	parser.add_argument("--resume-path", type=str, default=None, help="Explicit checkpoint path for resuming")
+	parser.add_argument(
+		"--resume-stage",
+		type=int,
+		default=None,
+		choices=(0, 1),
+		help="Resume training from a given stage's checkpoint (0 or 1). Omit to start a fresh run.",
+	)
+	parser.add_argument(
+		"--resume-path",
+		type=str,
+		default=None,
+		help="Explicit checkpoint path for resuming; must be used together with --resume-stage.",
+	)
 	parser.add_argument("--disable-tensorboard", action="store_true", help="Disable TensorBoard even if train.yaml enables it")
 	return parser.parse_args()
 

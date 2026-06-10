@@ -65,9 +65,6 @@ tensorboard:
   enable: true
   log_dir: "tensorboard"
 
-resume:
-  path: null
-
 lora:
   r: 8
   alpha: 16
