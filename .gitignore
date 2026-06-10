@@ -1,14 +1,14 @@
 .vscode
 *.pyc
 
-log
+log/
 checkpoints/
-wandb/
-*demos*/
+tensorboard/
+
 *.zip
-RLBench/
 test*
 *Dataset*/
 temp/
 source/
+
 Model_Design.md
