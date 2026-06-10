@@ -107,6 +107,12 @@ class View_Selector:
                 param.requires_grad = False
             self._model_device = device
 
+            # xFormers 的 memory_efficient_attention 仅支持 CUDA + fp16/bf16，
+            # CPU 推理（fork 出的 DataLoader worker）会直接报错，需回退到 PyTorch
+            # 原生 scaled_dot_product_attention。
+            if device == "cpu":
+                self._disable_xformers_attention()
+
             self._ensure_transform_ready()
         except Exception as exc:
             self.selection_model = None
@@ -117,6 +123,19 @@ class View_Selector:
                 "Please check network access, local torch.hub cache, and model name settings. "
                 f"repo={self.repo}, model={self.model_name}"
             ) from exc
+
+    """在 CPU 推理时关闭 DINOv2 的 xFormers 注意力，回退到原生实现。
+
+    dinov2.layers.attention 在导入时把 XFORMERS_AVAILABLE 固定为模块级常量，
+    MemEffAttention.forward 在调用时读取该常量。这里把它改为 False，使前向走
+    super().forward()（scaled_dot_product_attention），从而支持 CPU。
+    仅影响当前进程（DataLoader worker），主进程的 GPU 训练 backbone 不受影响。
+    """
+    def _disable_xformers_attention(self) -> None:
+        import sys
+        attn_mod = sys.modules.get("dinov2.layers.attention")
+        if attn_mod is not None:
+            attn_mod.XFORMERS_AVAILABLE = False
 
     """校验图像路径是否存在，并返回规范化后的绝对路径。"""
     def _validate_image_path(self, img_path: str) -> Path:
