@@ -661,8 +661,8 @@ class VQAPTrainer:
 		detail_quantizer = model.atomaction_nsvq.detail_codebook_module.quantizer
 
 		if self.distributed:
-			dist.all_reduce(global_quantizer.codebooks_used, op=dist.ReduceOp.SUM)
-			dist.all_reduce(detail_quantizer.codebooks_used, op=dist.ReduceOp.SUM)
+			dist.all_reduce(global_quantizer.codebooks_used, op=dist.ReduceOp.AVG)
+			dist.all_reduce(detail_quantizer.codebooks_used, op=dist.ReduceOp.AVG)
 
 		replaced_g = 0
 		replaced_d = 0
@@ -690,10 +690,12 @@ class VQAPTrainer:
 		perplexity_d_threshold = float(codebook_cfg["perplexity_d_threshold"])
 		replace_interval_epochs = float(codebook_cfg["replace_interval_epochs"])
 
+		# perplexity 触发条件：任一码本 perplexity 低于对应阈值
 		trigger_by_perplexity = (
 			epoch_metrics["perplexity_g"] < perplexity_g_threshold
 			or epoch_metrics["perplexity_d"] < perplexity_d_threshold
 		)
+		# 间隔触发条件：epoch 满足固定间隔要求
 		trigger_by_interval = (
 			math.isfinite(replace_interval_epochs)
 			and replace_interval_epochs > 0
@@ -704,6 +706,7 @@ class VQAPTrainer:
 				"replaced_codebooks_g": 0,
 				"replaced_codebooks_d": 0,
 			}
+
 		return self._replace_dead_codebooks()
 
 	"""用先写临时文件再原子替换的方式保存 checkpoint，避免中途中断写坏文件。"""
@@ -871,9 +874,10 @@ class VQAPTrainer:
 			epoch_metrics = self._train_epoch(epoch)
 			self.scheduler.step()
 
+			# 先根据当前 perplexity 决定是否替换死码，再把更新后的状态一起保存。
+			replace_metrics = self._maybe_replace_dead_codebooks(epoch, epoch_metrics)
+
 			if (epoch + 1) % self.save_every_epochs == 0 or (epoch + 1) == self.total_epochs:
-				# 先根据当前 perplexity 决定是否替换死码，再把更新后的状态一起保存。
-				replace_metrics = self._maybe_replace_dead_codebooks(epoch, epoch_metrics)
 				epoch_metrics.update(replace_metrics)
 				self._save_checkpoint(epoch, epoch_metrics)
 				if self.rank == 0 and self.tb_writer is not None:
@@ -901,6 +905,10 @@ class VQAPTrainer:
 					"perplexity_g": f"{epoch_metrics['perplexity_g']:.1f}",
 					"perplexity_d": f"{epoch_metrics['perplexity_d']:.1f}",
 				}, refresh=False)
+
+			# 每个 epoch 结束，codebooks_used 清 0
+			self.model.module.atomaction_nsvq.global_codebook_module.quantizer.codebooks_used.zero_()
+			self.model.module.atomaction_nsvq.detail_codebook_module.quantizer.codebooks_used.zero_() 
 
 
 def parse_args() -> argparse.Namespace:

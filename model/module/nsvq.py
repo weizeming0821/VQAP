@@ -101,7 +101,7 @@ class NSVQQuantizer(nn.Module):
 		self.codebooks = nn.Parameter(torch.empty(self.codebook_size, self.codebook_dim))  # [K, D]
 		self.register_buffer(
 			"codebooks_used",
-			torch.zeros(self.codebook_size, dtype=torch.long),  # [K]，每个码字累计被分配的次数
+			torch.zeros(self.codebook_size, dtype=torch.float32),  # [K]，每个码字累计被分配的次数
 			persistent=True,
 		)
 
