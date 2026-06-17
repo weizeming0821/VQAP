@@ -55,6 +55,26 @@ EPOCH_METRIC_KEYS = (
 	"perplexity_d",
 )
 
+LOSS_TENSORBOARD_KEYS = (
+	("loss_total", "total"),
+	("loss_ap", "ap"),
+	("loss_sep", "sep"),
+	("loss_ag", "ag"),
+	("loss_future", "future"),
+)
+
+EPOCH_HISTORY_METRIC_KEYS = (
+	"loss_total",
+	"loss_ap",
+	"loss_sep",
+	"loss_ag",
+	"loss_future",
+	"perplexity_g",
+	"perplexity_d",
+	"grad_norm",
+	"lambda_future",
+)
+
 
 """读取 YAML 配置文件，并校验顶层必须为字典。"""
 def load_yaml_config(path: str) -> Dict[str, Any]:
@@ -181,6 +201,7 @@ class VQAPTrainer:
 		self.global_step = int(self.resume_state.get("global_step", 0)) if self.resume_state is not None else 0
 		self.best_lap = float(self.resume_state.get("best_lap", float("inf"))) if self.resume_state is not None else float("inf")
 		self.best_ltotal = float(self.resume_state.get("best_ltotal", float("inf"))) if self.resume_state is not None else float("inf")
+		self.epoch_history = [dict(record) for record in self.resume_state["epoch_history"]] if self.resume_state is not None else []
 		self._validate_resume_config()
 
 		# TensorBoard 的启停只影响实验记录，不影响训练主逻辑。
@@ -215,22 +236,37 @@ class VQAPTrainer:
 
 		if self.rank == 0:
 			if self.resume_state is not None:
-				stage_epoch, stage_total = self._stage_progress(self.start_epoch)
+				next_stage, next_stage_epoch, stage_total = self._next_train_position()
 				self.logger.info(
-					f"Resuming stage {self.current_stage} from {self.resume_path} | "
-					f"global epoch {self.start_epoch}/{self.total_epochs} "
-					f"(S{self.current_stage} {stage_epoch}/{stage_total}) | global_step={self.global_step}"
+					f"Resuming from {self.resume_path} | "
+					f"checkpoint_stage={self.current_stage} | "
+					f"checkpoint_epoch={self.start_epoch}/{self.total_epochs} | "
+					f"next_epoch={self.start_epoch + 1}/{self.total_epochs} | "
+					f"next_stage=S{next_stage} {next_stage_epoch}/{stage_total} | "
+					f"history_epochs={len(self.epoch_history)} | global_step={self.global_step}"
 				)
 			self.logger.info(
 				f"Trainer initialized | stage={self.current_stage} | start_epoch={self.start_epoch} | "
 				f"global_step={self.global_step} | dataset_size={len(self.train_dataset)}"
 			)
 
-	"""把全局 epoch 换算成所在 stage 内的进度 (stage_epoch, stage_total)。"""
-	def _stage_progress(self, global_epoch: int) -> tuple[int, int]:
-		if int(global_epoch) < self.stage0_epochs:
+	"""把全局 epoch 换算成指定 stage 内的进度 (stage_epoch, stage_total)。"""
+	def _stage_progress(self, global_epoch: int, stage: Optional[int] = None) -> tuple[int, int]:
+		if stage is None:
+			resolved_stage = 0 if int(global_epoch) < self.stage0_epochs else 1
+		else:
+			resolved_stage = int(stage)
+		if resolved_stage == 0:
 			return int(global_epoch), self.stage0_epochs
-		return int(global_epoch) - self.stage0_epochs, self.stage1_epochs
+		return max(int(global_epoch) - self.stage0_epochs, 0), self.stage1_epochs
+
+	"""返回下一个将要训练的 stage 与其内部 epoch。"""
+	def _next_train_position(self) -> tuple[int, int, int]:
+		next_stage = int(self.current_stage)
+		if next_stage == 0 and self.start_epoch >= self.stage0_epochs:
+			next_stage = 1
+		stage_epoch, stage_total = self._stage_progress(self.start_epoch, stage=next_stage)
+		return next_stage, stage_epoch + 1, stage_total
 
 	"""续训配置一致性校验：禁止 Stage 1 改 stage0_epochs，禁止把当前 stage 的 epoch 改小。"""
 	def _validate_resume_config(self) -> None:
@@ -576,6 +612,65 @@ class VQAPTrainer:
 			return nullcontext()
 		return torch.autocast(device_type="cuda", dtype=self.autocast_dtype)
 
+	"""记录一个 epoch 的摘要，供续训与最终统计复用。"""
+	def _append_epoch_history(self, epoch: int, epoch_metrics: Dict[str, float], epoch_time_seconds: float) -> None:
+		stage_epoch, _ = self._stage_progress(int(epoch), stage=self.current_stage)
+		record: Dict[str, Any] = {
+			"global_epoch": int(epoch) + 1,
+			"stage": int(self.current_stage),
+			"stage_epoch": int(stage_epoch) + 1,
+			"epoch_time_seconds": float(epoch_time_seconds),
+		}
+		for metric_name in EPOCH_HISTORY_METRIC_KEYS:
+			record[metric_name] = float(epoch_metrics[metric_name])
+		self.epoch_history.append(record)
+
+	"""输出某个阶段或整体的最终统计。"""
+	def _log_history_summary(self, title: str, records: list[Dict[str, Any]], stage: Optional[int] = None) -> None:
+		if self.rank != 0:
+			return
+		if not records:
+			self.logger.info("%s | no epochs recorded", title)
+			return
+
+		final_record = records[-1]
+		best_total_record = min(records, key=lambda item: float(item["loss_total"]))
+		best_ap_record = min(records, key=lambda item: float(item["loss_ap"]))
+		total_time_seconds = sum(float(item["epoch_time_seconds"]) for item in records)
+		avg_time_seconds = total_time_seconds / float(len(records))
+
+		header = (
+			f"{title} | global_epoch={int(records[0]['global_epoch'])}-{int(records[-1]['global_epoch'])} | "
+			f"count={len(records)} | total_time={total_time_seconds:.2f}s | avg_time={avg_time_seconds:.2f}s"
+		)
+		if stage is not None:
+			header += f" | stage_epoch={int(records[0]['stage_epoch'])}-{int(records[-1]['stage_epoch'])}"
+		self.logger.info(header)
+		self.logger.info(
+			f"{title} Final | "
+			f"loss_total={final_record['loss_total']:.4f} | loss_ap={final_record['loss_ap']:.4f} | "
+			f"loss_sep={final_record['loss_sep']:.4f} | loss_ag={final_record['loss_ag']:.4f} | "
+			f"loss_future={final_record['loss_future']:.4f} | "
+			f"perp_g={final_record['perplexity_g']:.2f} | perp_d={final_record['perplexity_d']:.2f}"
+		)
+		self.logger.info(
+			f"{title} Best | "
+			f"loss_total={best_total_record['loss_total']:.4f} @ {f"epoch={int(best_total_record['global_epoch'])} (S{int(best_total_record['stage'])} {int(best_total_record['stage_epoch'])})"} | "
+			f"loss_ap={best_ap_record['loss_ap']:.4f} @ {f"epoch={int(best_ap_record['global_epoch'])} (S{int(best_ap_record['stage'])} {int(best_ap_record['stage_epoch'])})"}"
+		)
+
+	"""输出训练结束时的最终统计。"""
+	def _log_final_summary(self) -> None:
+		if self.rank != 0:
+			return
+
+		stage0_records = [record for record in self.epoch_history if int(record["stage"]) == 0]
+		stage1_records = [record for record in self.epoch_history if int(record["stage"]) == 1]
+		self.logger.info("=" * 20 + " Final Training Summary " + "=" * 20)
+		self._log_history_summary("Stage 0", stage0_records, stage=0)
+		self._log_history_summary("Stage 1", stage1_records, stage=1)
+		self._log_history_summary("Overall", self.epoch_history)
+
 	"""执行一次完整前向，并按当前 stage 组装总损失。
 
 	关键点：
@@ -845,6 +940,7 @@ class VQAPTrainer:
 			"model_args": self.model_args,
 			"train_args": self.train_args,
 			"global_args": self.global_args,
+			"epoch_history": self.epoch_history,
 			"tb_log_dir": getattr(self.tb_writer, "log_dir", None),
 		}
 
@@ -952,7 +1048,18 @@ class VQAPTrainer:
 			for key, value in log_payload.items():
 				self.tb_writer.add_scalar(key, value, step)
 
-		stage_epoch, stage_total = self._stage_progress(int(epoch))
+			# 独立的 stage-loss 曲线
+			stage_epoch, _ = self._stage_progress(int(epoch), stage=self.current_stage)
+			stage_loss_prefix = f"loss_stage{self.current_stage}"
+			# stage 单独曲线使用各自 stage 内的 epoch 作为横轴。
+			for metric_name, tag_name in LOSS_TENSORBOARD_KEYS:
+				self.tb_writer.add_scalar(
+					f"{stage_loss_prefix}/{tag_name}",
+					epoch_metrics[metric_name],
+					stage_epoch + 1,
+				)
+
+		stage_epoch, stage_total = self._stage_progress(int(epoch), stage=self.current_stage)
 		self.logger.info(
 			f"epoch={epoch + 1}/{self.total_epochs} (S{self.current_stage} {stage_epoch + 1}/{stage_total}) | "
 			f"loss_total={epoch_metrics['loss_total']:.4f} | loss_ap={epoch_metrics['loss_ap']:.4f} | "
@@ -998,6 +1105,13 @@ class VQAPTrainer:
 			replace_metrics = self._maybe_replace_dead_codebooks(epoch, epoch_metrics, used_steps)
 			epoch_metrics.update(replace_metrics)
 			self._reset_codebook_usage_counters()
+			epoch_time_seconds = time.time() - epoch_start_time
+			# 先追加历史，再把同一时刻的状态写入 checkpoint。
+			self._append_epoch_history(
+				epoch=epoch,
+				epoch_metrics=epoch_metrics,
+				epoch_time_seconds=epoch_time_seconds,
+			)
 
 			if self.rank == 0 and self.tb_writer is not None:
 				step = int(epoch) + 1
@@ -1018,7 +1132,7 @@ class VQAPTrainer:
 			self._log_epoch_summary(
 				epoch=epoch,
 				epoch_metrics=epoch_metrics,
-				epoch_time_seconds=time.time() - epoch_start_time,
+				epoch_time_seconds=epoch_time_seconds,
 			)
 
 			if self.rank == 0 and isinstance(epoch_range, tqdm):
@@ -1028,6 +1142,8 @@ class VQAPTrainer:
 					"perplexity_g": f"{epoch_metrics['perplexity_g']:.1f}",
 					"perplexity_d": f"{epoch_metrics['perplexity_d']:.1f}",
 				}, refresh=False)
+
+		self._log_final_summary()
 
 
 def parse_args() -> argparse.Namespace:
