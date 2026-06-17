@@ -376,7 +376,7 @@ def main() -> None:
 	device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 	checkpoint_path = Path(args.checkpoint).expanduser()
-	output_dir = Path(args.output_dir).expanduser() if args.output_dir else REPO_ROOT / "viz" / "codebook" / checkpoint_path.parent.name
+	output_dir = Path(args.output_dir).expanduser() if args.output_dir else REPO_ROOT / "images" / checkpoint_path.parent.name
 	output_dir.mkdir(parents=True, exist_ok=True)
 	print(f"device={device} | checkpoint={checkpoint_path} | output_dir={output_dir}")
 
