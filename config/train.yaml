@@ -12,7 +12,7 @@ flow_matching:
   noise_std: 1.0
 
 data:
-  batch_size: 32
+  batch_size: 64
   num_workers: 8
   pin_memory: true
   persistent_workers: true
@@ -20,8 +20,8 @@ data:
   prefetch_factor: 2
 
 stage:
-  stage0_epochs: 60
-  stage1_epochs: 40
+  stage0_epochs: 150
+  stage1_epochs: 100
 
 lr:
   stage0_main: 3.0e-4
@@ -51,7 +51,7 @@ loss:
 
 codebook:
   perplexity_g_threshold: 9.0
-  perplexity_d_threshold: 64.0
+  perplexity_d_threshold: 48.0
   replace_interval_epochs: 20  # 设为 inf 则保留 perplexity 触发
 
 checkpoint:

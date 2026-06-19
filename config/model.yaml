@@ -24,12 +24,12 @@ AtomAction_NSVQ:
     norm_type: layernorm
   global_codebook:
     codebook_size: 36
-    codebook_dim: 256
+    codebook_dim: 512
   detail_codebook:
     num_queries: 9
     num_heads: 4
-    codebook_size: 256
-    codebook_dim: 256
+    codebook_size: 192
+    codebook_dim: 512
     dropout: 0.1
   flow_matching_head:
     input_dim: 9
@@ -37,8 +37,8 @@ AtomAction_NSVQ:
     time_embed_dim: 256
     time_min_period: 0.004
     time_max_period: 4.0
-    global_code_dim: 256
-    detail_code_dim: 256
+    global_code_dim: 512
+    detail_code_dim: 512
     num_detail_tokens: 9
     condition_hidden_dim: 512
     num_layers: 8
@@ -59,7 +59,7 @@ AtomAction_NSVQ:
       output_dim: 1
   nsvq:
     discard_threshold: 0.1
-    replace_noise_scale: 1.0e-5
+    replace_noise_scale: 1.0e-3
     eps: 1.0e-6
 
 VASA:
@@ -77,7 +77,7 @@ VASA:
     dropout: 0.1
     norm_type: layernorm
   future_predictor:
-    global_code_dim: 256
+    global_code_dim: 512
     image_feature_dim: 768
     ffn_hidden_dim: 3072
   flow_matching_head:
