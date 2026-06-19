@@ -636,6 +636,14 @@ class VQAPTrainer:
 		final_record = records[-1]
 		best_total_record = min(records, key=lambda item: float(item["loss_total"]))
 		best_ap_record = min(records, key=lambda item: float(item["loss_ap"]))
+		best_total_position = (
+			f"epoch={int(best_total_record['global_epoch'])} "
+			f"(S{int(best_total_record['stage'])} {int(best_total_record['stage_epoch'])})"
+		)
+		best_ap_position = (
+			f"epoch={int(best_ap_record['global_epoch'])} "
+			f"(S{int(best_ap_record['stage'])} {int(best_ap_record['stage_epoch'])})"
+		)
 		total_time_seconds = sum(float(item["epoch_time_seconds"]) for item in records)
 		avg_time_seconds = total_time_seconds / float(len(records))
 
@@ -655,8 +663,8 @@ class VQAPTrainer:
 		)
 		self.logger.info(
 			f"{title} Best | "
-			f"loss_total={best_total_record['loss_total']:.4f} @ {f"epoch={int(best_total_record['global_epoch'])} (S{int(best_total_record['stage'])} {int(best_total_record['stage_epoch'])})"} | "
-			f"loss_ap={best_ap_record['loss_ap']:.4f} @ {f"epoch={int(best_ap_record['global_epoch'])} (S{int(best_ap_record['stage'])} {int(best_ap_record['stage_epoch'])})"}"
+			f"loss_total={best_total_record['loss_total']:.4f} @ {best_total_position} | "
+			f"loss_ap={best_ap_record['loss_ap']:.4f} @ {best_ap_position}"
 		)
 
 	"""输出训练结束时的最终统计。"""
