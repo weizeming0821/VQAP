@@ -11,4 +11,5 @@ test*
 temp/
 source/
 
-Model_Design.md
+VQAP_Design.md
+VLA_Design.md

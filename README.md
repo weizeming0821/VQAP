@@ -2,7 +2,7 @@
 
 VQAP 是面向 VLA 模型的**离散动作码本预训练**项目：以 RLBench 专家演示中的原子动作片段为数据，通过双码本（全局 $K_g{=}36$ / 细节 $K_d{=}256$）NSVQ 量化 + Flow Matching 重构 + 视觉语义对齐，学习一组带原子动作语义的离散码本，供下游 VLA 复用。
 
-> 本 README 只记录**如何执行脚本、复刻实验、跑通流程**。模型结构、损失设计、维度推导等请见 [Model_Design.md](Model_Design.md)。
+> 本 README 只记录**如何执行脚本、复刻实验、跑通流程**。模型结构、损失设计、维度推导等请见 [VQAP_Design.md](VQAP_Design.md)（数据集 / 双码本模型 / 预训练）；下游 VLA 集成设计见 [VLA_Design.md](VLA_Design.md)。
 
 ---
 
@@ -37,7 +37,7 @@ AtomAction_Dataset/   训练数据集
 
 ## 3. 数据集
 
-训练消费的是 `AtomAction_Dataset/`：每条样本为一个**原子动作片段（phase）**的低维轨迹 + 多视角 RGB 起止帧，按 `action/task/variation/phase` 组织。归一化统计量存于数据集根目录的 `dataset_metadata.json::traj_stats`，在 `__getitem__` 阶段直接读取。详细数据流见 [Model_Design.md](Model_Design.md) §二。
+训练消费的是 `AtomAction_Dataset/`：每条样本为一个**原子动作片段（phase）**的低维轨迹 + 多视角 RGB 起止帧，按 `action/task/variation/phase` 组织。归一化统计量存于数据集根目录的 `dataset_metadata.json::traj_stats`，在 `__getitem__` 阶段直接读取。详细数据流见 [VQAP_Design.md](VQAP_Design.md) §二。
 
 **重新生成数据集**（需 RLBench 环境，已有数据集可跳过）：
 
@@ -137,7 +137,7 @@ bash run_tensorboard.sh          # 默认端口 6006
 bash run_tensorboard.sh 6007     # 指定端口
 ```
 
-监控曲线（x 轴 = epoch）：`loss/*`、`loss_ap/*`、`loss_ag/*`、`train_state/*`（grad_norm、lambda_future、stage）、`lr/*`、`codebook/*`（perplexity_g/d、replaced_g/d）、`best/*`。码本健康判据见 [Model_Design.md](Model_Design.md) §5.5。
+监控曲线（x 轴 = epoch）：`loss/*`、`loss_ap/*`、`loss_ag/*`、`train_state/*`（grad_norm、lambda_future、stage）、`lr/*`、`codebook/*`（perplexity_g/d、replaced_g/d）、`best/*`。码本健康判据见 [VQAP_Design.md](VQAP_Design.md) §5.5。
 
 ---
 
