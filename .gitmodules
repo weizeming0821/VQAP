@@ -1,0 +1,3 @@
+[submodule "openpi-vqap"]
+	path = openpi-vqap
+	url = https://github.com/weizeming0821/openpi-vqap.git
