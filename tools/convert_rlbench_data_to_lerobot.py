@@ -4,18 +4,34 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from concurrent.futures import Future, ProcessPoolExecutor
+from contextlib import contextmanager
+import fcntl
 import importlib.util
 import json
+import os
 import pickle
 import shutil
 import sys
 import types
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 from PIL import Image
+
+try:
+    import datasets as hf_datasets
+except ImportError:  # pragma: no cover - optional dependency
+    hf_datasets = None
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - optional dependency
+    tqdm = None
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -27,6 +43,10 @@ MANIFEST_NAME = "manifest.json"
 LOW_DIM_PICKLE = "low_dim_obs.pkl"
 VARIATION_DESCRIPTIONS = "variation_descriptions.pkl"
 EPISODES_DIR = "episodes"
+DEFAULT_NUM_WORKERS = 1
+PROGRESS_LOG_NAME = ".conversion_progress.jsonl"
+PENDING_STATE_NAME = ".conversion_pending.json"
+LOCK_NAME_TEMPLATE = ".{split}.convert.lock"
 
 RAW_TO_LEROBOT_CAMERAS = {
     "front_rgb": "observation.images.front",
@@ -35,6 +55,9 @@ RAW_TO_LEROBOT_CAMERAS = {
     "right_shoulder_rgb": "observation.images.right_shoulder",
     "overhead_rgb": "observation.images.overhead",
 }
+
+
+_WORKER_RLBENCH_ROOT: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -48,6 +71,17 @@ class EpisodeSpec:
     instruction: str
 
 
+@dataclass(frozen=True)
+class PreparedEpisode:
+    """CPU-side payload prepared before serial LeRobot writing."""
+
+    spec: EpisodeSpec
+    num_frames: int
+    image_paths: dict[str, tuple[str, ...]]
+    states: np.ndarray
+    actions: np.ndarray
+
+
 class CompatibleUnpickler(pickle.Unpickler):
     """Handle a few module path differences in older pickles."""
 
@@ -57,6 +91,11 @@ class CompatibleUnpickler(pickle.Unpickler):
         elif module.startswith("numpy._core."):
             module = module.replace("numpy._core.", "numpy.core.", 1)
         return super().find_class(module, name)
+
+
+def utc_now_iso() -> str:
+    """Return a stable UTC timestamp string."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def parse_args() -> argparse.Namespace:
@@ -112,6 +151,15 @@ def parse_args() -> argparse.Namespace:
         help="Robot type written into the LeRobot metadata.",
     )
     parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=DEFAULT_NUM_WORKERS,
+        help=(
+            "Number of worker processes for episode preparation. "
+            "LeRobot writing stays single-writer to keep the dataset consistent."
+        ),
+    )
+    parser.add_argument(
         "--image-writer-processes",
         type=int,
         default=5,
@@ -124,6 +172,11 @@ def parse_args() -> argparse.Namespace:
         help="Number of async image writer threads.",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from an existing split output if a progress log is available.",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Delete the output split directory if it already exists.",
@@ -134,10 +187,14 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--max-episodes-per-task must be >= 1.")
     if args.fps < 1:
         raise ValueError("--fps must be >= 1.")
+    if args.num_workers < 1:
+        raise ValueError("--num-workers must be >= 1.")
     if args.image_writer_processes < 0:
         raise ValueError("--image-writer-processes must be >= 0.")
     if args.image_writer_threads < 0:
         raise ValueError("--image-writer-threads must be >= 0.")
+    if args.resume and args.overwrite:
+        raise ValueError("--resume and --overwrite cannot be used together.")
 
     return args
 
@@ -155,6 +212,11 @@ def get_numeric_suffix(name: str, prefix: str) -> int:
     if not name.startswith(prefix):
         raise ValueError(f"{name!r} does not start with {prefix!r}.")
     return int(name[len(prefix) :])
+
+
+def spec_key(spec: EpisodeSpec) -> str:
+    """Build a stable raw episode id for resume tracking."""
+    return f"{spec.task}/{spec.variation}/{spec.episode}"
 
 
 def discover_tasks(
@@ -216,7 +278,11 @@ def build_episode_specs(
     for task in tasks:
         task_dir = split_root / task
         variation_dirs = sorted(
-            (path for path in task_dir.iterdir() if path.is_dir() and path.name.startswith("variation")),
+            (
+                path
+                for path in task_dir.iterdir()
+                if path.is_dir() and path.name.startswith("variation")
+            ),
             key=lambda path: get_numeric_suffix(path.name, "variation"),
         )
         converted_for_task = 0
@@ -228,7 +294,11 @@ def build_episode_specs(
                 continue
 
             episode_dirs = sorted(
-                (path for path in episodes_root.iterdir() if path.is_dir() and path.name.startswith("episode")),
+                (
+                    path
+                    for path in episodes_root.iterdir()
+                    if path.is_dir() and path.name.startswith("episode")
+                ),
                 key=lambda path: get_numeric_suffix(path.name, "episode"),
             )
             for episode_dir in episode_dirs:
@@ -302,6 +372,13 @@ def install_rlbench_pickle_support(rlbench_root: Path) -> None:
         spec.loader.exec_module(module)
 
 
+def init_prepare_worker(rlbench_root: str) -> None:
+    """Initialize a preparation worker process."""
+    global _WORKER_RLBENCH_ROOT
+    _WORKER_RLBENCH_ROOT = Path(rlbench_root)
+    install_rlbench_pickle_support(_WORKER_RLBENCH_ROOT)
+
+
 def load_demo(path: Path) -> Any:
     """Load one raw RLBench low_dim_obs.pkl file."""
     with path.open("rb") as handle:
@@ -330,7 +407,7 @@ def observation_to_state(observation: Any) -> np.ndarray:
     return np.concatenate([xyz, quaternion_xyzw, gripper], axis=0).astype(np.float32)
 
 
-def load_png_paths(camera_dir: Path, expected_frames: int) -> list[Path]:
+def load_png_paths(camera_dir: Path, expected_frames: int) -> tuple[str, ...]:
     """Collect and validate PNG frame paths for one camera."""
     if not camera_dir.is_dir():
         raise FileNotFoundError(f"Camera folder not found: {camera_dir}")
@@ -349,10 +426,10 @@ def load_png_paths(camera_dir: Path, expected_frames: int) -> list[Path]:
             raise ValueError(
                 f"{camera_dir} is missing frame {frame_index} or has non-sequential names."
             )
-    return png_paths
+    return tuple(str(path) for path in png_paths)
 
 
-def load_image(image_path: Path) -> np.ndarray:
+def load_image(image_path: str | Path) -> np.ndarray:
     """Read one RGB image as uint8 HWC."""
     with Image.open(image_path) as image:
         return np.asarray(image.convert("RGB"), dtype=np.uint8)
@@ -367,18 +444,10 @@ def infer_image_shape(specs: list[EpisodeSpec]) -> tuple[int, int, int]:
     raise FileNotFoundError("Failed to infer image shape from the raw dataset.")
 
 
-def create_lerobot_dataset(
-    repo_id: str,
-    dataset_root: Path,
+def expected_features(
     image_shape: tuple[int, int, int],
-    fps: int,
-    robot_type: str,
-    image_writer_processes: int,
-    image_writer_threads: int,
-) -> Any:
-    """Create an empty LeRobot dataset for one split."""
-    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-
+) -> dict[str, dict[str, Any]]:
+    """Build the expected LeRobot feature schema."""
     height, width, channels = image_shape
     if channels != 3:
         raise ValueError(f"Expected RGB images with 3 channels, got {image_shape}")
@@ -401,28 +470,410 @@ def create_lerobot_dataset(
         "shape": (8,),
         "names": ["action"],
     }
+    return features
+
+
+def create_lerobot_dataset(
+    repo_id: str,
+    dataset_root: Path,
+    image_shape: tuple[int, int, int],
+    fps: int,
+    robot_type: str,
+    image_writer_processes: int,
+    image_writer_threads: int,
+) -> Any:
+    """Create an empty LeRobot dataset for one split."""
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
     return LeRobotDataset.create(
         repo_id=repo_id,
         root=dataset_root,
         robot_type=robot_type,
         fps=fps,
-        features=features,
+        features=expected_features(image_shape),
         use_videos=False,
         image_writer_processes=image_writer_processes,
         image_writer_threads=image_writer_threads,
     )
 
 
-def convert_episode(dataset: Any, spec: EpisodeSpec) -> int:
-    """Convert one raw episode and return the number of written frames."""
+def cleanup_stale_images(dataset_root: Path) -> None:
+    """Remove temporary image buffers left behind by interrupted runs."""
+    images_dir = dataset_root / "images"
+    if images_dir.is_dir():
+        shutil.rmtree(images_dir)
+
+
+def dataset_meta_exists(dataset_root: Path) -> bool:
+    """Check whether a LeRobot dataset has already been created here."""
+    return (dataset_root / "meta" / "info.json").is_file()
+
+
+def append_resume_record(path: Path, record: dict[str, Any]) -> None:
+    """Append one successful conversion record."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=True, sort_keys=False))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Atomically write a JSON payload."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=True, sort_keys=False)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, path)
+
+
+def load_pending_state(path: Path) -> dict[str, Any] | None:
+    """Load the current in-flight episode transaction, if any."""
+    if not path.is_file():
+        return None
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def remove_pending_state(path: Path) -> None:
+    """Remove the in-flight transaction marker."""
+    if path.exists():
+        path.unlink()
+
+
+def load_resume_records(path: Path) -> dict[str, dict[str, Any]]:
+    """Load successful conversion records from previous runs."""
+    records: dict[str, dict[str, Any]] = {}
+    if not path.is_file():
+        return records
+
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                print(
+                    f"[warn] ignore malformed resume record at line {line_number}: {path}",
+                    file=sys.stderr,
+                )
+                break
+            key = record.get("raw_episode_key")
+            if not key:
+                raise RuntimeError(
+                    f"Progress log record at line {line_number} is missing raw_episode_key."
+                )
+            if key in records:
+                raise RuntimeError(
+                    f"Duplicate raw_episode_key found in progress log: {key}"
+                )
+            if "output_episode_index" not in record:
+                raise RuntimeError(
+                    f"Progress log record at line {line_number} is missing output_episode_index."
+                )
+            records[key] = record
+    return records
+
+
+def count_parquet_files(dataset_root: Path) -> int:
+    """Count parquet episode files on disk."""
+    data_root = dataset_root / "data"
+    if not data_root.is_dir():
+        return 0
+    return sum(1 for _ in data_root.rglob("*.parquet"))
+
+
+def validate_commit_records(records: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Validate commit records and return them sorted by episode index."""
+    ordered = sorted(
+        records.values(),
+        key=lambda record: int(record["output_episode_index"]),
+    )
+    seen_indices: set[int] = set()
+    for expected_index, record in enumerate(ordered):
+        output_index = int(record["output_episode_index"])
+        if output_index in seen_indices:
+            raise RuntimeError(f"Duplicate output_episode_index in progress log: {output_index}")
+        if output_index != expected_index:
+            raise RuntimeError(
+                "Progress log episode indices are not contiguous from 0. "
+                f"Expected {expected_index}, got {output_index}."
+            )
+        seen_indices.add(output_index)
+    return ordered
+
+
+def audit_dataset_state(
+    repo_id: str,
+    dataset_root: Path,
+    commit_records: dict[str, dict[str, Any]],
+    pending_state: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Validate that dataset files, metadata, and progress bookkeeping agree."""
+    if not dataset_meta_exists(dataset_root):
+        if commit_records or pending_state is not None:
+            raise RuntimeError(
+                "Progress bookkeeping exists but the LeRobot dataset metadata is missing."
+            )
+        return {
+            "meta_total_episodes": 0,
+            "meta_total_frames": 0,
+            "ordered_commits": [],
+            "episode_lengths": {},
+        }
+
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
+
+    meta = LeRobotDatasetMetadata(repo_id, root=dataset_root)
+    ordered_commits = validate_commit_records(commit_records)
+    parquet_count = count_parquet_files(dataset_root)
+
+    if parquet_count != meta.total_episodes:
+        raise RuntimeError(
+            f"Parquet file count ({parquet_count}) does not match metadata total_episodes "
+            f"({meta.total_episodes})."
+        )
+    if len(meta.episodes) != meta.total_episodes:
+        raise RuntimeError(
+            f"episodes.jsonl count ({len(meta.episodes)}) does not match metadata total_episodes "
+            f"({meta.total_episodes})."
+        )
+
+    episode_lengths = {
+        int(episode_index): int(episode_dict["length"])
+        for episode_index, episode_dict in meta.episodes.items()
+    }
+    if set(episode_lengths) != set(range(meta.total_episodes)):
+        raise RuntimeError("Episode indices in metadata are not contiguous from 0.")
+
+    expected_frames_from_meta = sum(episode_lengths.values())
+    if meta.total_frames != expected_frames_from_meta:
+        raise RuntimeError(
+            f"Metadata total_frames ({meta.total_frames}) does not match summed episode lengths "
+            f"({expected_frames_from_meta})."
+        )
+
+    commit_count = len(ordered_commits)
+    if pending_state is None:
+        if meta.total_episodes != commit_count:
+            raise RuntimeError(
+                f"Metadata total_episodes ({meta.total_episodes}) does not match committed progress "
+                f"records ({commit_count})."
+            )
+        if ordered_commits and all(record.get("frames") is not None for record in ordered_commits):
+            commit_frames = sum(int(record["frames"]) for record in ordered_commits)
+            if meta.total_frames != commit_frames:
+                raise RuntimeError(
+                    f"Metadata total_frames ({meta.total_frames}) does not match committed progress "
+                    f"frames ({commit_frames})."
+                )
+    else:
+        expected_output_index = int(pending_state["output_episode_index"])
+        if commit_count != expected_output_index:
+            raise RuntimeError(
+                "Pending state does not line up with the committed progress log: "
+                f"commit_count={commit_count}, pending.output_episode_index={expected_output_index}."
+            )
+        if meta.total_episodes not in (expected_output_index, expected_output_index + 1):
+            raise RuntimeError(
+                "Pending state exists, but metadata total_episodes is inconsistent with it: "
+                f"{meta.total_episodes} not in {{{expected_output_index}, {expected_output_index + 1}}}."
+            )
+        if meta.total_episodes == expected_output_index + 1:
+            pending_frames = pending_state.get("frames")
+            last_length = episode_lengths[expected_output_index]
+            if pending_frames is not None and int(pending_frames) != last_length:
+                raise RuntimeError(
+                    "Recovered pending episode length does not match metadata: "
+                    f"{pending_frames} != {last_length}."
+                )
+
+    return {
+        "meta_total_episodes": meta.total_episodes,
+        "meta_total_frames": meta.total_frames,
+        "ordered_commits": ordered_commits,
+        "episode_lengths": episode_lengths,
+    }
+
+
+def build_commit_record(
+    *,
+    spec: EpisodeSpec,
+    frames: int | None,
+    output_episode_index: int,
+    finished_at: str | None,
+    recovered_from_pending: bool = False,
+) -> dict[str, Any]:
+    """Build one canonical progress record."""
+    record: dict[str, Any] = {
+        "raw_episode_key": spec_key(spec),
+        "task": spec.task,
+        "variation": spec.variation,
+        "episode": spec.episode,
+        "frames": frames,
+        "output_episode_index": output_episode_index,
+        "finished_at": finished_at,
+    }
+    if recovered_from_pending:
+        record["recovered_from_pending"] = True
+    return record
+
+
+def validate_records_match_plan(
+    specs: list[EpisodeSpec],
+    commit_records: dict[str, dict[str, Any]],
+) -> None:
+    """Ensure the existing dataset/progress log matches the requested conversion plan."""
+    allowed_keys = {spec_key(spec) for spec in specs}
+    extra_keys = sorted(set(commit_records) - allowed_keys)
+    if extra_keys:
+        preview = ", ".join(extra_keys[:5])
+        raise RuntimeError(
+            "Existing dataset/progress log contains episodes that are not part of the current "
+            f"requested plan, e.g. {preview}. Use matching arguments or restart with --overwrite."
+        )
+
+
+def recover_pending_commit_if_needed(
+    *,
+    repo_id: str,
+    dataset_root: Path,
+    progress_path: Path,
+    pending_path: Path,
+    pending_state: dict[str, Any] | None,
+    commit_records: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any] | None]:
+    """Repair or clear one interrupted episode transaction."""
+    if pending_state is None:
+        return commit_records, None
+
+    audit = audit_dataset_state(repo_id, dataset_root, commit_records, pending_state)
+    expected_output_index = int(pending_state["output_episode_index"])
+    meta_total_episodes = int(audit["meta_total_episodes"])
+    spec = EpisodeSpec(
+        task=pending_state["task"],
+        variation=pending_state["variation"],
+        episode=pending_state["episode"],
+        episode_dir=Path(pending_state["episode_dir"]),
+        instruction=pending_state["instruction"],
+    )
+
+    if meta_total_episodes == expected_output_index:
+        print(
+            f"[resume] clearing unfinished pending episode {pending_state['raw_episode_key']} "
+            "because it was not committed into the dataset."
+        )
+        remove_pending_state(pending_path)
+        return commit_records, None
+
+    recovered_frames = audit["episode_lengths"][expected_output_index]
+    record = build_commit_record(
+        spec=spec,
+        frames=recovered_frames,
+        output_episode_index=expected_output_index,
+        finished_at=utc_now_iso(),
+        recovered_from_pending=True,
+    )
+    append_resume_record(progress_path, record)
+    remove_pending_state(pending_path)
+    updated_records = dict(commit_records)
+    updated_records[record["raw_episode_key"]] = record
+    print(
+        f"[resume] recovered committed episode {record['raw_episode_key']} "
+        "from the pending transaction marker."
+    )
+    return updated_records, None
+
+
+def verify_existing_dataset(
+    repo_id: str,
+    dataset_root: Path,
+    image_shape: tuple[int, int, int],
+    fps: int,
+    robot_type: str,
+) -> None:
+    """Check that resume is targeting a compatible existing dataset."""
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
+
+    meta = LeRobotDatasetMetadata(repo_id, root=dataset_root)
+    if meta.fps != fps:
+        raise RuntimeError(
+            f"Existing dataset fps={meta.fps} does not match requested fps={fps}."
+        )
+    if meta.robot_type != robot_type:
+        raise RuntimeError(
+            "Existing dataset robot_type does not match the requested value: "
+            f"{meta.robot_type!r} != {robot_type!r}"
+        )
+
+    expected = expected_features(image_shape)
+    for key, feature in expected.items():
+        existing = meta.features.get(key)
+        if existing is None:
+            raise RuntimeError(f"Existing dataset is missing feature {key!r}.")
+        if tuple(existing["shape"]) != tuple(feature["shape"]):
+            raise RuntimeError(
+                f"Existing dataset feature {key!r} has shape {existing['shape']}, "
+                f"expected {feature['shape']}."
+            )
+        if existing["dtype"] != feature["dtype"]:
+            raise RuntimeError(
+                f"Existing dataset feature {key!r} has dtype {existing['dtype']}, "
+                f"expected {feature['dtype']}."
+            )
+
+
+def load_or_create_dataset(
+    repo_id: str,
+    dataset_root: Path,
+    image_shape: tuple[int, int, int],
+    fps: int,
+    robot_type: str,
+    image_writer_processes: int,
+    image_writer_threads: int,
+    resume: bool,
+) -> Any:
+    """Open an existing dataset for resume or create a fresh one."""
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
+    cleanup_stale_images(dataset_root)
+
+    if resume and dataset_meta_exists(dataset_root):
+        verify_existing_dataset(repo_id, dataset_root, image_shape, fps, robot_type)
+        dataset = LeRobotDataset(repo_id=repo_id, root=dataset_root)
+        if image_writer_processes or image_writer_threads:
+            dataset.start_image_writer(
+                num_processes=image_writer_processes,
+                num_threads=image_writer_threads,
+            )
+        return dataset
+
+    return create_lerobot_dataset(
+        repo_id=repo_id,
+        dataset_root=dataset_root,
+        image_shape=image_shape,
+        fps=fps,
+        robot_type=robot_type,
+        image_writer_processes=image_writer_processes,
+        image_writer_threads=image_writer_threads,
+    )
+
+
+def prepare_episode(spec: EpisodeSpec) -> PreparedEpisode:
+    """Prepare one episode in a worker-friendly form."""
     low_dim_path = spec.episode_dir / LOW_DIM_PICKLE
     demo = load_demo(low_dim_path)
     num_observations = len(demo)
     if num_observations < 2:
         raise ValueError(f"{low_dim_path} has only {num_observations} observations.")
 
-    camera_frames = {
+    image_paths = {
         feature_key: load_png_paths(
             spec.episode_dir / raw_folder,
             expected_frames=num_observations,
@@ -430,29 +881,149 @@ def convert_episode(dataset: Any, spec: EpisodeSpec) -> int:
         for raw_folder, feature_key in RAW_TO_LEROBOT_CAMERAS.items()
     }
 
-    for step_index in range(num_observations - 1):
+    states = np.stack(
+        [observation_to_state(demo[index]) for index in range(num_observations - 1)],
+        axis=0,
+    )
+    actions = np.stack(
+        [observation_to_state(demo[index + 1]) for index in range(num_observations - 1)],
+        axis=0,
+    )
+
+    return PreparedEpisode(
+        spec=spec,
+        num_frames=num_observations - 1,
+        image_paths=image_paths,
+        states=states,
+        actions=actions,
+    )
+
+
+def iter_prepared_episodes(
+    specs: list[EpisodeSpec],
+    num_workers: int,
+    rlbench_root: Path,
+) -> Iterator[tuple[EpisodeSpec, PreparedEpisode | Exception]]:
+    """Yield prepared episodes in deterministic order."""
+    if num_workers <= 1:
+        for spec in specs:
+            try:
+                yield spec, prepare_episode(spec)
+            except Exception as exc:  # pragma: no cover - data-dependent
+                yield spec, exc
+        return
+
+    max_pending = max(num_workers * 2, 1)
+    spec_iter = iter(specs)
+    futures: deque[tuple[EpisodeSpec, Future[PreparedEpisode]]] = deque()
+
+    with ProcessPoolExecutor(
+        max_workers=num_workers,
+        initializer=init_prepare_worker,
+        initargs=(str(rlbench_root),),
+    ) as executor:
+        while len(futures) < max_pending:
+            try:
+                spec = next(spec_iter)
+            except StopIteration:
+                break
+            futures.append((spec, executor.submit(prepare_episode, spec)))
+
+        while futures:
+            spec, future = futures.popleft()
+            try:
+                yield spec, future.result()
+            except Exception as exc:  # pragma: no cover - worker/data-dependent
+                yield spec, exc
+
+            try:
+                next_spec = next(spec_iter)
+            except StopIteration:
+                continue
+            futures.append((next_spec, executor.submit(prepare_episode, next_spec)))
+
+
+def write_prepared_episode(dataset: Any, prepared: PreparedEpisode) -> int:
+    """Write one prepared episode into the LeRobot dataset."""
+    for step_index in range(prepared.num_frames):
         frame = {
             feature_key: load_image(paths[step_index])
-            for feature_key, paths in camera_frames.items()
+            for feature_key, paths in prepared.image_paths.items()
         }
-        frame["observation.state"] = observation_to_state(demo[step_index])
-        frame["action"] = observation_to_state(demo[step_index + 1])
-        frame["task"] = spec.instruction
+        frame["observation.state"] = prepared.states[step_index]
+        frame["action"] = prepared.actions[step_index]
+        frame["task"] = prepared.spec.instruction
         dataset.add_frame(frame)
 
     dataset.save_episode()
-    return num_observations - 1
+    return prepared.num_frames
 
 
-def prepare_output_dir(path: Path, overwrite: bool) -> None:
+def prepare_output_dir(path: Path, overwrite: bool, resume: bool) -> None:
     """Prepare the output directory for one split."""
     if path.exists():
-        if not overwrite:
+        if overwrite:
+            shutil.rmtree(path)
+        elif not resume:
             raise FileExistsError(
-                f"{path} already exists. Use --overwrite to rebuild it."
+                f"{path} already exists. Use --overwrite to rebuild it or --resume to continue."
             )
-        shutil.rmtree(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+
+
+@contextmanager
+def split_lock(lock_path: Path) -> Iterator[None]:
+    """Prevent concurrent top-level conversion runs for the same split."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                f"Another conversion run is active for this split: {lock_path}"
+            ) from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+class SimpleProgress:
+    """Fallback progress helper when tqdm is unavailable."""
+
+    def __init__(self, total: int, desc: str, initial: int = 0):
+        self.total = total
+        self.desc = desc
+        self.current = initial
+        if total > 0:
+            print(f"[{desc}] {self.current}/{self.total}")
+
+    def set_postfix(self, **_: Any) -> None:
+        return None
+
+    def update(self, value: int = 1) -> None:
+        self.current += value
+        if self.total > 0:
+            print(f"[{self.desc}] {self.current}/{self.total}")
+
+    def close(self) -> None:
+        return None
+
+
+def make_progress(total: int, desc: str, initial: int = 0) -> Any:
+    """Create a tqdm bar when possible, otherwise use a simple fallback."""
+    if tqdm is None:
+        return SimpleProgress(total=total, desc=desc, initial=initial)
+    return tqdm(total=total, desc=desc, initial=initial, dynamic_ncols=True)
+
+
+def disable_nested_progress_bars() -> None:
+    """Keep the terminal focused on the converter-level progress bar."""
+    if hf_datasets is None:
+        return
+    disable_fn = getattr(hf_datasets, "disable_progress_bar", None)
+    if callable(disable_fn):
+        disable_fn()
 
 
 def main() -> int:
@@ -476,70 +1047,200 @@ def main() -> int:
 
     output_root = args.output_root.resolve()
     dataset_root = output_root / args.split
-    prepare_output_dir(dataset_root, args.overwrite)
+    progress_path = dataset_root / PROGRESS_LOG_NAME
+    lock_path = output_root / LOCK_NAME_TEMPLATE.format(split=args.split)
+    repo_id = args.split
 
-    rlbench_root = resolve_rlbench_root(raw_root, manifest)
-    install_rlbench_pickle_support(rlbench_root)
+    with split_lock(lock_path):
+        disable_nested_progress_bars()
+        prepare_output_dir(dataset_root, args.overwrite, args.resume)
 
-    dataset = create_lerobot_dataset(
-        repo_id=args.split,
-        dataset_root=dataset_root,
-        image_shape=infer_image_shape(specs),
-        fps=args.fps,
-        robot_type=args.robot_type,
-        image_writer_processes=args.image_writer_processes,
-        image_writer_threads=args.image_writer_threads,
-    )
+        rlbench_root = resolve_rlbench_root(raw_root, manifest)
+        install_rlbench_pickle_support(rlbench_root)
 
-    converted_episodes = 0
-    converted_frames = 0
-    skipped_episodes = 0
-    per_task_counts = {task: 0 for task in tasks}
+        completed_records: dict[str, dict[str, Any]] = {}
+        pending_path = dataset_root / PENDING_STATE_NAME
+        if args.resume and dataset_meta_exists(dataset_root):
+            if not progress_path.exists():
+                raise RuntimeError(
+                    "This dataset was created before transactional resume support and has no "
+                    f"{PROGRESS_LOG_NAME}. Use --overwrite to rebuild it cleanly."
+                )
+            completed_records = load_resume_records(progress_path)
+            if not completed_records:
+                print(
+                    f"[resume] {progress_path.name} exists but no valid records were loaded.",
+                    file=sys.stderr,
+                )
+            pending_state = load_pending_state(pending_path)
+            completed_records, _ = recover_pending_commit_if_needed(
+                repo_id=repo_id,
+                dataset_root=dataset_root,
+                progress_path=progress_path,
+                pending_path=pending_path,
+                pending_state=pending_state,
+                commit_records=completed_records,
+            )
+            validate_records_match_plan(specs, completed_records)
+            audit_dataset_state(
+                repo_id=repo_id,
+                dataset_root=dataset_root,
+                commit_records=completed_records,
+                pending_state=None,
+            )
 
-    for spec in specs:
+        image_shape = infer_image_shape(specs)
+        dataset = load_or_create_dataset(
+            repo_id=repo_id,
+            dataset_root=dataset_root,
+            image_shape=image_shape,
+            fps=args.fps,
+            robot_type=args.robot_type,
+            image_writer_processes=args.image_writer_processes,
+            image_writer_threads=args.image_writer_threads,
+            resume=args.resume,
+        )
+
+        completed_keys = set(completed_records)
+        pending_specs = [spec for spec in specs if spec_key(spec) not in completed_keys]
+        completed_current = len(specs) - len(pending_specs)
+        if args.resume:
+            print(
+                f"[resume] split={args.split} total={len(specs)} "
+                f"completed={completed_current} pending={len(pending_specs)}"
+            )
+        else:
+            print(
+                f"[start] split={args.split} total={len(specs)} "
+                f"pending={len(pending_specs)} num_workers={args.num_workers}"
+            )
+
+        converted_episodes = 0
+        converted_frames = 0
+        skipped_episodes = 0
+        per_task_counts = {task: 0 for task in tasks}
+        for record in completed_records.values():
+            task = record.get("task")
+            if task in per_task_counts:
+                per_task_counts[task] += 1
+
+        progress = make_progress(
+            total=len(pending_specs),
+            desc=f"{args.split} convert",
+            initial=0,
+        )
+        progress.set_postfix(
+            overall_done=completed_current,
+            overall_total=len(specs),
+            skipped=skipped_episodes,
+        )
+
         try:
-            episode_frames = convert_episode(dataset, spec)
-        except Exception as exc:  # pragma: no cover - data-dependent
-            skipped_episodes += 1
-            if hasattr(dataset, "clear_episode_buffer"):
-                dataset.clear_episode_buffer()
-            print(
-                "[warn] skip"
-                f" split={args.split}"
-                f" task={spec.task}"
-                f" variation={spec.variation}"
-                f" episode={spec.episode}"
-                f" reason={exc}",
-                file=sys.stderr,
+            for plan_index, (spec, prepared_or_exc) in enumerate(
+                iter_prepared_episodes(
+                    pending_specs,
+                    num_workers=args.num_workers,
+                    rlbench_root=rlbench_root,
+                ),
+                start=completed_current,
+            ):
+                if isinstance(prepared_or_exc, Exception):
+                    skipped_episodes += 1
+                    print(
+                        "[warn] skip"
+                        f" split={args.split}"
+                        f" task={spec.task}"
+                        f" variation={spec.variation}"
+                        f" episode={spec.episode}"
+                        f" reason={prepared_or_exc}",
+                        file=sys.stderr,
+                    )
+                    progress.update(1)
+                    progress.set_postfix(
+                        overall_done=completed_current,
+                        overall_total=len(specs),
+                        skipped=skipped_episodes,
+                    )
+                    continue
+
+                pending_state = {
+                    "raw_episode_key": spec_key(spec),
+                    "task": spec.task,
+                    "variation": spec.variation,
+                    "episode": spec.episode,
+                    "episode_dir": str(spec.episode_dir),
+                    "instruction": spec.instruction,
+                    "plan_index": plan_index,
+                    "frames": prepared_or_exc.num_frames,
+                    "output_episode_index": dataset.meta.total_episodes,
+                    "started_at": utc_now_iso(),
+                }
+                atomic_write_json(pending_path, pending_state)
+
+                try:
+                    episode_frames = write_prepared_episode(dataset, prepared_or_exc)
+                except KeyboardInterrupt:  # pragma: no cover - interactive interrupt
+                    cleanup_stale_images(dataset_root)
+                    raise
+                except Exception as exc:  # pragma: no cover - write-path failure
+                    cleanup_stale_images(dataset_root)
+                    raise RuntimeError(
+                        "LeRobot write failed after a pending transaction was recorded. "
+                        "The pending state has been preserved for a safe --resume recovery."
+                    ) from exc
+
+                record = build_commit_record(
+                    spec=spec,
+                    frames=episode_frames,
+                    output_episode_index=dataset.meta.total_episodes - 1,
+                    finished_at=utc_now_iso(),
+                )
+                append_resume_record(progress_path, record)
+                remove_pending_state(pending_path)
+
+                converted_episodes += 1
+                converted_frames += episode_frames
+                per_task_counts[spec.task] += 1
+                completed_records[record["raw_episode_key"]] = record
+                completed_keys.add(record["raw_episode_key"])
+                completed_current += 1
+
+                progress.update(1)
+                progress.set_postfix(
+                    overall_done=completed_current,
+                    overall_total=len(specs),
+                    skipped=skipped_episodes,
+                )
+        finally:
+            progress.close()
+            if getattr(dataset, "image_writer", None) is not None:
+                dataset.stop_image_writer()
+
+        audit_dataset_state(
+            repo_id=repo_id,
+            dataset_root=dataset_root,
+            commit_records=completed_records,
+            pending_state=load_pending_state(pending_path),
+        )
+        if completed_current != len(specs):
+            raise RuntimeError(
+                f"Conversion finished with missing episodes: completed={completed_current}, "
+                f"expected={len(specs)}, skipped={skipped_episodes}."
             )
-            continue
 
-        converted_episodes += 1
-        converted_frames += episode_frames
-        per_task_counts[spec.task] += 1
+        print(
+            f"[done] split={args.split} output={dataset_root} "
+            f"converted_now={converted_episodes} frames_now={converted_frames} "
+            f"skipped_now={skipped_episodes} total_done={completed_current}/{len(specs)}"
+        )
+        for task, count in per_task_counts.items():
+            print(f"[task] split={args.split} task={task} episodes={count}")
 
-        if converted_episodes % 20 == 0:
-            print(
-                f"[{args.split}] converted_episodes={converted_episodes} "
-                f"converted_frames={converted_frames} skipped={skipped_episodes}"
-            )
-
-    if getattr(dataset, "image_writer", None) is not None:
-        dataset.stop_image_writer()
-
-    print(
-        f"[done] split={args.split} output={dataset_root} "
-        f"episodes={converted_episodes} frames={converted_frames} "
-        f"skipped={skipped_episodes}"
-    )
-    for task, count in per_task_counts.items():
-        print(f"[task] split={args.split} task={task} episodes={count}")
-
-    print(
-        "For later openpi training, set "
-        f"HF_LEROBOT_HOME={output_root} and use repo_id={args.split}."
-    )
-    return 0
+        print(
+            "For later openpi training, set "
+            f"HF_LEROBOT_HOME={output_root} and use repo_id={repo_id}."
+        )
+        return 0
 
 
 if __name__ == "__main__":
