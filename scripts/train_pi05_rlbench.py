@@ -16,7 +16,7 @@ import sys
 import time
 from typing import Any
 
-# Set allocator config before importing torch.
+# 在 import torch 之前设置分配器，避免 CUDA 默认缓存策略先被初始化。
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +25,7 @@ OPENPI_SRC = OPENPI_ROOT / "src"
 if str(OPENPI_SRC) not in sys.path:
     sys.path.insert(0, str(OPENPI_SRC))
 
+# 训练脚本默认指向项目内缓存，避免落到只读的用户目录。
 os.environ.setdefault("OPENPI_DATA_HOME", str(REPO_ROOT / "openpi_cache"))
 os.environ.setdefault("HF_LEROBOT_HOME", str(REPO_ROOT / "LeRobot_RLBench_Dataset"))
 os.environ.setdefault("HF_HOME", str(REPO_ROOT / ".cache" / "huggingface"))
@@ -42,6 +43,7 @@ LATEST_CKPT_PATH = CHECKPOINT_ROOT / "latest.pth"
 BEST_CKPT_PATH = CHECKPOINT_ROOT / "best.pth"
 META_PATH = CHECKPOINT_ROOT / "meta.json"
 
+# 这些模块只在真正训练时导入，避免 `--help` 也要等待大段初始化。
 jax = None
 safetensors_torch = None
 tqdm = None
@@ -52,8 +54,8 @@ _config = None
 _data = None
 
 
+"""解析训练参数，保留高频可调项，默认值仍然来自 openpi config。"""
 def parse_args() -> argparse.Namespace:
-    """Parse training arguments."""
     parser = argparse.ArgumentParser(description="Fine-tune pi0.5 on RLBench LeRobot data.")
     parser.add_argument("--config-name", default="pi05_rlbench_pt", help="Base openpi training config name.")
     parser.add_argument("--batch-size", type=int, default=None, help="Override global batch size.")
@@ -74,8 +76,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+"""按需导入 openpi / jax / safetensors 等重型依赖，减少非训练场景的启动等待。"""
 def load_runtime_dependencies(logger: logging.Logger | None = None) -> None:
-    """Import heavy training modules only when a real run starts."""
     global jax, safetensors_torch, tqdm, openpi_pi0_config, openpi_pi0_pytorch, _normalize, _config, _data
     if _config is not None:
         return
@@ -103,8 +105,8 @@ def load_runtime_dependencies(logger: logging.Logger | None = None) -> None:
     _data = _openpi_data
 
 
+"""初始化 DDP 环境，并为当前进程绑定对应的 GPU 设备。"""
 def setup_ddp() -> tuple[bool, int, int, torch.device]:
-    """Initialize DDP when launched with torchrun."""
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
     if use_ddp and not dist.is_initialized():
@@ -118,15 +120,15 @@ def setup_ddp() -> tuple[bool, int, int, torch.device]:
     return use_ddp, rank, local_rank, device
 
 
+"""安全销毁 DDP 进程组，避免多卡任务残留通信状态。"""
 def cleanup_ddp() -> None:
-    """Tear down the DDP process group."""
     if dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()
 
 
+"""设置随机种子；多卡时外部会传入 seed + rank。"""
 def set_random_seed(seed: int) -> None:
-    """Set per-process random seeds."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -134,8 +136,8 @@ def set_random_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+"""初始化终端与文件日志，仅 rank0 负责真实写入。"""
 def init_logging(log_path: Path, *, is_main: bool) -> logging.Logger:
-    """Create console + file logging on rank 0 only."""
     logger = logging.getLogger(TRAIN_NAME)
     logger.handlers.clear()
     logger.propagate = False
@@ -171,8 +173,8 @@ def init_logging(log_path: Path, *, is_main: bool) -> logging.Logger:
     return logger
 
 
+"""初始化固定目录下的 TensorBoard writer，并记录本次训练配置。"""
 def init_tensorboard(*, enabled: bool, is_main: bool, config: _config.TrainConfig) -> SummaryWriter | None:
-    """Create a SummaryWriter in a fixed TensorBoard directory."""
     if not enabled or not is_main:
         return None
 
@@ -189,11 +191,12 @@ def init_tensorboard(*, enabled: bool, is_main: bool, config: _config.TrainConfi
     return writer
 
 
+"""读取 openpi 默认 config，并把路径与命令行覆盖项改成当前项目的版本。"""
 def build_train_config(args: argparse.Namespace) -> _config.TrainConfig:
-    """Load the base openpi config and apply CLI overrides."""
     config = _config.get_config(args.config_name)
     data_config_factory = config.data
     assets_config = getattr(data_config_factory, "assets", None)
+    # 把相对 assets 路径改成绝对路径，避免从不同 cwd 启动时找不到 norm stats。
     if assets_config is not None and assets_config.assets_dir and "://" not in assets_config.assets_dir:
         resolved_assets_dir = str((OPENPI_ROOT / assets_config.assets_dir).resolve())
         data_config_factory = dataclasses.replace(
@@ -227,8 +230,8 @@ def build_train_config(args: argparse.Namespace) -> _config.TrainConfig:
     return dataclasses.replace(config, **replace_kwargs)
 
 
+"""准备日志、TensorBoard、checkpoint 固定目录，并处理 resume / overwrite 互斥逻辑。"""
 def prepare_output_dirs(*, resume: bool, overwrite: bool, is_main: bool, use_ddp: bool) -> None:
-    """Prepare fixed output directories for the single training run."""
     if is_main:
         LOG_ROOT.mkdir(parents=True, exist_ok=True)
         if resume:
@@ -258,13 +261,13 @@ def prepare_output_dirs(*, resume: bool, overwrite: bool, is_main: bool, use_ddp
         dist.barrier()
 
 
+"""从 DDP wrapper 中取出真实模型，便于统一保存和加载权重。"""
 def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
-    """Return the underlying module when wrapped by DDP."""
     return model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
 
 
+"""打印当前 GPU 显存占用，主要用于定位模型初始化或 checkpoint 加载阶段的内存问题。"""
 def log_memory_usage(logger: logging.Logger, device: torch.device, step: int, *, phase: str) -> None:
-    """Log CUDA memory statistics when available."""
     if device.type != "cuda":
         return
 
@@ -284,14 +287,14 @@ def log_memory_usage(logger: logging.Logger, device: torch.device, step: int, *,
     )
 
 
+"""构建 RLBench 训练 dataloader；数据变换与归一化仍复用 openpi 官方流水线。"""
 def build_dataloader(config: _config.TrainConfig) -> tuple[Any, _config.DataConfig]:
-    """Build the RLBench training dataloader."""
     loader = _data.create_data_loader(config, framework="pytorch", shuffle=True)
     return loader, loader.data_config()
 
 
+"""按 openpi 的 pi0.5 配置构建 PyTorch 模型，并开启梯度检查点。"""
 def build_model(config: _config.TrainConfig, device: torch.device) -> torch.nn.Module:
-    """Create the PyTorch pi0.5 model on the target device."""
     if not isinstance(config.model, openpi_pi0_config.Pi0Config):
         model_cfg = openpi_pi0_config.Pi0Config(
             dtype=config.pytorch_training_precision,
@@ -312,8 +315,8 @@ def build_model(config: _config.TrainConfig, device: torch.device) -> torch.nn.M
     return model
 
 
+"""使用 openpi config 中的 AdamW 超参数构建优化器。"""
 def create_optimizer(config: _config.TrainConfig, model: torch.nn.Module) -> torch.optim.Optimizer:
-    """Build the AdamW optimizer from the openpi config."""
     return torch.optim.AdamW(
         model.parameters(),
         lr=config.lr_schedule.peak_lr,
@@ -323,8 +326,8 @@ def create_optimizer(config: _config.TrainConfig, model: torch.nn.Module) -> tor
     )
 
 
+"""复刻官方 PyTorch 训练脚本里的 warmup + cosine 学习率调度。"""
 def lr_for_step(config: _config.TrainConfig, step: int) -> float:
-    """Match the cosine schedule used by the official PyTorch script."""
     warmup_steps = config.lr_schedule.warmup_steps
     peak_lr = config.lr_schedule.peak_lr
     decay_steps = config.lr_schedule.decay_steps
@@ -338,6 +341,7 @@ def lr_for_step(config: _config.TrainConfig, step: int) -> float:
     return end_lr + (peak_lr - end_lr) * cosine
 
 
+"""新开训练时加载 pi0.5 base 权重；resume 场景下跳过。"""
 def load_base_weights_if_needed(
     logger: logging.Logger,
     config: _config.TrainConfig,
@@ -345,7 +349,6 @@ def load_base_weights_if_needed(
     *,
     resume: bool,
 ) -> None:
-    """Load the base PyTorch checkpoint for fresh fine-tuning runs."""
     if resume or config.pytorch_weight_path is None:
         return
 
@@ -355,13 +358,13 @@ def load_base_weights_if_needed(
     logger.info("Loaded base weights")
 
 
+"""从 latest.pth 指向的 step 目录恢复模型、优化器和训练步数。"""
 def load_resume_state(
     logger: logging.Logger,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
 ) -> tuple[int, float, int]:
-    """Restore model and optimizer state from latest.pth."""
     logger.info("Loading resume checkpoint from %s", LATEST_CKPT_PATH)
     payload = torch.load(LATEST_CKPT_PATH, map_location=device, weights_only=False)
     step_dir = Path(payload["step_dir"]).expanduser().resolve()
@@ -381,14 +384,15 @@ def load_resume_state(
     return global_step, best_loss, best_step
 
 
+"""通过临时文件写 JSON，避免中途中断时留下损坏的元数据文件。"""
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    """Write JSON through a temporary file."""
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     with tmp_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=True)
     os.replace(tmp_path, path)
 
 
+"""导出 openpi 兼容的 step 目录，供后续 policy 加载与在线测试使用。"""
 def export_openpi_checkpoint(
     config: _config.TrainConfig,
     data_config: _config.DataConfig,
@@ -396,7 +400,6 @@ def export_openpi_checkpoint(
     optimizer: torch.optim.Optimizer,
     global_step: int,
 ) -> Path:
-    """Export an openpi-style checkpoint directory for future policy loading."""
     final_dir = CHECKPOINT_ROOT / f"step_{global_step:07d}"
     tmp_dir = CHECKPOINT_ROOT / f".tmp_step_{global_step:07d}"
     if tmp_dir.exists():
@@ -422,6 +425,7 @@ def export_openpi_checkpoint(
     return final_dir
 
 
+"""更新 latest / best 索引文件，并同步写入 step 目录与元数据摘要。"""
 def save_training_state(
     logger: logging.Logger,
     config: _config.TrainConfig,
@@ -434,7 +438,6 @@ def save_training_state(
     best_loss: float,
     best_step: int,
 ) -> tuple[float, int]:
-    """Save latest/best .pth files and an openpi export directory."""
     step_dir = export_openpi_checkpoint(config, data_config, model, optimizer, global_step)
     payload = {
         "global_step": global_step,
@@ -475,19 +478,21 @@ def save_training_state(
     return best_loss, best_step
 
 
+"""训练主入口：串起目录准备、数据/模型构建、训练循环和 checkpoint 保存。"""
 def train() -> int:
-    """Run training."""
     args = parse_args()
     use_ddp, rank, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or rank == 0
 
     try:
+        # 先准备固定输出目录，再初始化日志，确保后续所有状态都能落盘。
         prepare_output_dirs(resume=args.resume, overwrite=args.overwrite, is_main=is_main, use_ddp=use_ddp)
 
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         log_path = LOG_ROOT / f"{TRAIN_NAME}_{timestamp}.log"
         logger = init_logging(log_path, is_main=is_main)
 
+        # 训练相关的重型依赖放到这里再导入，便于 `--help` 快速返回。
         load_runtime_dependencies(logger if is_main else None)
         config = build_train_config(args)
         set_random_seed(config.seed + rank)
@@ -506,6 +511,7 @@ def train() -> int:
             logger.info("pi0.5 model is ready.")
         optimizer = create_optimizer(config, model)
 
+        # 多卡训练仍走标准 DDP，保持和官方 PyTorch 入口一致。
         if use_ddp:
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
@@ -546,6 +552,7 @@ def train() -> int:
         )
 
         while global_step < config.num_train_steps:
+            # 分布式 dataloader 在每轮循环前同步 epoch，保证 shuffle 行为稳定。
             if use_ddp and hasattr(loader, "set_epoch"):
                 loader.set_epoch(global_step // len(loader))
 
@@ -553,13 +560,16 @@ def train() -> int:
                 if global_step >= config.num_train_steps:
                     break
 
+                # observation / actions 统一搬到当前 rank 对应的 device。
                 observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
                 actions = actions.to(torch.float32).to(device)  # noqa: PLW2901
 
+                # 每步显式刷新学习率，和官方脚本保持同样的调度方式。
                 lr = lr_for_step(config, global_step)
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = lr
 
+                # 前向、反向、梯度裁剪与优化器更新。
                 losses = model(observation, actions)
                 if isinstance(losses, (list, tuple)):
                     losses = torch.stack(losses)
@@ -583,6 +593,7 @@ def train() -> int:
 
                 global_step += 1
 
+                # 按固定间隔聚合日志，并同步写入 TensorBoard。
                 if is_main and global_step % config.log_interval == 0:
                     elapsed = time.time() - step_start_time
                     avg_loss = sum(item["loss"] for item in log_buffer) / len(log_buffer)
@@ -605,6 +616,7 @@ def train() -> int:
                     step_start_time = time.time()
                     log_buffer = []
 
+                # latest / best 索引文件与 openpi step 导出目录一起更新。
                 should_save = (
                     (global_step % config.save_interval == 0 and global_step > 0)
                     or global_step == config.num_train_steps
