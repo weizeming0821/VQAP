@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import enum
 import json
 import logging
 import os
@@ -173,6 +174,31 @@ def init_logging(log_path: Path, *, is_main: bool) -> logging.Logger:
     return logger
 
 
+"""把配置对象递归转换成 JSON-safe 结构，避免 TensorBoard 记录时因特殊对象崩溃。"""
+def make_json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): make_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [make_json_safe(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, enum.Enum):
+        return value.value
+    if dataclasses.is_dataclass(value):
+        return make_json_safe(dataclasses.asdict(value))
+    if isinstance(value, np.generic):
+        return value.item()
+    return repr(value)
+
+
+"""把任意对象格式化成适合写入 TensorBoard 的文本，不让辅助记录中断训练。"""
+def format_tensorboard_text(payload: Any) -> str:
+    safe_payload = make_json_safe(payload)
+    return f"```json\n{json.dumps(safe_payload, indent=2, ensure_ascii=True)}\n```"
+
+
 """初始化固定目录下的 TensorBoard writer，并记录本次训练配置。"""
 def init_tensorboard(*, enabled: bool, is_main: bool, config: _config.TrainConfig) -> SummaryWriter | None:
     if not enabled or not is_main:
@@ -182,10 +208,16 @@ def init_tensorboard(*, enabled: bool, is_main: bool, config: _config.TrainConfi
 
     TENSORBOARD_ROOT.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(TENSORBOARD_ROOT))
-    writer.add_text("train_config", f"```json\n{json.dumps(dataclasses.asdict(config), indent=2)}\n```", 0)
+    writer.add_text("train_config", format_tensorboard_text(dataclasses.asdict(config)), 0)
     writer.add_text(
         "runtime_paths",
-        f"```json\n{json.dumps({'log_root': str(LOG_ROOT), 'tensorboard_root': str(TENSORBOARD_ROOT), 'checkpoint_root': str(CHECKPOINT_ROOT)}, indent=2)}\n```",
+        format_tensorboard_text(
+            {
+                "log_root": str(LOG_ROOT),
+                "tensorboard_root": str(TENSORBOARD_ROOT),
+                "checkpoint_root": str(CHECKPOINT_ROOT),
+            }
+        ),
         0,
     )
     return writer
@@ -439,6 +471,11 @@ def save_training_state(
     best_step: int,
 ) -> tuple[float, int]:
     step_dir = export_openpi_checkpoint(config, data_config, model, optimizer, global_step)
+    is_best = current_loss <= best_loss
+    if is_best:
+        best_loss = current_loss
+        best_step = global_step
+
     payload = {
         "global_step": global_step,
         "best_loss": best_loss,
@@ -453,11 +490,7 @@ def save_training_state(
     torch.save(payload, latest_tmp)
     os.replace(latest_tmp, LATEST_CKPT_PATH)
 
-    if current_loss <= best_loss:
-        best_loss = current_loss
-        best_step = global_step
-        payload["best_loss"] = best_loss
-        payload["best_step"] = best_step
+    if is_best:
         best_tmp = BEST_CKPT_PATH.with_suffix(".pth.tmp")
         torch.save(payload, best_tmp)
         os.replace(best_tmp, BEST_CKPT_PATH)
