@@ -71,7 +71,13 @@ def parse_args() -> argparse.Namespace:
         help="Override PyTorch training precision.",
     )
     parser.add_argument("--seed", type=int, default=None, help="Override random seed.")
-    parser.add_argument("--resume", action="store_true", help="Resume from checkpoints/pi05_rlbench_train/latest.pth.")
+    parser.add_argument("--resume", action="store_true", help="Resume from a saved checkpoint index file.")
+    parser.add_argument(
+        "--resume-source",
+        choices=("latest", "best"),
+        default="latest",
+        help="Choose which checkpoint index to resume from when --resume is set.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Remove old checkpoints and TensorBoard logs.")
     parser.add_argument("--disable-tensorboard", action="store_true", help="Disable TensorBoard logging.")
     return parser.parse_args()
@@ -263,12 +269,20 @@ def build_train_config(args: argparse.Namespace) -> _config.TrainConfig:
 
 
 """准备日志、TensorBoard、checkpoint 固定目录，并处理 resume / overwrite 互斥逻辑。"""
-def prepare_output_dirs(*, resume: bool, overwrite: bool, is_main: bool, use_ddp: bool) -> None:
+def prepare_output_dirs(
+    *,
+    resume: bool,
+    resume_source: str,
+    overwrite: bool,
+    is_main: bool,
+    use_ddp: bool,
+) -> None:
     if is_main:
         LOG_ROOT.mkdir(parents=True, exist_ok=True)
         if resume:
-            if not LATEST_CKPT_PATH.exists():
-                raise FileNotFoundError(f"Resume requested but {LATEST_CKPT_PATH} does not exist.")
+            resume_index_path = BEST_CKPT_PATH if resume_source == "best" else LATEST_CKPT_PATH
+            if not resume_index_path.exists():
+                raise FileNotFoundError(f"Resume requested but {resume_index_path} does not exist.")
             CHECKPOINT_ROOT.mkdir(parents=True, exist_ok=True)
             TENSORBOARD_ROOT.mkdir(parents=True, exist_ok=True)
         else:
@@ -390,24 +404,78 @@ def load_base_weights_if_needed(
     logger.info("Loaded base weights")
 
 
-"""从 latest.pth 指向的 step 目录恢复模型、优化器和训练步数。"""
+"""读取 root checkpoint 索引文件，统一处理路径不存在的报错。"""
+def load_checkpoint_index(index_path: Path, map_location: torch.device | str) -> dict[str, Any]:
+    if not index_path.exists():
+        raise FileNotFoundError(f"Checkpoint index does not exist: {index_path}")
+    return torch.load(index_path, map_location=map_location, weights_only=False)
+
+
+"""从索引文件里解析出实际的 step 目录。"""
+def resolve_step_dir(payload: dict[str, Any], *, index_path: Path) -> Path:
+    step_dir_value = payload.get("step_dir")
+    if not step_dir_value:
+        raise KeyError(f"Checkpoint index {index_path} is missing `step_dir`.")
+    return Path(step_dir_value).expanduser().resolve()
+
+
+"""保存后只保留 latest / best 指向的完整 step 目录，避免权重文件无限堆积。"""
+def prune_step_checkpoints(logger: logging.Logger) -> None:
+    keep_dirs: set[Path] = set()
+    for index_path in (LATEST_CKPT_PATH, BEST_CKPT_PATH):
+        if not index_path.exists():
+            continue
+        try:
+            payload = load_checkpoint_index(index_path, map_location="cpu")
+            keep_dirs.add(resolve_step_dir(payload, index_path=index_path))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Skip parsing checkpoint index %s during cleanup: %s", index_path, exc)
+
+    for step_dir in sorted(CHECKPOINT_ROOT.glob("step_*")):
+        if not step_dir.is_dir():
+            continue
+        if step_dir.resolve() in keep_dirs:
+            continue
+        shutil.rmtree(step_dir)
+        logger.info("Removed stale checkpoint directory: %s", step_dir)
+
+
+"""从 latest/best 索引指向的 step 目录恢复模型、优化器和训练步数。"""
 def load_resume_state(
     logger: logging.Logger,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    *,
+    resume_source: str,
+    max_train_steps: int,
 ) -> tuple[int, float, int]:
-    logger.info("Loading resume checkpoint from %s", LATEST_CKPT_PATH)
-    payload = torch.load(LATEST_CKPT_PATH, map_location=device, weights_only=False)
-    step_dir = Path(payload["step_dir"]).expanduser().resolve()
-    safetensors_torch.load_model(unwrap_model(model), step_dir / "model.safetensors", device=str(device))
-    optimizer_state = torch.load(step_dir / "optimizer.pt", map_location=device, weights_only=False)
-    optimizer.load_state_dict(optimizer_state)
+    index_path = BEST_CKPT_PATH if resume_source == "best" else LATEST_CKPT_PATH
+    logger.info("Loading resume checkpoint from %s (%s)", resume_source, index_path)
+    payload = load_checkpoint_index(index_path, map_location=device)
+    step_dir = resolve_step_dir(payload, index_path=index_path)
+    model_path = step_dir / "model.safetensors"
+    optimizer_path = step_dir / "optimizer.pt"
+    if not model_path.exists():
+        raise FileNotFoundError(f"Resume checkpoint is missing model weights: {model_path}")
+    if not optimizer_path.exists():
+        raise FileNotFoundError(f"Resume checkpoint is missing optimizer state: {optimizer_path}")
+
     global_step = int(payload.get("global_step", 0))
+    if global_step > max_train_steps:
+        raise ValueError(
+            f"Resume checkpoint step={global_step} exceeds configured num_train_steps={max_train_steps}. "
+            "Increase --train-steps or choose another resume source."
+        )
+
+    safetensors_torch.load_model(unwrap_model(model), model_path, device=str(device))
+    optimizer_state = torch.load(optimizer_path, map_location=device, weights_only=False)
+    optimizer.load_state_dict(optimizer_state)
     best_loss = float(payload.get("best_loss", float("inf")))
     best_step = int(payload.get("best_step", 0))
     logger.info(
-        "Resumed training from step=%d best_loss=%.6f best_step=%d step_dir=%s",
+        "Resumed training from %s: step=%d best_loss=%.6f best_step=%d step_dir=%s",
+        resume_source,
         global_step,
         best_loss,
         best_step,
@@ -507,6 +575,7 @@ def save_training_state(
             "latest_step_dir": str(step_dir),
         },
     )
+    prune_step_checkpoints(logger)
     logger.info("Saved checkpoints at step=%d current_loss=%.6f best_loss=%.6f", global_step, current_loss, best_loss)
     return best_loss, best_step
 
@@ -519,7 +588,13 @@ def train() -> int:
 
     try:
         # 先准备固定输出目录，再初始化日志，确保后续所有状态都能落盘。
-        prepare_output_dirs(resume=args.resume, overwrite=args.overwrite, is_main=is_main, use_ddp=use_ddp)
+        prepare_output_dirs(
+            resume=args.resume,
+            resume_source=args.resume_source,
+            overwrite=args.overwrite,
+            is_main=is_main,
+            use_ddp=use_ddp,
+        )
 
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         log_path = LOG_ROOT / f"{TRAIN_NAME}_{timestamp}.log"
@@ -558,8 +633,22 @@ def train() -> int:
             logger.info("Log file: %s", log_path)
             logger.info("TensorBoard: %s", TENSORBOARD_ROOT if writer is not None else "disabled")
             logger.info("Checkpoints: %s", CHECKPOINT_ROOT)
-            logger.info("Using config=%s batch_size=%d num_workers=%d train_steps=%d", config.name, config.batch_size, config.num_workers, config.num_train_steps)
-            logger.info("Running on %s | rank=%d local_rank=%d world_size=%d", platform.node(), rank, local_rank, dist.get_world_size() if use_ddp else 1)
+            logger.info(
+                "Using config=%s batch_size=%d num_workers=%d train_steps=%d",
+                config.name,
+                config.batch_size,
+                config.num_workers,
+                config.num_train_steps,
+            )
+            logger.info(
+                "Running on %s | rank=%d local_rank=%d world_size=%d",
+                platform.node(),
+                rank,
+                local_rank,
+                dist.get_world_size() if use_ddp else 1,
+            )
+            if args.resume:
+                logger.info("Resume source: %s", args.resume_source)
             logger.info("Loaded data config for repo_id=%s", data_config.repo_id)
             log_memory_usage(logger, device, 0, phase="after_model_creation")
 
@@ -567,7 +656,14 @@ def train() -> int:
         best_loss = float("inf")
         best_step = 0
         if args.resume:
-            global_step, best_loss, best_step = load_resume_state(logger, model, optimizer, device)
+            global_step, best_loss, best_step = load_resume_state(
+                logger,
+                model,
+                optimizer,
+                device,
+                resume_source=args.resume_source,
+                max_train_steps=config.num_train_steps,
+            )
         else:
             if is_main:
                 logger.info("Loading base pi0.5 weights...")
