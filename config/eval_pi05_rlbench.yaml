@@ -1,0 +1,50 @@
+checkpoint:
+  # best | latest | official
+  which: best
+  train_config_name: pi05_rlbench_pt
+  finetuned_root_dir: checkpoints/pi05_rlbench_train
+  official_dir: openpi_cache/openpi-assets/checkpoints/pi05_base_pytorch
+  rlbench_norm_stats_dir: openpi-vqap/assets/pi05_rlbench/train
+
+dataset:
+  raw_root: RLBench_Raw_Dataset
+  split: val
+  variation_mode: demo_replay
+  start_episode: 0
+  episodes_per_task: 25
+
+environment:
+  headless: true
+  image_size: 128
+  max_steps: 100
+  replan_steps: 5
+  gripper_threshold: 0.5
+
+runtime:
+  device: auto
+  seed: 42
+
+logging:
+  log_root: log
+  log_name_prefix: pi05_rlbench_eval
+
+tasks:
+  names:
+    - close_jar
+    - insert_onto_square_peg
+    - light_bulb_in
+    - meat_off_grill
+    - open_drawer
+    - place_cups
+    - place_shape_in_shape_sorter
+    - push_buttons
+    - put_groceries_in_cupboard
+    - put_item_in_drawer
+    - put_money_in_safe
+    - reach_and_drag
+    - slide_block_to_target
+    - stack_blocks
+    - stack_cups
+    - stack_wine
+    - sweep_to_dustpan
+    - turn_tap
