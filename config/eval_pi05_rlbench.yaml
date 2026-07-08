@@ -15,8 +15,8 @@ dataset:
 
 environment:
   headless: true
-  image_size: 128
-  max_steps: 100
+  image_size: 224
+  max_steps: 200
   replan_steps: 5
   gripper_threshold: 0.5
 
