@@ -10,6 +10,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import pickle
 import random
 import sys
 import time
@@ -34,6 +35,15 @@ os.environ.setdefault("HF_HOME", str(REPO_ROOT / ".cache" / "huggingface"))
 os.environ.setdefault("HF_DATASETS_CACHE", str(REPO_ROOT / ".cache" / "huggingface" / "datasets"))
 
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "eval_pi05_rlbench.yaml"
+LOW_DIM_PICKLE = "low_dim_obs.pkl"
+IMAGE_FORMAT = "%d.png"
+RGB_CAMERA_SPECS = (
+    ("front_rgb", "front_rgb"),
+    ("wrist_rgb", "wrist_rgb"),
+    ("left_shoulder_rgb", "left_shoulder_rgb"),
+    ("right_shoulder_rgb", "right_shoulder_rgb"),
+    ("overhead_rgb", "overhead_rgb"),
+)
 
 
 """解析评测参数；核心配置放 YAML，命令行只保留少量高频覆盖项。"""
@@ -180,6 +190,103 @@ def resolve_runtime_device(requested: str) -> str:
         return requested
     torch = require_torch()
     return "cuda:0" if torch.cuda.is_available() else "cpu"
+
+
+"""判断某个 Qt 变量是否被 opencv-python 的内置插件目录污染了。"""
+def is_cv2_qt_path(path: str | None) -> bool:
+    if not path:
+        return False
+    normalized = path.replace("\\", "/")
+    return "/cv2/qt/" in normalized and "site-packages" in normalized
+
+
+"""在启动 RLBench 前修正 Qt/X11 环境，避免 openpi 导入链把插件路径指到 cv2。"""
+def sanitize_rlbench_gui_env(logger: logging.Logger) -> None:
+    coppeliaroot = os.environ.get("COPPELIASIM_ROOT")
+    display = os.environ.get("DISPLAY")
+    plugin_path = os.environ.get("QT_QPA_PLATFORM_PLUGIN_PATH")
+    plugin_search_path = os.environ.get("QT_PLUGIN_PATH")
+    font_dir = os.environ.get("QT_QPA_FONTDIR")
+
+    logger.info(
+        "GUI env before RLBench launch | DISPLAY=%s COPPELIASIM_ROOT=%s QT_QPA_PLATFORM_PLUGIN_PATH=%s QT_PLUGIN_PATH=%s QT_QPA_FONTDIR=%s",
+        display,
+        coppeliaroot,
+        plugin_path,
+        plugin_search_path,
+        font_dir,
+    )
+    if not display:
+        logger.warning(
+            "DISPLAY is not set. Even with headless=True, RLBench/PyRep usually still needs an X server. "
+            "Use `export DISPLAY=:99` or `DISPLAY=:99 python3 scripts/eval_pi05_rlbench.py ...`."
+        )
+
+    if is_cv2_qt_path(plugin_path):
+        if coppeliaroot:
+            os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = coppeliaroot
+            logger.info(
+                "Replaced cv2 Qt plugin path with COPPELIASIM_ROOT: %s",
+                coppeliaroot,
+            )
+        else:
+            os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
+            logger.warning(
+                "Removed cv2 Qt plugin path, but COPPELIASIM_ROOT is unset. "
+                "If RLBench still fails, export COPPELIASIM_ROOT before running eval."
+            )
+    elif not plugin_path and coppeliaroot:
+        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = coppeliaroot
+        logger.info("Set QT_QPA_PLATFORM_PLUGIN_PATH from COPPELIASIM_ROOT: %s", coppeliaroot)
+
+    if is_cv2_qt_path(plugin_search_path):
+        os.environ.pop("QT_PLUGIN_PATH", None)
+        logger.info("Removed cv2-injected QT_PLUGIN_PATH: %s", plugin_search_path)
+
+    if is_cv2_qt_path(font_dir):
+        os.environ.pop("QT_QPA_FONTDIR", None)
+        logger.info("Removed cv2-injected QT_QPA_FONTDIR: %s", font_dir)
+
+    logger.info(
+        "GUI env sanitized | DISPLAY=%s QT_QPA_PLATFORM_PLUGIN_PATH=%s QT_PLUGIN_PATH=%s QT_QPA_FONTDIR=%s",
+        os.environ.get("DISPLAY"),
+        os.environ.get("QT_QPA_PLATFORM_PLUGIN_PATH"),
+        os.environ.get("QT_PLUGIN_PATH"),
+        os.environ.get("QT_QPA_FONTDIR"),
+    )
+
+
+"""为旧 numpy pickle 安装模块别名，兼容 raw demo 在不同 numpy 版本间反序列化。"""
+def install_numpy_pickle_compat(logger: logging.Logger) -> None:
+    import importlib
+
+    alias_pairs = {
+        "numpy._core.numeric": "numpy.core.numeric",
+        "numpy._core.numerictypes": "numpy.core.numerictypes",
+        "numpy._core.fromnumeric": "numpy.core.fromnumeric",
+    }
+    installed: list[str] = []
+
+    for legacy_name, modern_name in alias_pairs.items():
+        try:
+            importlib.import_module(legacy_name)
+            continue
+        except ModuleNotFoundError:
+            pass
+
+        module = importlib.import_module(modern_name)
+        sys.modules[legacy_name] = module
+
+        parent_name, _, attr_name = legacy_name.rpartition(".")
+        if parent_name:
+            parent_module = importlib.import_module(parent_name)
+            setattr(parent_module, attr_name, module)
+        installed.append(f"{legacy_name}->{modern_name}")
+
+    if installed:
+        logger.info("Installed numpy pickle compatibility aliases: %s", ", ".join(installed))
+    else:
+        logger.info("Numpy pickle compatibility aliases not needed in current environment.")
 
 
 """构建 openpi 训练配置，并把相对 assets 路径修正到当前仓库。"""
@@ -451,6 +558,46 @@ def safe_nanmean(values: list[float]) -> float:
     return float(np.nanmean(array))
 
 
+"""从 RGB-only raw dataset 读取一个 demo，并补回已有 RGB 路径。"""
+def load_rgb_only_demo(episode_path: Path):
+    low_dim_path = episode_path / LOW_DIM_PICKLE
+    if not low_dim_path.exists():
+        raise FileNotFoundError(f"Demo low-dim pickle does not exist: {low_dim_path}")
+    with low_dim_path.open("rb") as handle:
+        demo = pickle.load(handle)
+
+    step_count = len(demo)
+    if step_count <= 0:
+        raise ValueError(f"Demo at {episode_path} is empty.")
+    if getattr(demo, "random_seed", None) is None:
+        raise ValueError(f"Demo at {episode_path} is missing random_seed, cannot replay reset state.")
+
+    for attribute_name, folder in RGB_CAMERA_SPECS:
+        camera_dir = episode_path / folder
+        if not camera_dir.is_dir():
+            raise FileNotFoundError(f"Expected RGB camera directory does not exist: {camera_dir}")
+        for step_index in range(step_count):
+            frame_path = camera_dir / (IMAGE_FORMAT % step_index)
+            if not frame_path.is_file():
+                raise FileNotFoundError(
+                    f"Missing RGB frame for demo replay: {frame_path} "
+                    f"(step_count={step_count}, camera={attribute_name})"
+                )
+            setattr(demo[step_index], attribute_name, str(frame_path))
+
+    return demo
+
+
+"""优先从 demo.misc 里读 variation_index；缺失时再退回调度器给的 variation。"""
+def resolve_demo_variation(demo, fallback_variation: int) -> int:
+    if len(demo) <= 0:
+        raise ValueError("Demo has no observations.")
+    misc = getattr(demo[0], "misc", None)
+    if isinstance(misc, dict) and "variation_index" in misc:
+        return int(misc["variation_index"])
+    return int(fallback_variation)
+
+
 class RLBenchEvalRuntime:
     """薄封装：管理 RLBench 环境、任务切换和 demo replay reset。"""
 
@@ -468,7 +615,9 @@ class RLBenchEvalRuntime:
             raise ImportError("RLBench and PyRep runtime dependencies are required for evaluation.") from exc
 
         class ClippedEndEffectorPoseViaPlanning(EndEffectorPoseViaPlanning):
-            def action(self, scene, action, ignore_collisions: bool = True):
+            """Clamp target XYZ into the RLBench workspace before planning."""
+
+            def action(self, scene, action, *args, **kwargs):
                 action = np.asarray(action, dtype=np.float32).copy()
                 action[:3] = np.clip(
                     action[:3],
@@ -477,7 +626,7 @@ class RLBenchEvalRuntime:
                     np.asarray([scene._workspace_maxx, scene._workspace_maxy, scene._workspace_maxz], dtype=np.float32)
                     - 1e-7,
                 )
-                super().action(scene, action, ignore_collisions)
+                super().action(scene, action)
 
         disabled_camera = CameraConfig()
         disabled_camera.set_all(False)
@@ -508,6 +657,7 @@ class RLBenchEvalRuntime:
 
         self._task_file_to_task_class = task_file_to_task_class
         self._step_exceptions = (IKError, ConfigurationPathError, InvalidActionError)
+        self._dataset_root = dataset_root.resolve()
         self._env = Environment(
             action_mode=MoveArmThenGripper(ClippedEndEffectorPoseViaPlanning(), Discrete()),
             obs_config=obs_config,
@@ -536,15 +686,17 @@ class RLBenchEvalRuntime:
     def reset_to_demo(self, task_name: str, variation: int, local_episode: int) -> tuple[Any, str, int]:
         self.set_task(task_name)
         assert self._task is not None
-        self._task.set_variation(variation)
-        demo = self._task.get_demos(
-            1,
-            live_demos=False,
-            random_selection=False,
-            from_episode_number=local_episode,
-            image_paths=True,
-        )[0]
-        demo_variation = int(getattr(demo, "variation_number", variation))
+        episode_path = (
+            self._dataset_root
+            / task_name
+            / f"variation{variation}"
+            / "episodes"
+            / f"episode{local_episode}"
+        )
+        if not episode_path.is_dir():
+            raise FileNotFoundError(f"Demo episode directory does not exist: {episode_path}")
+        demo = load_rgb_only_demo(episode_path)
+        demo_variation = resolve_demo_variation(demo, variation)
         self._task.set_variation(demo_variation)
         descriptions, obs = self._task.reset_to_demo(demo)
         prompt = descriptions[0] if descriptions else self._task.get_task_descriptions()[0]
@@ -698,6 +850,8 @@ def main() -> int:
 
     norm_stats = load_norm_stats(norm_stats_source)
     policy = create_policy(train_config, checkpoint_info["checkpoint_dir"], norm_stats, device)
+    sanitize_rlbench_gui_env(logger)
+    install_numpy_pickle_compat(logger)
 
     runtime = RLBenchEvalRuntime(
         dataset_root=split_root,
