@@ -16,7 +16,7 @@ dataset:
 environment:
   headless: true
   image_size: 224
-  max_steps: 200
+  max_steps: 250
   replan_steps: 5
   gripper_threshold: 0.5
 
@@ -27,6 +27,14 @@ runtime:
 logging:
   log_root: log
   log_name_prefix: pi05_rlbench_eval
+
+recording:
+  enabled: true
+  videos_per_task: 1      # 成功、失败各录 N 条（N=1 -> 每任务最多 1 成功 + 1 失败）
+  save_dir: result
+  resolution: [640, 480]  # [width, height]，独立于评测观测相机
+  fps: 30
+  rotate_speed: 0.005     # 相机每仿真步旋转弧度；0 = 固定机位
 
 tasks:
   names:

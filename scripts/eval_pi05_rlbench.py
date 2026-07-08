@@ -28,6 +28,10 @@ if str(OPENPI_SRC) not in sys.path:
     sys.path.insert(0, str(OPENPI_SRC))
 if str(RLBENCH_SRC) not in sys.path:
     sys.path.insert(0, str(RLBENCH_SRC))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from utils.rlbench_video_recorder import EpisodeVideoRecorder
 
 os.environ.setdefault("OPENPI_DATA_HOME", str(REPO_ROOT / "openpi_cache"))
 os.environ.setdefault("HF_LEROBOT_HOME", str(REPO_ROOT / "LeRobot_RLBench_Dataset"))
@@ -91,6 +95,12 @@ def parse_args() -> argparse.Namespace:
         help="Override runtime.device, e.g. cuda:0 or cpu.",
     )
     parser.add_argument(
+        "--record-videos",
+        type=int,
+        default=None,
+        help="Override recording.videos_per_task (success/fail each); 0 disables recording.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Resolve config, checkpoints and task plans without launching RLBench.",
@@ -126,6 +136,13 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> dic
         config["environment"]["replan_steps"] = args.replan_steps
     if args.device is not None:
         config["runtime"]["device"] = args.device
+    if args.record_videos is not None:
+        recording = config.setdefault("recording", {})
+        if args.record_videos <= 0:
+            recording["enabled"] = False
+        else:
+            recording["enabled"] = True
+            recording["videos_per_task"] = args.record_videos
     return config
 
 
@@ -671,6 +688,10 @@ class RLBenchEvalRuntime:
     def step_exceptions(self):
         return self._step_exceptions
 
+    @property
+    def scene(self):
+        return self._env._scene
+
     def launch(self) -> None:
         self._env.launch()
 
@@ -718,9 +739,17 @@ def rollout_episode(
     max_steps: int,
     replan_steps: int,
     gripper_threshold: float,
+    recorder: EpisodeVideoRecorder | None = None,
 ) -> dict[str, Any]:
     obs, prompt, used_variation = runtime.reset_to_demo(task_name, variation, local_episode)
     policy_obs = make_policy_observation(obs, prompt)
+    if recorder is not None:
+        recorder.start_episode(
+            task_name=task_name,
+            prompt=prompt,
+            variation=used_variation,
+            local_episode=local_episode,
+        )
 
     action_queue: deque[np.ndarray] = deque()
     infer_ms_values: list[float] = []
@@ -760,12 +789,16 @@ def rollout_episode(
         policy_obs = make_policy_observation(obs, prompt)
 
     wall_time_s = time.monotonic() - episode_start
+    video_path = None
+    if recorder is not None:
+        video_path = recorder.end_episode(success=success, error_type=error_type)
     return {
         "task": task_name,
         "prompt": prompt,
         "variation": used_variation,
         "local_episode": local_episode,
         "success": success,
+        "video_path": str(video_path) if video_path is not None else None,
         "steps": steps_taken,
         "policy_calls": policy_calls,
         "infer_ms_mean": float(np.mean(infer_ms_values)) if infer_ms_values else float("nan"),
@@ -783,7 +816,8 @@ def main() -> int:
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     log_root = resolve_path_like(config["logging"]["log_root"])
     assert isinstance(log_root, Path)
-    log_path = log_root / f"{config['logging']['log_name_prefix']}_{checkpoint_source}_{timestamp}.log"
+    run_name = f"{config['logging']['log_name_prefix']}_{checkpoint_source}_{timestamp}"
+    log_path = log_root / f"{run_name}.log"
     logger = init_logging(log_path)
 
     set_random_seed(int(config["runtime"]["seed"]))
@@ -816,6 +850,14 @@ def main() -> int:
     if variation_mode != "demo_replay":
         raise ValueError(f"Only variation_mode=demo_replay is supported right now, got {variation_mode}")
 
+    recording_cfg = dict(config.get("recording") or {})
+    recording_enabled = bool(recording_cfg.get("enabled", False))
+    video_root: Path | None = None
+    if recording_enabled:
+        video_save_dir = resolve_path_like(recording_cfg.get("save_dir", "result"))
+        assert isinstance(video_save_dir, Path)
+        video_root = video_save_dir / run_name
+
     task_plans: dict[str, list[tuple[int, int]]] = {}
     for task_name in task_names:
         task_root = split_root / task_name
@@ -841,6 +883,14 @@ def main() -> int:
         max_steps,
         replan_steps,
     )
+    if recording_enabled:
+        logger.info(
+            "Recording config | videos_per_task=%s (success/fail each) video_root=%s",
+            recording_cfg.get("videos_per_task", 1),
+            video_root,
+        )
+    else:
+        logger.info("Recording disabled.")
     for task_name in task_names:
         logger.info("Task plan | task=%s episodes=%d first_entries=%s", task_name, len(task_plans[task_name]), task_plans[task_name][:5])
 
@@ -859,6 +909,18 @@ def main() -> int:
         headless=bool(config["environment"]["headless"]),
     )
 
+    recorder: EpisodeVideoRecorder | None = None
+    if recording_enabled:
+        assert video_root is not None
+        recorder = EpisodeVideoRecorder(
+            video_root,
+            videos_per_task=int(recording_cfg.get("videos_per_task", 1)),
+            resolution=tuple(recording_cfg.get("resolution", [640, 480])),
+            fps=int(recording_cfg.get("fps", 30)),
+            rotate_speed=float(recording_cfg.get("rotate_speed", 0.005)),
+            logger=logger,
+        )
+
     total_episodes = sum(len(plan) for plan in task_plans.values())
     completed_episodes = 0
     overall_results: list[dict[str, Any]] = []
@@ -867,6 +929,8 @@ def main() -> int:
 
     try:
         runtime.launch()
+        if recorder is not None:
+            recorder.attach(runtime.scene)
         for task_index, task_name in enumerate(task_names, start=1):
             task_results: list[dict[str, Any]] = []
             logger.info("========== Task %d/%d | %s ==========", task_index, len(task_names), task_name)
@@ -891,11 +955,12 @@ def main() -> int:
                     max_steps=max_steps,
                     replan_steps=replan_steps,
                     gripper_threshold=gripper_threshold,
+                    recorder=recorder,
                 )
                 task_results.append(result)
                 overall_results.append(result)
                 logger.info(
-                    "Episode result | task=%s success=%d steps=%d policy_calls=%d infer_ms_mean=%.2f infer_ms_last=%.2f wall_time_s=%.2f variation=%d error=%s prompt=%s",
+                    "Episode result | task=%s success=%d steps=%d policy_calls=%d infer_ms_mean=%.2f infer_ms_last=%.2f wall_time_s=%.2f variation=%d error=%s video=%s prompt=%s",
                     task_name,
                     int(result["success"]),
                     result["steps"],
@@ -905,6 +970,7 @@ def main() -> int:
                     result["wall_time_s"],
                     result["variation"],
                     result["error_type"],
+                    result["video_path"],
                     short_prompt(result["prompt"]),
                 )
 
@@ -931,6 +997,8 @@ def main() -> int:
                 task_summary["avg_infer_ms"],
             )
     finally:
+        if recorder is not None:
+            recorder.finalize()
         runtime.shutdown()
 
     overall_successes = sum(int(item["success"]) for item in overall_results)
@@ -959,6 +1027,11 @@ def main() -> int:
     logger.info("Overall success rate (macro): %.4f", macro_task_success_rate)
     logger.info("Overall successes: %d/%d", overall_successes, len(overall_results))
     logger.info("Total wall time (s): %.2f", total_wall_time_s)
+    if recorder is not None:
+        summary_path = recorder.write_summary(
+            header=f"Eval run: {run_name} | checkpoint={checkpoint_source} | log={log_path}"
+        )
+        logger.info("Recording summary written: %s", summary_path)
     logger.info("Evaluation finished successfully.")
     return 0
 
