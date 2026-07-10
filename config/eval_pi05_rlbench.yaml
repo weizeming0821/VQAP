@@ -16,9 +16,13 @@ dataset:
 environment:
   headless: true
   image_size: 224
-  max_steps: 250
-  replan_steps: 5
+  max_steps: 400          # demo 最长约 352 步（stack_blocks），250 会让长任务必然超时
+  replan_steps: 10
   gripper_threshold: 0.5
+  # planning: 每步路径规划、在每个 waypoint 完全停稳（卡顿，replay 上限 91.7%）；
+  # ik: 逐帧 IK 伺服，平滑但接触/滞后时会发散（replay 上限 75%）；
+  # hybrid: IK 优先，IK 失败单步回退 planning（推荐）。
+  arm_action_mode: hybrid
 
 runtime:
   device: auto
