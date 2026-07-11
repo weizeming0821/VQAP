@@ -44,6 +44,17 @@ LATEST_CKPT_PATH = CHECKPOINT_ROOT / "latest.pth"
 BEST_CKPT_PATH = CHECKPOINT_ROOT / "best.pth"
 META_PATH = CHECKPOINT_ROOT / "meta.json"
 
+
+"""按 --train-name 重定向所有输出目录，避免不同实验互相覆盖 checkpoint/TensorBoard。"""
+def apply_train_name(train_name: str) -> None:
+    global TRAIN_NAME, TENSORBOARD_ROOT, CHECKPOINT_ROOT, LATEST_CKPT_PATH, BEST_CKPT_PATH, META_PATH
+    TRAIN_NAME = train_name
+    TENSORBOARD_ROOT = REPO_ROOT / "tensorboard" / TRAIN_NAME
+    CHECKPOINT_ROOT = REPO_ROOT / "checkpoints" / TRAIN_NAME
+    LATEST_CKPT_PATH = CHECKPOINT_ROOT / "latest.pth"
+    BEST_CKPT_PATH = CHECKPOINT_ROOT / "best.pth"
+    META_PATH = CHECKPOINT_ROOT / "meta.json"
+
 # 这些模块只在真正训练时导入，避免 `--help` 也要等待大段初始化。
 jax = None
 safetensors_torch = None
@@ -59,6 +70,16 @@ _data = None
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fine-tune pi0.5 on RLBench LeRobot data.")
     parser.add_argument("--config-name", default="pi05_rlbench_pt", help="Base openpi training config name.")
+    parser.add_argument(
+        "--train-name",
+        default=TRAIN_NAME,
+        help="Experiment name; controls checkpoints/<name> and tensorboard/<name> so runs don't clobber each other.",
+    )
+    parser.add_argument(
+        "--freeze-vlm",
+        action="store_true",
+        help="Freeze the PaliGemma vision tower and language model; train only the action expert and projections.",
+    )
     parser.add_argument("--batch-size", type=int, default=None, help="Override global batch size.")
     parser.add_argument("--num-workers", type=int, default=None, help="Override dataloader workers.")
     parser.add_argument("--train-steps", type=int, default=None, help="Override total train steps.")
@@ -361,15 +382,33 @@ def build_model(config: _config.TrainConfig, device: torch.device) -> torch.nn.M
     return model
 
 
-"""使用 openpi config 中的 AdamW 超参数构建优化器。"""
+"""使用 openpi config 中的 AdamW 超参数构建优化器；只纳入可训练参数以兼容 --freeze-vlm。"""
 def create_optimizer(config: _config.TrainConfig, model: torch.nn.Module) -> torch.optim.Optimizer:
     return torch.optim.AdamW(
-        model.parameters(),
+        (param for param in model.parameters() if param.requires_grad),
         lr=config.lr_schedule.peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
         weight_decay=config.optimizer.weight_decay,
     )
+
+
+"""冻结 PaliGemma 视觉塔与语言模型，只训练 action expert 和投影层。"""
+def freeze_vlm_parameters(model: torch.nn.Module, logger: logging.Logger, *, is_main: bool) -> None:
+    frozen_numel = 0
+    trainable_numel = 0
+    for name, param in unwrap_model(model).named_parameters():
+        if name.startswith("paligemma_with_expert.paligemma."):
+            param.requires_grad_(False)
+            frozen_numel += param.numel()
+        else:
+            trainable_numel += param.numel()
+    if is_main:
+        logger.info(
+            "Froze PaliGemma VLM: frozen=%.1fM trainable=%.1fM",
+            frozen_numel / 1e6,
+            trainable_numel / 1e6,
+        )
 
 
 """复刻官方 PyTorch 训练脚本里的 warmup + cosine 学习率调度。"""
@@ -583,6 +622,7 @@ def save_training_state(
 """训练主入口：串起目录准备、数据/模型构建、训练循环和 checkpoint 保存。"""
 def train() -> int:
     args = parse_args()
+    apply_train_name(args.train_name)
     use_ddp, rank, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or rank == 0
 
@@ -617,6 +657,8 @@ def train() -> int:
         model = build_model(config, device)
         if is_main:
             logger.info("pi0.5 model is ready.")
+        if args.freeze_vlm:
+            freeze_vlm_parameters(model, logger, is_main=is_main)
         optimizer = create_optimizer(config, model)
 
         # 多卡训练仍走标准 DDP，保持和官方 PyTorch 入口一致。
