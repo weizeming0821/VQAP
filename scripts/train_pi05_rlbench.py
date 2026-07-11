@@ -36,7 +36,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-TRAIN_NAME = "pi05_rlbench_train"
+TRAIN_NAME = "pi05_rlbench_delta_train"
 LOG_ROOT = REPO_ROOT / "log"
 TENSORBOARD_ROOT = REPO_ROOT / "tensorboard" / TRAIN_NAME
 CHECKPOINT_ROOT = REPO_ROOT / "checkpoints" / TRAIN_NAME
@@ -69,7 +69,7 @@ _data = None
 """解析训练参数，保留高频可调项，默认值仍然来自 openpi config。"""
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fine-tune pi0.5 on RLBench LeRobot data.")
-    parser.add_argument("--config-name", default="pi05_rlbench_pt", help="Base openpi training config name.")
+    parser.add_argument("--config-name", default="pi05_rlbench_delta_pt", help="Base openpi training config name.")
     parser.add_argument(
         "--train-name",
         default=TRAIN_NAME,
