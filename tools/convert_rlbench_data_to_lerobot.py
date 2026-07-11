@@ -135,9 +135,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--prompt-strategy",
-        choices=("longest", "first", "shortest"),
+        choices=("longest", "first", "shortest", "random"),
         default="longest",
-        help="How to pick one instruction from variation_descriptions.pkl.",
+        help="How to pick one instruction from variation_descriptions.pkl. "
+        "'random' picks per-episode (deterministic per episode key) to avoid language overfitting.",
+    )
+    parser.add_argument(
+        "--action-stride",
+        type=int,
+        default=1,
+        help="Temporal subsampling stride k: keep frames 0,k,2k,... and use the next kept "
+        "frame as the action target. Increases per-step motion to avoid stall attractors.",
+    )
+    parser.add_argument(
+        "--action-repr",
+        choices=("absolute", "delta"),
+        default="absolute",
+        help="'absolute': action = next kept frame pose (legacy). "
+        "'delta': action = [dxyz, dquat(world), gripper], matching pi0.5 pretraining priors.",
+    )
+    parser.add_argument(
+        "--repo-id",
+        default=None,
+        help="Override LeRobot repo id / output subdirectory (default: the split name). "
+        "Use e.g. train_delta to write alongside an existing dataset.",
     )
     parser.add_argument(
         "--fps",
@@ -185,6 +206,8 @@ def parse_args() -> argparse.Namespace:
 
     if args.max_episodes_per_task is not None and args.max_episodes_per_task < 1:
         raise ValueError("--max-episodes-per-task must be >= 1.")
+    if args.action_stride < 1:
+        raise ValueError("--action-stride must be >= 1.")
     if args.fps < 1:
         raise ValueError("--fps must be >= 1.")
     if args.num_workers < 1:
@@ -244,7 +267,7 @@ def discover_tasks(
     return tasks
 
 
-def pick_instruction(descriptions: list[str], strategy: str) -> str:
+def pick_instruction(descriptions: list[str], strategy: str, episode_key: str = "") -> str:
     """Pick one stable instruction string for the whole episode."""
     cleaned = [text.strip() for text in descriptions if text and text.strip()]
     if not cleaned:
@@ -253,17 +276,24 @@ def pick_instruction(descriptions: list[str], strategy: str) -> str:
         return cleaned[0]
     if strategy == "shortest":
         return min(cleaned, key=len)
+    if strategy == "random":
+        # 每个 episode 用其 key 做确定性种子，重跑/断点续转结果一致。
+        import hashlib
+        import random as _random
+
+        seed = int.from_bytes(hashlib.sha256(episode_key.encode("utf-8")).digest()[:8], "big")
+        return _random.Random(seed).choice(cleaned)
     return max(cleaned, key=len)
 
 
-def load_instruction(variation_dir: Path, strategy: str) -> str:
-    """Read one language instruction from a variation directory."""
+def load_descriptions(variation_dir: Path) -> list[str]:
+    """Read the language instruction list from a variation directory."""
     desc_path = variation_dir / VARIATION_DESCRIPTIONS
     with desc_path.open("rb") as handle:
         descriptions = pickle.load(handle)
     if not isinstance(descriptions, list):
         raise TypeError(f"{desc_path} should contain a list of strings.")
-    return pick_instruction(descriptions, strategy)
+    return descriptions
 
 
 def build_episode_specs(
@@ -288,7 +318,7 @@ def build_episode_specs(
         converted_for_task = 0
 
         for variation_dir in variation_dirs:
-            instruction = load_instruction(variation_dir, prompt_strategy)
+            descriptions = load_descriptions(variation_dir)
             episodes_root = variation_dir / EPISODES_DIR
             if not episodes_root.is_dir():
                 continue
@@ -308,13 +338,14 @@ def build_episode_specs(
                 ):
                     break
 
+                episode_key = f"{task}/{variation_dir.name}/{episode_dir.name}"
                 specs.append(
                     EpisodeSpec(
                         task=task,
                         variation=variation_dir.name,
                         episode=episode_dir.name,
                         episode_dir=episode_dir,
-                        instruction=instruction,
+                        instruction=pick_instruction(descriptions, prompt_strategy, episode_key),
                     )
                 )
                 converted_for_task += 1
@@ -405,6 +436,41 @@ def observation_to_state(observation: Any) -> np.ndarray:
     quaternion_xyzw = normalize_quaternion_sign(pose[3:7])
     gripper = np.asarray([float(observation.gripper_open)], dtype=np.float32)
     return np.concatenate([xyz, quaternion_xyzw, gripper], axis=0).astype(np.float32)
+
+
+def quat_multiply_xyzw(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    """Hamilton product q1 ⊗ q2 for xyzw quaternions."""
+    x1, y1, z1, w1 = np.asarray(q1, dtype=np.float32)
+    x2, y2, z2, w2 = np.asarray(q2, dtype=np.float32)
+    return np.asarray(
+        [
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        ],
+        dtype=np.float32,
+    )
+
+
+def quat_conjugate_xyzw(q: np.ndarray) -> np.ndarray:
+    """Conjugate (= inverse for unit quaternions) of an xyzw quaternion."""
+    q = np.asarray(q, dtype=np.float32)
+    return np.asarray([-q[0], -q[1], -q[2], q[3]], dtype=np.float32)
+
+
+def state_pair_to_delta_action(state_now: np.ndarray, state_next: np.ndarray) -> np.ndarray:
+    """Build the 8D delta action [dxyz, dquat_world_xyzw, gripper_next].
+
+    世界系旋转增量定义为 R_next = R_delta @ R_now，即 dq = q_next ⊗ q_now^-1。
+    评测端用 q_target = dq ⊗ q_current 合成绝对目标位姿。
+    """
+    dxyz = state_next[:3] - state_now[:3]
+    dquat = quat_multiply_xyzw(state_next[3:7], quat_conjugate_xyzw(state_now[3:7]))
+    dquat = dquat / np.clip(np.linalg.norm(dquat), 1e-8, None)
+    dquat = normalize_quaternion_sign(dquat)
+    gripper = state_next[7:8]
+    return np.concatenate([dxyz, dquat, gripper], axis=0).astype(np.float32)
 
 
 def load_png_paths(camera_dir: Path, expected_frames: int) -> tuple[str, ...]:
@@ -865,34 +931,56 @@ def load_or_create_dataset(
     )
 
 
-def prepare_episode(spec: EpisodeSpec) -> PreparedEpisode:
-    """Prepare one episode in a worker-friendly form."""
+def prepare_episode(spec: EpisodeSpec, action_stride: int = 1, action_repr: str = "absolute") -> PreparedEpisode:
+    """Prepare one episode in a worker-friendly form.
+
+    action_stride=k 表示只保留第 0,k,2k,... 帧作为样本，动作目标是下一个保留帧；
+    action_repr='delta' 时动作为 [dxyz, dquat_world, gripper_next]。
+    """
     low_dim_path = spec.episode_dir / LOW_DIM_PICKLE
     demo = load_demo(low_dim_path)
     num_observations = len(demo)
     if num_observations < 2:
         raise ValueError(f"{low_dim_path} has only {num_observations} observations.")
 
-    image_paths = {
+    kept_indices = list(range(0, num_observations, action_stride))
+    # 结尾帧若不在等距网格上则补上，保证最后一个动作到达 demo 终点。
+    if kept_indices[-1] != num_observations - 1:
+        kept_indices.append(num_observations - 1)
+    if len(kept_indices) < 2:
+        raise ValueError(
+            f"{low_dim_path} has too few frames ({num_observations}) for action_stride={action_stride}."
+        )
+    num_frames = len(kept_indices) - 1
+
+    full_image_paths = {
         feature_key: load_png_paths(
             spec.episode_dir / raw_folder,
             expected_frames=num_observations,
         )
         for raw_folder, feature_key in RAW_TO_LEROBOT_CAMERAS.items()
     }
+    image_paths = {
+        feature_key: tuple(paths[index] for index in kept_indices[:-1])
+        for feature_key, paths in full_image_paths.items()
+    }
 
-    states = np.stack(
-        [observation_to_state(demo[index]) for index in range(num_observations - 1)],
-        axis=0,
-    )
-    actions = np.stack(
-        [observation_to_state(demo[index + 1]) for index in range(num_observations - 1)],
-        axis=0,
-    )
+    kept_states = [observation_to_state(demo[index]) for index in kept_indices]
+    states = np.stack(kept_states[:-1], axis=0)
+    if action_repr == "delta":
+        actions = np.stack(
+            [
+                state_pair_to_delta_action(kept_states[index], kept_states[index + 1])
+                for index in range(num_frames)
+            ],
+            axis=0,
+        )
+    else:
+        actions = np.stack(kept_states[1:], axis=0)
 
     return PreparedEpisode(
         spec=spec,
-        num_frames=num_observations - 1,
+        num_frames=num_frames,
         image_paths=image_paths,
         states=states,
         actions=actions,
@@ -903,12 +991,14 @@ def iter_prepared_episodes(
     specs: list[EpisodeSpec],
     num_workers: int,
     rlbench_root: Path,
+    action_stride: int = 1,
+    action_repr: str = "absolute",
 ) -> Iterator[tuple[EpisodeSpec, PreparedEpisode | Exception]]:
     """Yield prepared episodes in deterministic order."""
     if num_workers <= 1:
         for spec in specs:
             try:
-                yield spec, prepare_episode(spec)
+                yield spec, prepare_episode(spec, action_stride, action_repr)
             except Exception as exc:  # pragma: no cover - data-dependent
                 yield spec, exc
         return
@@ -927,7 +1017,7 @@ def iter_prepared_episodes(
                 spec = next(spec_iter)
             except StopIteration:
                 break
-            futures.append((spec, executor.submit(prepare_episode, spec)))
+            futures.append((spec, executor.submit(prepare_episode, spec, action_stride, action_repr)))
 
         while futures:
             spec, future = futures.popleft()
@@ -940,7 +1030,7 @@ def iter_prepared_episodes(
                 next_spec = next(spec_iter)
             except StopIteration:
                 continue
-            futures.append((next_spec, executor.submit(prepare_episode, next_spec)))
+            futures.append((next_spec, executor.submit(prepare_episode, next_spec, action_stride, action_repr)))
 
 
 def write_prepared_episode(dataset: Any, prepared: PreparedEpisode) -> int:
@@ -1046,10 +1136,12 @@ def main() -> int:
         raise RuntimeError(f"No episodes found under {split_root}")
 
     output_root = args.output_root.resolve()
-    dataset_root = output_root / args.split
+    repo_id = args.repo_id or args.split
+    dataset_root = output_root / repo_id
     progress_path = dataset_root / PROGRESS_LOG_NAME
-    lock_path = output_root / LOCK_NAME_TEMPLATE.format(split=args.split)
-    repo_id = args.split
+    lock_path = output_root / LOCK_NAME_TEMPLATE.format(split=repo_id)
+    # stride 下采样后的有效控制频率写进元数据。
+    effective_fps = max(1, round(args.fps / args.action_stride))
 
     with split_lock(lock_path):
         disable_nested_progress_bars()
@@ -1094,7 +1186,7 @@ def main() -> int:
             repo_id=repo_id,
             dataset_root=dataset_root,
             image_shape=image_shape,
-            fps=args.fps,
+            fps=effective_fps,
             robot_type=args.robot_type,
             image_writer_processes=args.image_writer_processes,
             image_writer_threads=args.image_writer_threads,
@@ -1111,8 +1203,10 @@ def main() -> int:
             )
         else:
             print(
-                f"[start] split={args.split} total={len(specs)} "
-                f"pending={len(pending_specs)} num_workers={args.num_workers}"
+                f"[start] split={args.split} repo_id={repo_id} total={len(specs)} "
+                f"pending={len(pending_specs)} num_workers={args.num_workers} "
+                f"action_stride={args.action_stride} action_repr={args.action_repr} "
+                f"prompt_strategy={args.prompt_strategy} effective_fps={effective_fps}"
             )
 
         converted_episodes = 0
@@ -1141,6 +1235,8 @@ def main() -> int:
                     pending_specs,
                     num_workers=args.num_workers,
                     rlbench_root=rlbench_root,
+                    action_stride=args.action_stride,
+                    action_repr=args.action_repr,
                 ),
                 start=completed_current,
             ):
