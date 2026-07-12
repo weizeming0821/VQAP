@@ -9,4 +9,4 @@ export HF_HOME="${HF_HOME:-${REPO_ROOT}/.cache/huggingface}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${REPO_ROOT}/.cache/huggingface/datasets}"
 
 
-CUDA_VISIBLE_DEVICES="1,3,5,6" torchrun --nproc_per_node=4 scripts/train_pi05_rlbench.py "$@"
+CUDA_VISIBLE_DEVICES="0,1,2,4" torchrun --nproc_per_node=4 scripts/train_pi05_rlbench.py "$@"
