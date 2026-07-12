@@ -1,15 +1,18 @@
 checkpoint:
   # best | latest | official
   which: best
-  train_config_name: pi05_rlbench_pt
-  finetuned_root_dir: checkpoints/pi05_rlbench_train
+  # ===== 默认评测 delta 实验(pi05_rlbench_delta_train)。=====
+  # 如需评旧的绝对位姿实验,四处一起改回:
+  #   train_config_name: pi05_rlbench_pt
+  #   finetuned_root_dir: checkpoints/pi05_rlbench_train
+  #   rlbench_norm_stats_dir: openpi-vqap/assets/pi05_rlbench/train
+  #   action_space: absolute
+  train_config_name: pi05_rlbench_delta_pt
+  finetuned_root_dir: checkpoints/pi05_rlbench_delta_train
   official_dir: openpi_cache/openpi-assets/checkpoints/pi05_base_pytorch
-  rlbench_norm_stats_dir: openpi-vqap/assets/pi05_rlbench/train
-  # absolute: 动作是绝对位姿(旧数据); delta: 动作是 [dxyz, rot6d(dR), grip](train_delta 数据)。
-  # 评测 delta ckpt 时同时改: train_config_name: pi05_rlbench_delta_pt,
-  # finetuned_root_dir: checkpoints/pi05_rlbench_delta_train,
-  # rlbench_norm_stats_dir: openpi-vqap/assets/pi05_rlbench_delta/train_delta
-  action_space: absolute
+  rlbench_norm_stats_dir: openpi-vqap/assets/pi05_rlbench_delta/train_delta
+  # absolute: 模型输出绝对位姿; delta: 模型输出 [dxyz, rot6d(dR), grip],评测端与当前位姿合成。
+  action_space: delta
 
 dataset:
   raw_root: RLBench_Raw_Dataset
