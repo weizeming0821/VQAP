@@ -58,6 +58,7 @@ EPISODE_FOLDER = "episode%d"
 VARIATIONS_FOLDER = "variation%d"
 LOW_DIM_PICKLE = "low_dim_obs.pkl"
 VARIATION_DESCRIPTIONS = "variation_descriptions.pkl"
+EPISODE_META = "meta.json"
 IMAGE_FORMAT = "%d.png"
 FRONT_RGB_FOLDER = "front_rgb"
 WRIST_RGB_FOLDER = "wrist_rgb"
@@ -379,6 +380,14 @@ def clear_high_dim_fields(observation: Any) -> None:
             setattr(observation, f"{prefix}_{suffix}", None)
 
 
+"""返回 scene 中当前真正加载的任务名,用于任务身份强校验。"""
+def loaded_scene_task_name(task_env: Any) -> str:
+    scene_task = task_env._scene.task
+    if scene_task is None:
+        raise RuntimeError("Scene has no task loaded.")
+    return scene_task.get_name()
+
+
 """把一个完整 demo 保存成 5 路 RGB + low_dim_obs.pkl。"""
 def save_demo(demo: Any, episode_path: Path) -> None:
     ensure_dir(episode_path)
@@ -402,10 +411,38 @@ def save_demo(demo: Any, episode_path: Path) -> None:
         pickle.dump(demo, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-"""检查一个 episode 目录是否完整，可用于默认断点续跑。"""
-def episode_status(episode_path: Path) -> tuple[bool, str]:
+"""检查一个 episode 目录是否完整且任务身份正确，可用于默认断点续跑。"""
+def episode_status(
+    episode_path: Path,
+    expected_task_name: str,
+    expected_variation: int,
+) -> tuple[bool, str]:
     if not episode_path.exists():
         return False, "missing episode directory"
+
+    # meta.json 记录采集时 scene 中真正加载的任务；缺失或不匹配都视为不完整，
+    # 强制重采，保证被污染的旧 episode 不会通过断点续跑幸存。
+    meta_path = episode_path / EPISODE_META
+    if not meta_path.exists():
+        return False, "missing meta.json"
+    try:
+        with meta_path.open("r", encoding="utf-8") as handle:
+            meta = json.load(handle)
+    except Exception as exc:  # pragma: no cover - defensive runtime path
+        return False, f"failed to read meta.json: {exc}"
+    if meta.get("task_name") != expected_task_name:
+        return False, (
+            f"meta task_name={meta.get('task_name')!r} != expected {expected_task_name!r}"
+        )
+    if meta.get("scene_task_name") != expected_task_name:
+        return False, (
+            f"meta scene_task_name={meta.get('scene_task_name')!r} "
+            f"!= expected {expected_task_name!r}"
+        )
+    if meta.get("variation") != expected_variation:
+        return False, (
+            f"meta variation={meta.get('variation')!r} != expected {expected_variation}"
+        )
 
     low_dim_path = episode_path / LOW_DIM_PICKLE
     if not low_dim_path.exists():
@@ -566,16 +603,14 @@ def record_failure(
     manifest["updated_at"] = utc_now_iso()
 
 
-"""把多个 task 的 pending jobs 交织起来，避免前几个 task 长时间独占 worker。"""
-def interleave_job_groups(job_groups: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
-    ordered_jobs: list[dict[str, Any]] = []
-    non_empty_groups = [group for group in job_groups if group]
-    max_group_size = max((len(group) for group in non_empty_groups), default=0)
-    for group_index in range(max_group_size):
-        for group in non_empty_groups:
-            if group_index < len(group):
-                ordered_jobs.append(group[group_index])
-    return ordered_jobs
+"""按 task 顺序拼接 pending jobs。
+
+不再跨任务交织：修复 TaskEnvironment 复用 bug 后，worker 每次任务切换都要
+重新 get_task()（卸载并重载整个场景）。按任务分段排列可以让同一时段的
+worker 都采同一个任务，把场景重载次数降到最低。
+"""
+def order_job_groups(job_groups: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    return [job for group in job_groups for job in group]
 
 
 """构造单个 episode 的采集 job。"""
@@ -672,7 +707,7 @@ def prepare_task_specs(
                 variation,
                 local_episode_index,
             )
-            is_complete, _ = episode_status(episode_path)
+            is_complete, _ = episode_status(episode_path, task_name, variation)
             if is_complete:
                 complete_indices[variation].add(local_episode_index)
                 continue
@@ -713,7 +748,7 @@ def prepare_task_specs(
             f"pending={len(pending_jobs)}"
         )
 
-    return task_specs, interleave_job_groups(pending_by_task)
+    return task_specs, order_job_groups(pending_by_task)
 
 
 """把 worker 回传的结果并入 manifest 统计。"""
@@ -755,12 +790,21 @@ def apply_worker_result(
     atomic_write_json(manifest_path, manifest)
 
 
-"""采集单个 episode；worker 里每拿到一个 job 就执行一次。"""
+"""采集单个 episode；worker 里每拿到一个 job 就执行一次。
+
+注意：RLBench 的 Scene 在同一个 Environment 内是全局共享的，
+Environment.get_task() 会把上一个任务从 scene 卸载再加载新任务，
+因此旧的 TaskEnvironment 对象在任务切换后即失效（它的 reset/get_demos
+会作用在"当前 scene 里加载的任务"上）。这里绝不能按任务名缓存
+TaskEnvironment 复用——那正是之前数据集任务串台的根因。
+loaded_state 只保留"当前 scene 中加载的那个任务"这一个槽位，
+job 的任务与之不同时必须重新 get_task()。
+"""
 def collect_episode_job(
     env: Any,
     args: argparse.Namespace,
     worker_index: int,
-    task_env_cache: dict[str, Any],
+    loaded_state: dict[str, Any],
     job: dict[str, Any],
     rlbench_deps: dict[str, Any],
 ) -> dict[str, Any]:
@@ -771,15 +815,23 @@ def collect_episode_job(
     episode_path = Path(job["episode_path"])
     lock_path = Path(job["lock_path"])
 
-    task_env = task_env_cache.get(task_name)
-    if task_env is None:
+    if loaded_state.get("task_name") != task_name or loaded_state.get("task_env") is None:
         task_class = rlbench_deps["task_file_to_task_class"](task_name)
-        task_env = env.get_task(task_class)
-        task_env_cache[task_name] = task_env
+        loaded_state["task_env"] = env.get_task(task_class)
+        loaded_state["task_name"] = task_name
+    task_env = loaded_state["task_env"]
+
+    # 双重保险：无论缓存逻辑如何，都直接核对 scene 里真正加载的任务名。
+    scene_task_name = loaded_scene_task_name(task_env)
+    if scene_task_name != task_name:
+        raise RuntimeError(
+            f"Scene task mismatch before collection: loaded={scene_task_name!r}, "
+            f"expected={task_name!r}."
+        )
 
     with episode_file_lock(lock_path):
         # 进 worker 后再做一次检查，避免恢复运行时和其他实例撞到同一 episode。
-        is_complete, reason = episode_status(episode_path)
+        is_complete, reason = episode_status(episode_path, task_name, variation)
         if is_complete:
             print(
                 f"[{args.split}] worker={worker_index} skip task={task_name} "
@@ -814,8 +866,27 @@ def collect_episode_job(
                 live_demos=True,
                 max_attempts=args.max_retries,
             )
+            # 采集后再核对一次 scene 任务身份，防御 get_demos 内部的任何意外切换。
+            scene_task_name = loaded_scene_task_name(task_env)
+            if scene_task_name != task_name:
+                raise RuntimeError(
+                    f"Scene task mismatch after collection: loaded={scene_task_name!r}, "
+                    f"expected={task_name!r}."
+                )
             save_demo(demo, episode_path)
-            is_complete, reason = episode_status(episode_path)
+            atomic_write_json(
+                episode_path / EPISODE_META,
+                {
+                    "task_name": task_name,
+                    "scene_task_name": scene_task_name,
+                    "variation": variation,
+                    "local_episode_index": local_episode_index,
+                    "seed": seed,
+                    "step_count": len(demo),
+                    "collected_at": utc_now_iso(),
+                },
+            )
+            is_complete, reason = episode_status(episode_path, task_name, variation)
             if not is_complete:
                 raise RuntimeError(f"post-save validation failed: {reason}")
             return {
@@ -861,7 +932,7 @@ def worker_main(
         env.launch()
         launched = True
 
-        task_env_cache: dict[str, Any] = {}
+        loaded_state: dict[str, Any] = {"task_name": None, "task_env": None}
         while True:
             job = job_queue.get()
             if job is None:
@@ -871,7 +942,7 @@ def worker_main(
                     env=env,
                     args=args,
                     worker_index=worker_index,
-                    task_env_cache=task_env_cache,
+                    loaded_state=loaded_state,
                     job=job,
                     rlbench_deps=rlbench_deps,
                 )
