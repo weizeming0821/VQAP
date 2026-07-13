@@ -42,6 +42,7 @@ DEFAULT_RLBENCH_ROOT = REPO_ROOT / "source" / "RLBench"
 MANIFEST_NAME = "manifest.json"
 LOW_DIM_PICKLE = "low_dim_obs.pkl"
 VARIATION_DESCRIPTIONS = "variation_descriptions.pkl"
+EPISODE_META = "meta.json"
 EPISODES_DIR = "episodes"
 DEFAULT_NUM_WORKERS = 1
 PROGRESS_LOG_NAME = ".conversion_progress.jsonl"
@@ -296,6 +297,33 @@ def load_descriptions(variation_dir: Path) -> list[str]:
     return descriptions
 
 
+def verify_episode_identity(episode_dir: Path, task: str, variation_name: str) -> None:
+    """Verify the per-episode meta.json matches the directory it sits in.
+
+    采集脚本会把 scene 中真正加载的任务写进 meta.json；这里强校验目录归属，
+    杜绝任务串台的数据混进 LeRobot 数据集。缺 meta.json 的旧数据一律拒绝。
+    """
+    meta_path = episode_dir / EPISODE_META
+    if not meta_path.is_file():
+        raise RuntimeError(
+            f"{episode_dir} is missing {EPISODE_META}; the raw episode cannot be "
+            "identity-verified. Re-collect it with the fixed collector."
+        )
+    with meta_path.open("r", encoding="utf-8") as handle:
+        meta = json.load(handle)
+    expected_variation = get_numeric_suffix(variation_name, "variation")
+    for key in ("task_name", "scene_task_name"):
+        if meta.get(key) != task:
+            raise RuntimeError(
+                f"{episode_dir}: meta {key}={meta.get(key)!r} does not match task {task!r}."
+            )
+    if meta.get("variation") != expected_variation:
+        raise RuntimeError(
+            f"{episode_dir}: meta variation={meta.get('variation')!r} does not match "
+            f"{variation_name!r}."
+        )
+
+
 def build_episode_specs(
     split_root: Path,
     tasks: list[str],
@@ -338,6 +366,7 @@ def build_episode_specs(
                 ):
                     break
 
+                verify_episode_identity(episode_dir, task, variation_dir.name)
                 episode_key = f"{task}/{variation_dir.name}/{episode_dir.name}"
                 specs.append(
                     EpisodeSpec(
