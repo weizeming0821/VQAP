@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 
-REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "${REPO_ROOT}"
 
 export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-${REPO_ROOT}/openpi_cache}"

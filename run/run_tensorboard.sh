@@ -1,9 +1,9 @@
 #!/bin/bash
 # TensorBoard 启动脚本
-# 用法: bash run_tensorboard.sh [port]
+# 用法: bash run/run_tensorboard.sh [port]
 
 PORT=${1:-6006}
-LOGDIR="$(dirname "$0")/tensorboard"
+LOGDIR="$(dirname "$0")/../tensorboard"
 
 echo "=== TensorBoard ==="
 echo "Logdir : $LOGDIR"

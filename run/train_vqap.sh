@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+
+REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "${REPO_ROOT}"
+
+CUDA_VISIBLE_DEVICES="4,5,6,7" torchrun --nproc_per_node=4 scripts/train_vqap.py "$@"

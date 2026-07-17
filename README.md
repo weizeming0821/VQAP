@@ -25,8 +25,8 @@ utils/         损失函数、logger / TensorBoard 工具
 scripts/       train_vqap.py（训练）、generate_dataset.py（数据生成）
 tools/         visualize_codebook.py（码本可视化）
 traj_generator_segmentation/   RLBench 采集 + 分割
-train_vqap.sh        训练启动脚本（torchrun）
-run_tensorboard.sh   TensorBoard 启动脚本
+run/train_vqap.sh        训练启动脚本（torchrun）
+run/run_tensorboard.sh   TensorBoard 启动脚本
 checkpoints/   训练输出权重（按实验名 / stage 分目录）
 log/           文本日志
 tensorboard/   TensorBoard 事件文件
@@ -77,10 +77,10 @@ python scripts/generate_dataset.py --displays :99.0 :99.1 --output_path ./demos_
 
 ## 5. 训练
 
-单机多卡用 `torchrun` 启动。快捷脚本 `train_vqap.sh`：
+单机多卡用 `torchrun` 启动。快捷脚本 `run/train_vqap.sh`：
 
 ```bash
-bash train_vqap.sh
+bash run/train_vqap.sh
 # 内容等价于：
 # CUDA_VISIBLE_DEVICES="1,5" torchrun --nproc_per_node=2 scripts/train_vqap.py
 ```
@@ -133,8 +133,8 @@ torchrun --nproc_per_node=2 scripts/train_vqap.py --exp-name vqap_run1 \
 ## 6. TensorBoard
 
 ```bash
-bash run_tensorboard.sh          # 默认端口 6006
-bash run_tensorboard.sh 6007     # 指定端口
+bash run/run_tensorboard.sh          # 默认端口 6006
+bash run/run_tensorboard.sh 6007     # 指定端口
 ```
 
 监控曲线（x 轴 = epoch）：`loss/*`、`loss_ap/*`、`loss_ag/*`、`train_state/*`（grad_norm、lambda_future、stage）、`lr/*`、`codebook/*`（perplexity_g/d、replaced_g/d）、`best/*`。码本健康判据见 [VQAP_Design.md](VQAP_Design.md) §5.5。
@@ -163,7 +163,7 @@ python tools/visualize_codebook.py \
 # 3. 启动训练
 CUDA_VISIBLE_DEVICES="1,5" torchrun --nproc_per_node=2 scripts/train_vqap.py --exp-name my_run
 # 4. 另开终端看曲线
-bash run_tensorboard.sh
+bash run/run_tensorboard.sh
 # 5. 训练完成后可视化码本
 python tools/visualize_codebook.py --checkpoint checkpoints/my_run/stage1/best_lap.pth
 ```
