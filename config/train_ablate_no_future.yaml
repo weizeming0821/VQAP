@@ -1,0 +1,92 @@
+# ============================================================================
+# Exp4 消融臂 ②：−L_future（去掉未来帧潜空间预测支路）
+# 见 Exp_Design.md §6.2。与 config/train.yaml 的唯一差异是下方 loss 段的两个 0。
+#
+# 为什么改权重就等于消融模块（已核实）：
+#   model/vqap.py::forward 的数据流是 atomaction_nsvq → vasa（经 global_codeword），
+#   **没有 vasa → atomaction 的反向通路**，VASA 是纯下游支路。因此把 L_future 权重置 0
+#   后，不再有任何梯度经该支路回流到码本，等价于结构性移除。
+#   utils/loss_func.py::compute_future_weight_schedule 在两个 max 都为 0 时，
+#   stage0/stage1/ramp 三条分支全部返回 0。
+#
+# 注意：前向仍会执行 VASA（算力略有浪费），但这正是我们要的——数据管线与完整版
+# 逐位一致，唯一变量是损失项，消融对比因此没有额外混淆。
+#
+# 启动：
+#   sh run/train_vqap.sh --config config/train_ablate_no_future.yaml \
+#                        --exp-name vqap_pretrain_ablate_no_future
+# ============================================================================
+experiment:
+  exp_name: "vqap_pretrain_ablate_no_future"
+  seed: 42
+
+runtime:
+  precision: "bf16"
+  grad_clip_norm: 1.0
+  allow_tf32: true
+  cudnn_benchmark: true
+
+flow_matching:
+  noise_std: 1.0
+
+data:
+  batch_size: 64
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  drop_last: false
+  prefetch_factor: 2
+
+stage:
+  stage0_epochs: 150
+  stage1_epochs: 100
+
+lr:
+  stage0_main: 3.0e-4
+  stage0_lora: 5.0e-5
+  stage1_main: 1.0e-4
+
+optimizer:
+  beta1: 0.9
+  main_beta2: 0.99
+  lora_beta2: 0.99
+  eps: 1.0e-8
+  weight_decay: 1.0e-3
+
+scheduler:
+  warmup_epochs: 2
+  min_lr_ratio: 0.05
+
+loss:
+  lambda_ap: 1.0
+  lambda_ag: 1.0           # 保留 Action Grounding（这正是 ② 与 ① 的区别）
+  lambda_rot: 1.0
+  lambda_grip: 1.0
+  lambda_sep: 0.01
+  future_stage0_max: 0.0   # ← 消融 ②：L_future 关闭（原 0.1）
+  future_stage1_max: 0.0   # ← 消融 ②：L_future 关闭（原 1.0）
+  future_stage1_ramp_epochs: 20
+
+codebook:
+  perplexity_g_threshold: 9.0
+  perplexity_d_threshold: 48.0
+  replace_interval_epochs: 20  # 设为 inf 则保留 perplexity 触发
+
+checkpoint:
+  root_dir: "checkpoints"
+  save_every_epochs: 2
+
+logging:
+  log_dir: "log"
+
+tensorboard:
+  enable: true
+  log_dir: "tensorboard"
+
+lora:
+  r: 8
+  alpha: 16
+  dropout: 0.1
+  bias: "none"
+  target_modules:
+    - "attn.qkv"
