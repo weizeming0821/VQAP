@@ -133,18 +133,31 @@ def load_runtime_dependencies(logger: logging.Logger | None = None) -> None:
     _data = _openpi_data
 
 
-"""初始化 DDP 环境，并为当前进程绑定对应的 GPU 设备。"""
+"""初始化 DDP 环境，并为当前进程绑定对应的 GPU 设备。
+
+⚠️ 顺序不可调换（2026-07-21 修复的死锁 bug）：必须**先** `torch.cuda.set_device()`
+绑定本 rank 的 GPU，**再** `init_process_group()`。否则 NCCL 建通信域时本进程尚未绑定
+设备，只能自行猜测 rank→GPU 映射，PyTorch 会给出
+    "using GPU N as device used by this process is currently unknown.
+     This can potentially cause a hang if this rank to GPU mapping is incorrect."
+猜错即在启动期第一个集合通信上死锁（实测表现为 ALLGATHER SeqNum=2 卡满 600s 超时、
+watchdog SIGABRT），且是**间歇性**的——同样的命令可能这次正常、下次卡死。
+额外再显式传 `device_id=`，彻底消除猜测（需 torch>=2.3，当前 2.7.1）。
+"""
 def setup_ddp() -> tuple[bool, int, int, torch.device]:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
-    if use_ddp and not dist.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend=backend, init_method="env://")
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    if torch.cuda.is_available():
+    has_cuda = torch.cuda.is_available()
+    device = torch.device(f"cuda:{local_rank}" if has_cuda else "cpu")
+    if has_cuda:
         torch.cuda.set_device(device)
+    if use_ddp and not dist.is_initialized():
+        if has_cuda:
+            dist.init_process_group(backend="nccl", init_method="env://", device_id=device)
+        else:
+            dist.init_process_group(backend="gloo", init_method="env://")
     return use_ddp, rank, local_rank, device
 
 

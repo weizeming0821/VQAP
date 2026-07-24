@@ -10,8 +10,10 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${REPO_ROOT}/.cache/huggingface/d
 
 
 
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,4}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export CUDA_VISIBLE_DEVICES
 NPROC=$(echo "${CUDA_VISIBLE_DEVICES}" | awk -F, '{print NF}')
 
-torchrun --nproc_per_node="${NPROC}" scripts/train_pi05_rlbench.py "$@"
+# --standalone：单机多卡，rendezvous 自动选空闲端口。
+# 不加则固定占用 29500，与并行跑的另一个 torchrun 任务（如 VQAP 消融预训练）撞端口。
+torchrun --standalone --nproc_per_node="${NPROC}" scripts/train_pi05_rlbench.py "$@"
