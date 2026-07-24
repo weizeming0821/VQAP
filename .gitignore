@@ -6,7 +6,6 @@ checkpoints/
 tensorboard/
 
 *.zip
-test*
 *Dataset*/
 temp/
 source/
