@@ -16,3 +16,6 @@ openpi_cache
 .cache/
 result/
 Exp_Design.md
+
+test/
+tools/
