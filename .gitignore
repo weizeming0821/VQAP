@@ -17,5 +17,15 @@ openpi_cache
 result/
 Exp_Design.md
 
+# 仅保护当前 VLA agent 负责的契约测试和 cache 校验器。
+# 其余临时测试/工具仍保持忽略，避免把实验 agent 的本地脚本误纳入版本控制。
 tests/
+!tests/
+tests/*
+!tests/test_planner_cache.py
+!tests/test_seen12_cache_contract.py
+
 tools/
+!tools/
+tools/*
+!tools/verify_planner_cache.py
