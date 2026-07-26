@@ -50,6 +50,17 @@ RGB_CAMERA_SPECS = (
 )
 
 
+class EvalEnvironmentBroken(RuntimeError):
+    """连续 rollout 异常超限：判定 RLBench/CoppeliaSim 环境已损坏、无法恢复。
+
+    抛出后由主流程捕获，跳过剩余任务，但仍写出已收集结果的 summary（避免整轮白跑）。
+    """
+
+    def __init__(self, consecutive: int):
+        super().__init__(f"{consecutive} consecutive rollout failures; environment considered broken.")
+        self.consecutive = consecutive
+
+
 """解析评测参数；核心配置放 YAML，命令行只保留少量高频覆盖项。"""
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate pi0.5 on RLBench.")
@@ -1311,6 +1322,32 @@ def load_atom_segments(
     return plans
 
 
+"""构造一条"评测出错"的占位结果，使单局异常不拖垮整轮评测、且 summary 字段完整。
+
+用于 RLBench 偶发的场景放置失败(TaskEnvironmentError)等可恢复异常：把该局记为
+success=False + errored=True，评测继续下一局，成功率分母仍计入(视为失败局)。
+"""
+def make_errored_result(
+    task_name: str, variation: int, local_episode: int, error_type: str
+) -> dict[str, Any]:
+    return {
+        "task": task_name,
+        "prompt": "",
+        "variation": int(variation),
+        "local_episode": int(local_episode),
+        "success": False,
+        "errored": True,
+        "video_path": None,
+        "steps": 0,
+        "policy_calls": 0,
+        "infer_ms_mean": float("nan"),
+        "infer_ms_last": float("nan"),
+        "wall_time_s": 0.0,
+        "error_type": error_type,
+        "error_count": 1,
+    }
+
+
 """Exp0：把 demo 前缀重放到原子段起点，再把控制权交给 policy 执行该原子动作。
 
 与 rollout_replay_episode 共用同一条 8D->10D->8D 动作管线，保证前缀重放的落点
@@ -1704,6 +1741,8 @@ def main() -> int:
     overall_results: list[dict[str, Any]] = []
     task_summaries: list[dict[str, Any]] = []
     eval_start = time.monotonic()
+    consecutive_rollout_errors = 0
+    max_consecutive_rollout_errors = 10
 
     if args.atom_mode:
         try:
@@ -1805,6 +1844,7 @@ def main() -> int:
         logger.info("Next: watch the videos and fill human_success in %s", manifest_path)
         return 0
 
+    eval_env_broken: EvalEnvironmentBroken | None = None
     try:
         runtime.launch()
         if recorder is not None:
@@ -1824,29 +1864,56 @@ def main() -> int:
                     variation,
                     local_episode,
                 )
-                if args.replay_demo:
-                    result = rollout_replay_episode(
-                        runtime,
-                        task_name=task_name,
-                        variation=variation,
-                        local_episode=local_episode,
-                        gripper_threshold=gripper_threshold,
-                        recorder=recorder,
+                # 单局 rollout 包裹异常处理：RLBench 偶发的场景放置失败等不应拖垮整轮评测、
+                # 丢失已完成任务的结果。可恢复异常记为 errored 局并继续；连续失败超限视为
+                # 环境已损坏(如 CoppeliaSim 崩溃),提前结束但保证 summary 落盘。
+                try:
+                    if args.replay_demo:
+                        result = rollout_replay_episode(
+                            runtime,
+                            task_name=task_name,
+                            variation=variation,
+                            local_episode=local_episode,
+                            gripper_threshold=gripper_threshold,
+                            recorder=recorder,
+                        )
+                    else:
+                        result = rollout_episode(
+                            policy,
+                            runtime,
+                            task_name=task_name,
+                            variation=variation,
+                            local_episode=local_episode,
+                            max_steps=max_steps,
+                            replan_steps=replan_steps,
+                            gripper_threshold=gripper_threshold,
+                            action_stride=action_stride,
+                            action_space=action_space,
+                            recorder=recorder,
+                        )
+                    consecutive_rollout_errors = 0
+                except Exception as exc:  # noqa: BLE001
+                    error_type = type(exc).__name__
+                    consecutive_rollout_errors += 1
+                    logger.warning(
+                        "Rollout error (%s) task=%s var=%d ep=%d — 记为 errored 局并继续 "
+                        "(consecutive=%d): %s",
+                        error_type,
+                        task_name,
+                        variation,
+                        local_episode,
+                        consecutive_rollout_errors,
+                        exc,
                     )
-                else:
-                    result = rollout_episode(
-                        policy,
-                        runtime,
-                        task_name=task_name,
-                        variation=variation,
-                        local_episode=local_episode,
-                        max_steps=max_steps,
-                        replan_steps=replan_steps,
-                        gripper_threshold=gripper_threshold,
-                        action_stride=action_stride,
-                        action_space=action_space,
-                        recorder=recorder,
-                    )
+                    result = make_errored_result(task_name, variation, local_episode, error_type)
+                    if consecutive_rollout_errors >= max_consecutive_rollout_errors:
+                        task_results.append(result)
+                        overall_results.append(result)
+                        logger.error(
+                            "连续 %d 局 rollout 异常，判定环境已损坏，提前结束评测(summary 仍会写出)。",
+                            consecutive_rollout_errors,
+                        )
+                        raise EvalEnvironmentBroken(consecutive_rollout_errors) from exc
                 task_results.append(result)
                 overall_results.append(result)
                 logger.info(
@@ -1887,18 +1954,30 @@ def main() -> int:
                 task_summary["avg_steps"],
                 task_summary["avg_infer_ms"],
             )
+    except EvalEnvironmentBroken as exc:
+        # 环境损坏提前结束：吞掉异常，落到下方 summary 写出逻辑，保住已完成的结果。
+        eval_env_broken = exc
+        logger.error("评测因环境损坏提前结束（已完成 %d 局，summary 仍会写出）。", len(overall_results))
     finally:
         if recorder is not None:
             recorder.finalize()
         runtime.shutdown()
 
+    if not overall_results:
+        # 一局都没跑完就损坏：无可用结果，直接抛出。
+        if eval_env_broken is not None:
+            raise eval_env_broken
+        raise RuntimeError("评测未产生任何结果，无法生成 summary。")
+
+    # macro 只对**实际有评测结果**的任务求均值，避免提前结束时空任务产生 nan。
+    evaluated_tasks = [t for t in task_names if any(item["task"] == t for item in overall_results)]
     overall_successes = sum(int(item["success"]) for item in overall_results)
     overall_success_rate = overall_successes / max(1, len(overall_results))
     macro_task_success_rate = float(
         np.mean(
             [
                 np.mean([int(item["success"]) for item in overall_results if item["task"] == task_name])
-                for task_name in task_names
+                for task_name in evaluated_tasks
             ]
         )
     )
@@ -1918,6 +1997,9 @@ def main() -> int:
     logger.info("Overall success rate (macro): %.4f", macro_task_success_rate)
     logger.info("Overall successes: %d/%d", overall_successes, len(overall_results))
     logger.info("Total wall time (s): %.2f", total_wall_time_s)
+    errored_episodes = sum(1 for item in overall_results if item.get("errored"))
+    if errored_episodes:
+        logger.warning("Errored episodes (计入失败分母): %d", errored_episodes)
     if args.summary_json is not None:
         summary_payload = {
             "checkpoint_source": checkpoint_source,
@@ -1926,6 +2008,9 @@ def main() -> int:
             "success_rate_macro": macro_task_success_rate,
             "successes": overall_successes,
             "episodes": len(overall_results),
+            "errored_episodes": errored_episodes,
+            "partial_env_broken": eval_env_broken is not None,
+            "evaluated_tasks": evaluated_tasks,
             "total_wall_time_s": total_wall_time_s,
             "log_path": str(log_path),
             "task_summaries": task_summaries,

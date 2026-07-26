@@ -729,6 +729,12 @@ def train() -> int:
             logger.info("Entering train loop.")
         step_start_time = time.time()
         log_buffer: list[dict[str, float]] = []
+        # NaN 守卫计数：偶发 bf16 数值溢出会产生非有限 loss/梯度，若直接 optimizer.step
+        # 会把 NaN 永久写进权重（2026-07-26 事故：一次瞬时 NaN 毒化全部权重，空跑 11h）。
+        # 守卫跳过此类 step；连续跳过超限则判定为系统性发散并中止。
+        nan_skip_total = 0
+        consecutive_nan_skips = 0
+        max_consecutive_nan_skips = 25
         pbar = (
             tqdm.tqdm(total=config.num_train_steps, initial=global_step, desc="Training", disable=not is_main)
             if is_main
@@ -761,8 +767,67 @@ def train() -> int:
                     losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
                 loss = losses.mean()
+
+                # ---- NaN 守卫 ① 前向后：loss 非有限则跳过本 step ----
+                # DDP 关键：跳过决策必须**全 rank 一致**，否则部分 rank 不 backward →
+                # 其余 rank 卡在 all-reduce 死锁。用 all_reduce(MIN) 同步 finite 标志：
+                # 任一 rank 非有限 → 所有 rank 一起跳过。该集合通信所有 rank 都调用，不死锁。
+                loss_finite = torch.tensor(
+                    1.0 if torch.isfinite(loss).all() else 0.0, device=device, dtype=torch.float32
+                )
+                if use_ddp:
+                    dist.all_reduce(loss_finite, op=dist.ReduceOp.MIN)
+                if loss_finite.item() < 1.0:
+                    optimizer.zero_grad(set_to_none=True)  # 丢弃可能已累积的梯度
+                    nan_skip_total += 1
+                    consecutive_nan_skips += 1
+                    if is_main:
+                        logger.warning(
+                            "NaN guard: non-finite loss at step=%d, skip update "
+                            "(consecutive=%d total=%d)",
+                            global_step,
+                            consecutive_nan_skips,
+                            nan_skip_total,
+                        )
+                    if consecutive_nan_skips >= max_consecutive_nan_skips:
+                        raise RuntimeError(
+                            f"NaN guard aborting: {consecutive_nan_skips} consecutive non-finite "
+                            f"losses at step={global_step}. Likely systematic divergence, not a "
+                            "transient overflow — inspect LR/data/precision."
+                        )
+                    continue  # 不 backward/step，权重不被污染，重试下一个 batch(不消耗 step)
+
                 loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+
+                # ---- NaN 守卫 ② 反向后：梯度范数非有限则跳过 optimizer.step ----
+                # 有限 loss 仍可能反向出 NaN 梯度(如 log/div 的数值边界)；clip_grad_norm_
+                # 返回的总范数为 NaN 即表示存在 NaN 梯度。同样跨 rank 同步跳过。
+                grad_finite = torch.tensor(
+                    1.0 if torch.isfinite(grad_norm) else 0.0, device=device, dtype=torch.float32
+                )
+                if use_ddp:
+                    dist.all_reduce(grad_finite, op=dist.ReduceOp.MIN)
+                if grad_finite.item() < 1.0:
+                    optimizer.zero_grad(set_to_none=True)
+                    nan_skip_total += 1
+                    consecutive_nan_skips += 1
+                    if is_main:
+                        logger.warning(
+                            "NaN guard: non-finite grad_norm at step=%d, skip update "
+                            "(consecutive=%d total=%d)",
+                            global_step,
+                            consecutive_nan_skips,
+                            nan_skip_total,
+                        )
+                    if consecutive_nan_skips >= max_consecutive_nan_skips:
+                        raise RuntimeError(
+                            f"NaN guard aborting: {consecutive_nan_skips} consecutive non-finite "
+                            f"grads at step={global_step}. Likely systematic divergence."
+                        )
+                    continue
+
+                consecutive_nan_skips = 0  # 本 step 正常，重置连续计数
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
