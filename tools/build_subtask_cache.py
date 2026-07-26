@@ -46,26 +46,25 @@ DEFAULT_CAMERAS = (
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-ACTION_WHITELIST = {
-    "approach",
-    "grasp",
-    "lift",
-    "transfer",
-    "place",
-    "push",
-    "pull",
-    "press",
-    "rotate",
-    "slide",
-    "insert",
-    "hang",
-    "wipe",
-    "flip-open",
-    "flip-close",
-    "revolve-in",
-    "revolve-out",
-    "pose-adjust",
-}
+from data.planner_cache import (  # noqa: E402
+    CACHE_SCHEMA_VERSION,
+    INSTRUCTION_CONTRACT_VERSION,
+    RAW_VALIDATION_CACHE_ROLE,
+    TRAIN_CACHE_ROLE,
+    detect_cache_role,
+)
+from data.rlbench_seen12 import (  # noqa: E402
+    DEFAULT_TRAIN_CONFIG_NAME,
+    Seen12DataContract,
+    load_seen12_data_contract,
+)
+from planner.contract import (  # noqa: E402
+    ACTION_WHITELIST,
+    POSE_ADJUST_ACTION,
+    derive_code_policy,
+    instruction_contract_text,
+    normalize_planner_subtask,
+)
 
 
 @dataclass(frozen=True)
@@ -111,7 +110,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raw-root", type=Path, default=DEFAULT_RAW_ROOT)
     parser.add_argument("--lerobot-root", type=Path, default=DEFAULT_LEROBOT_ROOT)
     parser.add_argument("--phase-label", type=Path, default=DEFAULT_PHASE_LABEL)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help=(
+            f"Output cache path. Defaults to {DEFAULT_OUTPUT} for train_lerobot; "
+            "raw_validation requires an explicit path."
+        ),
+    )
+    parser.add_argument(
+        "--cache-role",
+        choices=(TRAIN_CACHE_ROLE, RAW_VALIDATION_CACHE_ROLE),
+        default=TRAIN_CACHE_ROLE,
+        help=(
+            "train_lerobot requires conversion metadata and is training-indexable; "
+            "raw_validation uses raw episode keys and is never training-eligible."
+        ),
+    )
     parser.add_argument("--debug-dir", type=Path, default=None)
     parser.add_argument("--rlbench-root", type=Path, default=DEFAULT_RLBENCH_ROOT)
     parser.add_argument("--tasks", nargs="*", default=None)
@@ -134,9 +150,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Raw-to-LeRobot temporal stride. If omitted, infer it per episode from "
-            "the conversion progress frame count."
+            "Raw-to-LeRobot temporal stride. If omitted, require one unique stride "
+            "shared by every Seen12 episode. An explicit value is still checked "
+            "against all 1200 episodes."
         ),
+    )
+    parser.add_argument(
+        "--train-config-name",
+        default=DEFAULT_TRAIN_CONFIG_NAME,
+        help="OpenPI TrainConfig used as the unique Seen12/norm-stats source.",
     )
     parser.add_argument("--image-max-size", type=int, default=256)
     parser.add_argument("--jpeg-quality", type=int, default=80)
@@ -168,6 +190,12 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--retry-review requires --resume.")
     if args.resume and args.overwrite:
         raise ValueError("--resume and --overwrite cannot be used together.")
+    if args.output is None:
+        if args.cache_role == RAW_VALIDATION_CACHE_ROLE:
+            raise ValueError("--output is required for raw_validation to protect the train cache path.")
+        args.output = DEFAULT_OUTPUT
+    if args.cache_role == RAW_VALIDATION_CACHE_ROLE and args.action_stride is not None:
+        raise ValueError("--action-stride is invalid for raw_validation; no LeRobot mapping is created.")
     return args
 
 
@@ -247,6 +275,7 @@ def load_conversion_records(lerobot_root: Path) -> dict[str, dict[str, Any]]:
     if not progress_path.is_file():
         raise FileNotFoundError(f"Conversion progress log not found: {progress_path}")
     records: dict[str, dict[str, Any]] = {}
+    seen_indices: set[int] = set()
     with progress_path.open("r", encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
@@ -255,7 +284,16 @@ def load_conversion_records(lerobot_root: Path) -> dict[str, dict[str, Any]]:
             record = json.loads(line)
             raw_key = record.get("raw_episode_key")
             if raw_key:
-                records[str(raw_key)] = record
+                raw_key = str(raw_key)
+                if raw_key in records:
+                    raise ValueError(f"Duplicate raw_episode_key in {progress_path}: {raw_key}")
+                output_index = int(record["output_episode_index"])
+                if output_index in seen_indices:
+                    raise ValueError(
+                        f"Duplicate output_episode_index in {progress_path}: {output_index}"
+                    )
+                seen_indices.add(output_index)
+                records[raw_key] = record
     return records
 
 
@@ -285,6 +323,7 @@ def collect_episode_specs(
     episode_keys: list[str] | None,
     max_episodes: int | None,
     max_episodes_per_task: int | None,
+    allowed_episode_indices: set[int] | None = None,
 ) -> list[EpisodeSpec]:
     if not raw_root.is_dir():
         raise FileNotFoundError(f"Raw root not found: {raw_root}")
@@ -330,6 +369,8 @@ def collect_episode_specs(
                 record = conversion_records.get(raw_key)
                 output_index = None if record is None else int(record["output_episode_index"])
                 lerobot_frames = None if record is None else int(record["frames"])
+                if allowed_episode_indices is not None and output_index not in allowed_episode_indices:
+                    continue
                 specs.append(
                     EpisodeSpec(
                         task_name=task_name,
@@ -352,6 +393,47 @@ def collect_episode_specs(
         if missing:
             raise FileNotFoundError(f"Requested episode keys not found: {missing}")
     return specs
+
+
+def filter_episode_specs(
+    specs: list[EpisodeSpec],
+    *,
+    tasks: list[str] | None,
+    variations: list[str] | None,
+    episode_keys: list[str] | None,
+    max_episodes: int | None,
+    max_episodes_per_task: int | None,
+) -> list[EpisodeSpec]:
+    """在完整 Seen12 契约校验后应用调试过滤，避免小子集影响 stride 推断。"""
+
+    requested_tasks = set(tasks or [])
+    requested_variations = {normalize_variation(item) for item in (variations or [])}
+    requested_keys = set(episode_keys or [])
+    selected: list[EpisodeSpec] = []
+    per_task_count: dict[str, int] = {}
+    for spec in specs:
+        if requested_tasks and spec.task_name not in requested_tasks:
+            continue
+        if requested_variations and spec.variation not in requested_variations:
+            continue
+        if requested_keys and spec.raw_episode_key not in requested_keys:
+            continue
+        if (
+            max_episodes_per_task is not None
+            and per_task_count.get(spec.task_name, 0) >= max_episodes_per_task
+        ):
+            continue
+        selected.append(spec)
+        per_task_count[spec.task_name] = per_task_count.get(spec.task_name, 0) + 1
+        if max_episodes is not None and len(selected) >= max_episodes:
+            break
+
+    if requested_keys:
+        found = {spec.raw_episode_key for spec in selected}
+        missing = sorted(requested_keys - found)
+        if missing:
+            raise FileNotFoundError(f"Requested episode keys not found in Seen12: {missing}")
+    return selected
 
 
 # 用目录名中的数字后缀排序，例如 variation2 在 variation10 前面。
@@ -476,26 +558,79 @@ def build_kept_indices(num_raw_frames: int, action_stride: int) -> list[int]:
     return kept
 
 
-# 根据 conversion progress 中的 LeRobot 帧数反推 action_stride。
-def infer_action_stride(num_raw_frames: int, lerobot_frames: int | None) -> tuple[int, list[str]]:
-    warnings_out: list[str] = []
-    if lerobot_frames is None or lerobot_frames <= 0:
-        warnings_out.append("action_stride_infer_failed:missing_lerobot_frames;fallback=1")
-        return 1, warnings_out
-    matches = [
+# 返回单个 episode 与转换帧数相容的全部 stride；不在这里猜一个答案。
+def candidate_action_strides(num_raw_frames: int, lerobot_frames: int) -> set[int]:
+    if num_raw_frames < 2:
+        raise ValueError(f"Raw episode must contain at least 2 frames, got {num_raw_frames}.")
+    if lerobot_frames < 1:
+        raise ValueError(f"LeRobot episode must contain at least 1 frame, got {lerobot_frames}.")
+    return {
         stride
-        for stride in range(1, max(2, num_raw_frames + 1))
+        for stride in range(1, num_raw_frames + 1)
         if len(build_kept_indices(num_raw_frames, stride)) - 1 == lerobot_frames
-    ]
-    if not matches:
-        warnings_out.append(
-            f"action_stride_infer_failed:raw_frames={num_raw_frames},"
-            f"lerobot_frames={lerobot_frames};fallback=1"
+    }
+
+
+def read_raw_step_count(spec: EpisodeSpec) -> int:
+    """从转换前产物读取帧数，避免为 stride 校验反序列化 1200 条轨迹。"""
+
+    meta_path = spec.episode_dir / "meta.json"
+    if not meta_path.is_file():
+        raise FileNotFoundError(f"Raw episode metadata not found: {meta_path}")
+    try:
+        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        step_count = int(payload["step_count"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid step_count in {meta_path}.") from exc
+    if step_count < 2:
+        raise ValueError(f"Invalid step_count={step_count} in {meta_path}.")
+    return step_count
+
+
+def resolve_global_action_stride(
+    specs: list[EpisodeSpec],
+    *,
+    explicit_stride: int | None,
+) -> int:
+    """对完整 Seen12 求唯一全局 stride；显式值也必须逐 episode 验证。"""
+
+    if not specs:
+        raise ValueError("Cannot resolve action_stride from an empty episode set.")
+    candidates: set[int] | None = None
+    mismatches: list[str] = []
+    for spec in specs:
+        if spec.lerobot_frames is None:
+            mismatches.append(f"{spec.raw_episode_key}: missing lerobot_frames")
+            continue
+        raw_frames = read_raw_step_count(spec)
+        episode_candidates = candidate_action_strides(raw_frames, spec.lerobot_frames)
+        if explicit_stride is not None:
+            if explicit_stride not in episode_candidates:
+                mismatches.append(
+                    f"{spec.raw_episode_key}: raw={raw_frames},"
+                    f"lerobot={spec.lerobot_frames},candidates={sorted(episode_candidates)}"
+                )
+            continue
+        candidates = (
+            set(episode_candidates)
+            if candidates is None
+            else candidates.intersection(episode_candidates)
         )
-        return 1, warnings_out
-    if len(matches) > 1:
-        warnings_out.append(f"action_stride_infer_ambiguous:matches={matches};use={matches[0]}")
-    return int(matches[0]), warnings_out
+
+    if mismatches:
+        preview = "; ".join(mismatches[:5])
+        raise ValueError(
+            f"action_stride validation failed for {len(mismatches)}/{len(specs)} episodes: "
+            f"{preview}"
+        )
+    if explicit_stride is not None:
+        return explicit_stride
+    if candidates is None or len(candidates) != 1:
+        raise ValueError(
+            "Seen12 must imply exactly one global action_stride; "
+            f"intersection={sorted(candidates or set())}."
+        )
+    return next(iter(candidates))
 
 
 # 将 raw 边界映射到 LeRobot frame index；end 取不超过 raw_end 的最后一个 kept frame。
@@ -606,8 +741,8 @@ def build_system_prompt() -> str:
         f"Allowed action labels: {allowed}.\n"
         "Do not invent action labels outside the allowed list. Do not remove phase_prior actions "
         "unless the input explicitly says they are optional.\n"
-        "pose-adjust is allowed only as an extra planning/segmentation label; if used, set "
-        "code_policy to map_to_neighbor or always_off.\n"
+        "pose-adjust is allowed only as an extra planning/segmentation label.\n"
+        "Output only planner-owned fields; code_policy is derived by the runtime.\n"
         "The output must be strict JSON only. Do not wrap it in markdown. Do not provide hidden "
         "chain-of-thought; use at most short boundary_reason strings."
     )
@@ -652,11 +787,11 @@ Important rules:
 4. raw_start_frame and raw_end_frame are inclusive raw RLBench frame indices.
 5. The first segment must start at 0. The last segment must end at {num_raw_frames - 1}.
 6. action must match the CSV phase at the same order, unless you insert an extra pose-adjust segment.
-7. If pose-adjust is inserted, code_policy must be map_to_neighbor or always_off.
-8. Each instruction must be an English subtask instruction derived from the longest_task_instruction.
-9. Keep instruction short but specific, for example "approach the drawer handle".
-10. confidence must be a number between 0 and 1.
-11. If keyframe_candidates look inaccurate, rely on phase_prior plus visual temporal order and set needs_review=true only when boundaries remain uncertain.
+7. Do not output code_policy; runtime code derives it deterministically from action.
+8. confidence must be a number between 0 and 1.
+9. If keyframe_candidates look inaccurate, rely on phase_prior plus visual temporal order and set needs_review=true only when boundaries remain uncertain.
+
+{instruction_contract_text()}
 
 Return exactly this JSON object:
 {{
@@ -668,7 +803,6 @@ Return exactly this JSON object:
       "instruction": "approach the target object",
       "raw_start_frame": 0,
       "raw_end_frame": 10,
-      "code_policy": "normal",
       "confidence": 0.8,
       "boundary_reason": "short visible evidence only"
     }}
@@ -806,13 +940,13 @@ def parse_json_response(text: str) -> dict[str, Any]:
     return data
 
 
-# 校验 API 输出，并补齐 LeRobot frame 边界。
+# 校验 API 输出；train cache 才补齐 LeRobot frame 边界。
 def normalize_api_result(
     *,
     data: dict[str, Any],
     spec: EpisodeSpec,
     num_raw_frames: int,
-    kept_indices: list[int],
+    kept_indices: list[int] | None,
 ) -> tuple[dict[str, Any], list[str]]:
     reasons: list[str] = []
     hard_errors: list[str] = []
@@ -822,19 +956,21 @@ def normalize_api_result(
 
     normalized: list[dict[str, Any]] = []
     previous_end = -1
+    previous_lerobot_end = -1
+    phase_position = 0
     for index, segment in enumerate(segments_in):
         if not isinstance(segment, dict):
             raise TypeError(f"segments[{index}] must be an object.")
-        action = str(segment.get("action", "")).strip()
-        if action not in ACTION_WHITELIST:
-            raise ValueError(f"segments[{index}].action is unsupported: {action!r}")
-        if action != "pose-adjust" and index < len(spec.phase_prior):
-            expected = spec.phase_prior[index]
+        subtask = normalize_planner_subtask(segment)
+        action = subtask.action
+        if action != POSE_ADJUST_ACTION and phase_position < len(spec.phase_prior):
+            expected = spec.phase_prior[phase_position]
             if action != expected:
-                reasons.append(f"phase_mismatch:index={index},expected={expected},got={action}")
-        instruction = str(segment.get("instruction", "")).strip()
-        if not instruction:
-            raise ValueError(f"segments[{index}].instruction is empty.")
+                reasons.append(
+                    f"phase_mismatch:phase_index={phase_position},expected={expected},got={action}"
+                )
+            phase_position += 1
+        instruction = subtask.instruction
         start = int(segment.get("raw_start_frame"))
         end = int(segment.get("raw_end_frame"))
         if start < 0 or end < start or end >= num_raw_frames:
@@ -847,12 +983,7 @@ def normalize_api_result(
         if previous_end >= 0 and start != previous_end + 1:
             hard_errors.append(f"gap_or_overlap:index={index},prev_end={previous_end},start={start}")
         previous_end = end
-        code_policy = str(segment.get("code_policy", "normal")).strip() or "normal"
-        if action == "pose-adjust" and code_policy == "normal":
-            reasons.append("pose_adjust_code_policy_adjusted:normal->map_to_neighbor")
-            code_policy = "map_to_neighbor"
-        if action != "pose-adjust" and code_policy not in {"normal", "map_to_neighbor", "always_off"}:
-            reasons.append(f"unknown_code_policy:{code_policy}")
+        code_policy = derive_code_policy(action)
         confidence = segment.get("confidence", None)
         try:
             confidence_value = float(confidence)
@@ -860,6 +991,22 @@ def normalize_api_result(
             confidence_value = 0.0
             reasons.append(f"missing_or_invalid_confidence:index={index}")
         confidence_value = max(0.0, min(1.0, confidence_value))
+        lerobot_start = None
+        lerobot_end = None
+        if kept_indices is not None:
+            lerobot_start = raw_to_lerobot_frame(start, kept_indices, is_end=False)
+            lerobot_end = raw_to_lerobot_frame(end, kept_indices, is_end=True)
+            if lerobot_end < lerobot_start:
+                hard_errors.append(
+                    f"empty_lerobot_segment:index={index},raw={start}-{end},"
+                    f"lerobot={lerobot_start}-{lerobot_end}"
+                )
+            if lerobot_start != previous_lerobot_end + 1:
+                hard_errors.append(
+                    f"lerobot_gap_or_overlap:index={index},"
+                    f"prev_end={previous_lerobot_end},start={lerobot_start}"
+                )
+            previous_lerobot_end = lerobot_end
         normalized.append(
             {
                 "segment_index": index,
@@ -867,8 +1014,8 @@ def normalize_api_result(
                 "instruction": instruction,
                 "raw_start_frame": start,
                 "raw_end_frame": end,
-                "lerobot_start_frame": raw_to_lerobot_frame(start, kept_indices, is_end=False),
-                "lerobot_end_frame": raw_to_lerobot_frame(end, kept_indices, is_end=True),
+                "lerobot_start_frame": lerobot_start,
+                "lerobot_end_frame": lerobot_end,
                 "code_policy": code_policy,
                 "confidence": confidence_value,
                 "boundary_reason": str(segment.get("boundary_reason", "")).strip(),
@@ -879,7 +1026,14 @@ def normalize_api_result(
         hard_errors.append(
             f"last_segment_end_mismatch:{normalized[-1]['raw_end_frame']}!={num_raw_frames - 1}"
         )
-    phase_actions = [seg["action"] for seg in normalized if seg["action"] != "pose-adjust"]
+    if kept_indices is not None:
+        expected_lerobot_frames = max(0, len(kept_indices) - 1)
+        if previous_lerobot_end != expected_lerobot_frames - 1:
+            hard_errors.append(
+                f"lerobot_coverage_mismatch:last_end={previous_lerobot_end},"
+                f"expected={expected_lerobot_frames - 1}"
+            )
+    phase_actions = [seg["action"] for seg in normalized if seg["action"] != POSE_ADJUST_ACTION]
     if phase_actions != spec.phase_prior:
         hard_errors.append(f"phase_sequence_mismatch:expected={spec.phase_prior},got={phase_actions}")
 
@@ -918,7 +1072,7 @@ def run_api_for_episode(
     user_prompt: str,
     image_inputs: list[ImageInput],
     num_raw_frames: int,
-    kept_indices: list[int],
+    kept_indices: list[int] | None,
     args: argparse.Namespace,
     debug_dir: Path,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1025,9 +1179,13 @@ def atomic_write_json(path: Path, payload: Any) -> None:
 
 
 # 初始化或恢复总 cache；重复字段统一放在 meta。
-def init_cache(args: argparse.Namespace) -> dict[str, Any]:
+def init_cache(
+    args: argparse.Namespace,
+    *,
+    expected_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if args.output.exists() and args.overwrite:
-        return build_empty_cache(args)
+        return build_empty_cache(args, extra_metadata=expected_metadata)
     if args.output.exists():
         if not args.resume:
             raise FileExistsError(
@@ -1037,15 +1195,47 @@ def init_cache(args: argparse.Namespace) -> dict[str, Any]:
             cache = json.load(handle)
         if "episodes" not in cache or not isinstance(cache["episodes"], dict):
             raise ValueError(f"Existing cache has invalid format: {args.output}")
+        meta = cache.get("meta")
+        if not isinstance(meta, dict):
+            raise ValueError(f"Existing cache is missing meta: {args.output}")
+        if meta.get("schema_version") != CACHE_SCHEMA_VERSION:
+            raise ValueError(
+                f"Existing cache schema_version={meta.get('schema_version')!r} is incompatible with "
+                f"{CACHE_SCHEMA_VERSION!r}. Rebuild with --overwrite."
+            )
+        if meta.get("instruction_contract_version") != INSTRUCTION_CONTRACT_VERSION:
+            raise ValueError(
+                "Existing cache lacks the current instruction contract. Rebuild with --overwrite "
+                "so offline and online Planner outputs remain comparable."
+            )
+        existing_role = detect_cache_role(cache)
+        if existing_role != args.cache_role:
+            raise ValueError(
+                f"Existing cache_role={existing_role!r} does not match "
+                f"--cache-role={args.cache_role!r}."
+            )
+        # Persist the explicit role when resuming a homogeneous legacy cache.
+        meta["cache_role"] = existing_role
+        for key, expected_value in (expected_metadata or {}).items():
+            if meta.get(key) != expected_value:
+                raise ValueError(
+                    f"Existing cache meta.{key}={meta.get(key)!r} does not match "
+                    f"the current data contract {expected_value!r}. Rebuild with --overwrite."
+                )
         return cache
-    return build_empty_cache(args)
+    return build_empty_cache(args, extra_metadata=expected_metadata)
 
 
 # 构造空 cache 的统一 meta。
-def build_empty_cache(args: argparse.Namespace) -> dict[str, Any]:
-    return {
-        "meta": {
-            "schema_version": "vqap_subtask_cache_v1",
+def build_empty_cache(
+    args: argparse.Namespace,
+    *,
+    extra_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    meta = {
+            "schema_version": CACHE_SCHEMA_VERSION,
+            "instruction_contract_version": INSTRUCTION_CONTRACT_VERSION,
+            "cache_role": args.cache_role,
             "source": "qwen_vl_api",
             "model": args.model,
             "action_space": "delta",
@@ -1056,7 +1246,10 @@ def build_empty_cache(args: argparse.Namespace) -> dict[str, Any]:
             "cameras": parse_cameras(args.cameras),
             "created_at": utc_now_iso(),
             "updated_at": utc_now_iso(),
-        },
+        }
+    meta.update(extra_metadata or {})
+    return {
+        "meta": meta,
         "episodes": {},
     }
 
@@ -1074,7 +1267,7 @@ def build_episode_record(
     *,
     spec: EpisodeSpec,
     num_raw_frames: int,
-    kept_indices: list[int],
+    kept_indices: list[int] | None,
     sampled_frames: list[int],
     keyframes: list[int],
     keyframe_warnings: list[str],
@@ -1082,12 +1275,18 @@ def build_episode_record(
     prompt_debug_path: Path,
     api_result: dict[str, Any] | None,
     api_meta: dict[str, Any] | None,
-    action_stride: int,
+    action_stride: int | None,
     dry_run: bool,
 ) -> dict[str, Any]:
-    expected_lerobot_frames = max(0, len(kept_indices) - 1)
+    expected_lerobot_frames = (
+        None if kept_indices is None else max(0, len(kept_indices) - 1)
+    )
     warnings = list(keyframe_warnings) + list(image_warnings)
-    if spec.lerobot_frames is not None and spec.lerobot_frames != expected_lerobot_frames:
+    if (
+        expected_lerobot_frames is not None
+        and spec.lerobot_frames is not None
+        and spec.lerobot_frames != expected_lerobot_frames
+    ):
         warnings.append(
             f"lerobot_frame_count_mismatch:progress={spec.lerobot_frames},"
             f"reconstructed={expected_lerobot_frames}"
@@ -1104,11 +1303,19 @@ def build_episode_record(
         "phase_prior": spec.phase_prior,
         "keyframe_candidates": keyframes,
         "sampled_frames": sampled_frames,
-        "frame_mapping": {
-            "method": "reconstructed_kept_indices_from_action_stride",
-            "action_stride": action_stride,
-            "kept_indices_count": len(kept_indices),
-        },
+        "frame_mapping": (
+            {
+                "method": "raw_only_no_lerobot_conversion",
+                "action_stride": None,
+                "kept_indices_count": None,
+            }
+            if kept_indices is None
+            else {
+                "method": "reconstructed_kept_indices_from_action_stride",
+                "action_stride": action_stride,
+                "kept_indices_count": len(kept_indices),
+            }
+        ),
         "dry_run": dry_run,
         "needs_review": True if dry_run else bool(api_result and api_result.get("needs_review")),
         "review_reasons": ["dry_run_no_api_call"] if dry_run else list(api_result.get("review_reasons", [])),
@@ -1130,27 +1337,103 @@ def main() -> int:
     debug_dir = args.debug_dir or (args.output.parent / "debug")
 
     phase_labels = load_phase_labels(args.phase_label)
-    conversion_records = load_conversion_records(args.lerobot_root)
-    specs = collect_episode_specs(
-        raw_root=args.raw_root,
-        phase_labels=phase_labels,
-        conversion_records=conversion_records,
-        tasks=args.tasks,
-        variations=args.variations,
-        episode_keys=args.episode_keys,
-        max_episodes=args.max_episodes,
-        max_episodes_per_task=args.max_episodes_per_task,
+    conversion_records = (
+        load_conversion_records(args.lerobot_root)
+        if args.cache_role == TRAIN_CACHE_ROLE
+        else {}
     )
+    contract: Seen12DataContract | None = None
+    global_action_stride: int | None = None
+    cache_contract_metadata: dict[str, Any] = {}
+    if args.cache_role == TRAIN_CACHE_ROLE:
+        # 本工具不执行 JAX 运算；强制 config 导入走 CPU，避免与并行实验占用的 GPU 冲突。
+        os.environ.setdefault("JAX_PLATFORMS", "cpu")
+        contract = load_seen12_data_contract(args.train_config_name)
+        expected_indices = set(contract.episode_indices)
+        contract_specs = collect_episode_specs(
+            raw_root=args.raw_root,
+            phase_labels=phase_labels,
+            conversion_records=conversion_records,
+            tasks=None,
+            variations=None,
+            episode_keys=None,
+            max_episodes=None,
+            max_episodes_per_task=None,
+            allowed_episode_indices=expected_indices,
+        )
+        actual_indices = {
+            spec.output_episode_index
+            for spec in contract_specs
+            if spec.output_episode_index is not None
+        }
+        missing_indices = sorted(expected_indices - actual_indices)
+        unexpected_indices = sorted(actual_indices - expected_indices)
+        if missing_indices or unexpected_indices or len(contract_specs) != len(expected_indices):
+            raise ValueError(
+                "Raw/conversion mapping does not exactly cover Seen12: "
+                f"expected={len(expected_indices)}, specs={len(contract_specs)}, "
+                f"missing={missing_indices[:10]}, unexpected={unexpected_indices[:10]}."
+            )
+        global_action_stride = resolve_global_action_stride(
+            contract_specs,
+            explicit_stride=args.action_stride,
+        )
+        specs = filter_episode_specs(
+            contract_specs,
+            tasks=args.tasks,
+            variations=args.variations,
+            episode_keys=args.episode_keys,
+            max_episodes=args.max_episodes,
+            max_episodes_per_task=args.max_episodes_per_task,
+        )
+        cache_contract_metadata = {
+            **contract.cache_metadata(),
+            "action_stride": global_action_stride,
+        }
+        print(
+            "[build_subtask_cache] data-contract "
+            f"config={contract.config_name} episodes={len(contract_specs)} "
+            f"stride={global_action_stride} norm_stats={contract.norm_stats_path}",
+            flush=True,
+        )
+    else:
+        specs = collect_episode_specs(
+            raw_root=args.raw_root,
+            phase_labels=phase_labels,
+            conversion_records=conversion_records,
+            tasks=args.tasks,
+            variations=args.variations,
+            episode_keys=args.episode_keys,
+            max_episodes=args.max_episodes,
+            max_episodes_per_task=args.max_episodes_per_task,
+        )
     if not specs:
         print("[build_subtask_cache] no episode selected.")
         return 0
+    if args.cache_role == TRAIN_CACHE_ROLE:
+        missing_conversion = [
+            spec.raw_episode_key
+            for spec in specs
+            if spec.output_episode_index is None or spec.lerobot_frames is None
+        ]
+        if missing_conversion:
+            preview = ", ".join(missing_conversion[:5])
+            raise ValueError(
+                f"train_lerobot requires conversion metadata for every selected episode; "
+                f"missing={len(missing_conversion)} ({preview})."
+            )
 
-    cache = build_empty_cache(args) if args.dry_run else init_cache(args)
+    cache = (
+        build_empty_cache(args, extra_metadata=cache_contract_metadata)
+        if args.dry_run
+        else init_cache(args, expected_metadata=cache_contract_metadata)
+    )
     processed = 0
     skipped = 0
     total = len(specs)
     print(
         f"[build_subtask_cache] selected={total} output={args.output} "
+        f"cache_role={args.cache_role} "
         f"dry_run={args.dry_run} resume={args.resume} overwrite={args.overwrite} "
         f"retry_review={args.retry_review}",
         flush=True,
@@ -1158,7 +1441,11 @@ def main() -> int:
 
     for position, spec in enumerate(specs, start=1):
         progress = f"[{position}/{total}]"
-        cache_key = str(spec.output_episode_index) if spec.output_episode_index is not None else spec.raw_episode_key
+        cache_key = (
+            str(spec.output_episode_index)
+            if args.cache_role == TRAIN_CACHE_ROLE
+            else spec.raw_episode_key
+        )
         if not args.dry_run and args.resume and cache_key in cache["episodes"] and not args.overwrite:
             existing_record = cache["episodes"][cache_key]
             should_retry_review = (
@@ -1178,14 +1465,19 @@ def main() -> int:
 
         demo = load_demo(spec.episode_dir, args.rlbench_root)
         num_raw_frames = len(demo)
-        effective_action_stride = args.action_stride
-        stride_warnings: list[str] = []
-        if effective_action_stride is None:
-            effective_action_stride, stride_warnings = infer_action_stride(
-                num_raw_frames,
-                spec.lerobot_frames,
-            )
-        kept_indices = build_kept_indices(num_raw_frames, effective_action_stride)
+        effective_action_stride: int | None = None
+        kept_indices: list[int] | None = None
+        if args.cache_role == TRAIN_CACHE_ROLE:
+            effective_action_stride = global_action_stride
+            if effective_action_stride is None:
+                raise RuntimeError("Resolved global action_stride is unexpectedly missing.")
+            kept_indices = build_kept_indices(num_raw_frames, effective_action_stride)
+            reconstructed_frames = len(kept_indices) - 1
+            if reconstructed_frames != spec.lerobot_frames:
+                raise ValueError(
+                    f"Runtime frame mapping drift for {spec.raw_episode_key}: "
+                    f"reconstructed={reconstructed_frames}, progress={spec.lerobot_frames}."
+                )
         keyframes, keyframe_debug, keyframe_warnings = extract_keyframe_candidates(
             demo,
             enabled=not args.no_keyframes,
@@ -1263,7 +1555,7 @@ def main() -> int:
             sampled_frames=sampled_frames,
             keyframes=keyframes,
             keyframe_warnings=keyframe_warnings,
-            image_warnings=stride_warnings + image_warnings,
+            image_warnings=image_warnings,
             prompt_debug_path=prompt_debug_path,
             api_result=api_result,
             api_meta=api_meta,
