@@ -29,4 +29,3 @@ tools/
 !tools/
 tools/*
 !tools/verify_planner_cache.py
-tools/verify_planner_cache.py
