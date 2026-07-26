@@ -14,12 +14,9 @@ from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping
 
 from planner.contract import (
-    ACTION_WHITELIST,
     PLANNER_SEMANTIC_CONTRACT_VERSION,
-    POSE_ADJUST_ACTION,
     PlannerContractError,
     derive_code_policy,
-    instruction_contract_text,
     normalize_planner_subtask,
 )
 
@@ -69,6 +66,10 @@ class PlannerCacheValidationReport:
     lerobot_geometry_checked: bool = False
     conversion_checked: bool = False
     training_eligible: bool = False
+    expected_episode_count: int | None = None
+    actual_episode_count: int = 0
+    missing_episode_count: int = 0
+    unexpected_episode_count: int = 0
     issues: list[ValidationIssue] = field(default_factory=list)
 
     def add(
@@ -103,6 +104,10 @@ class PlannerCacheValidationReport:
             "lerobot_geometry_checked": self.lerobot_geometry_checked,
             "conversion_checked": self.conversion_checked,
             "training_eligible": self.training_eligible,
+            "expected_episode_count": self.expected_episode_count,
+            "actual_episode_count": self.actual_episode_count,
+            "missing_episode_count": self.missing_episode_count,
+            "unexpected_episode_count": self.unexpected_episode_count,
             "error_count": len(self.errors),
             "warning_count": len(self.warnings),
             "valid": self.is_valid,
@@ -483,7 +488,17 @@ def _iter_episodes(
             report.add("error", "dry_run_record", "Dry-run cache records cannot be used for training.", episode_key=key)
         episodes.append(episode)
     report.checked_episodes = len(episodes)
+    report.actual_episode_count = len(episodes)
     return episodes
+
+
+def _converted_frame_count(num_raw_frames: int, action_stride: int) -> int:
+    if num_raw_frames < 1 or action_stride < 1:
+        return 0
+    kept = list(range(0, num_raw_frames, action_stride))
+    if kept[-1] != num_raw_frames - 1:
+        kept.append(num_raw_frames - 1)
+    return len(kept) - 1
 
 
 def validate_cache_payload(
@@ -514,6 +529,7 @@ def validate_cache_payload(
         )
 
     meta = payload.get("meta")
+    action_stride: int | None = None
     if not isinstance(meta, dict):
         report.add("error", "invalid_meta", "Top-level meta must be an object.")
     else:
@@ -547,7 +563,52 @@ def validate_cache_payload(
                 "legacy_instruction_contract",
                 "Cache predates explicit instruction_contract_version; rebuild before formal M1 training.",
             )
-    _iter_episodes(payload, report, cache_role=cache_role)
+        if cache_role == TRAIN_CACHE_ROLE:
+            try:
+                action_stride = _as_int(
+                    meta.get("action_stride"),
+                    "meta.action_stride",
+                    episode_key="meta",
+                )
+            except PlannerCacheError as exc:
+                report.add("error", "invalid_action_stride", str(exc))
+            else:
+                if action_stride < 1:
+                    report.add(
+                        "error",
+                        "invalid_action_stride",
+                        f"meta.action_stride must be >= 1, got {action_stride}.",
+                    )
+    episodes = _iter_episodes(payload, report, cache_role=cache_role)
+    if cache_role == TRAIN_CACHE_ROLE and action_stride is not None and action_stride >= 1:
+        records = payload.get("episodes", {})
+        for episode in episodes:
+            expected_frames = _converted_frame_count(episode.all_frames, action_stride)
+            if episode.lerobot_frames != expected_frames:
+                report.add(
+                    "error",
+                    "action_stride_geometry_mismatch",
+                    f"meta.action_stride={action_stride} reconstructs {expected_frames} frames, "
+                    f"but record stores {episode.lerobot_frames}.",
+                    episode_key=episode.cache_key,
+                )
+            record = records.get(episode.cache_key, {})
+            frame_mapping = record.get("frame_mapping") if isinstance(record, dict) else None
+            if not isinstance(frame_mapping, dict):
+                report.add(
+                    "error",
+                    "missing_frame_mapping",
+                    "train_lerobot record requires frame_mapping metadata.",
+                    episode_key=episode.cache_key,
+                )
+            elif frame_mapping.get("action_stride") != action_stride:
+                report.add(
+                    "error",
+                    "record_action_stride_mismatch",
+                    f"frame_mapping.action_stride={frame_mapping.get('action_stride')!r} "
+                    f"does not match meta.action_stride={action_stride}.",
+                    episode_key=episode.cache_key,
+                )
     return report
 
 
@@ -592,6 +653,8 @@ def validate_against_conversion_progress(
     conversion_progress_path: str | Path,
     *,
     require_complete: bool = False,
+    expected_episode_indices: Iterable[int] | None = None,
+    expected_metadata: Mapping[str, Any] | None = None,
 ) -> PlannerCacheValidationReport:
     """校验 cache 的 episode id、raw key 与 LeRobot 帧数是否对应转换产物。"""
 
@@ -607,6 +670,19 @@ def validate_against_conversion_progress(
     except (FileNotFoundError, PlannerCacheError) as exc:
         report.add("error", "invalid_conversion_progress", str(exc))
         return report
+
+    meta = payload.get("meta")
+    if expected_metadata is not None:
+        if not isinstance(meta, dict):
+            report.add("error", "invalid_meta", "Cannot validate expected metadata.")
+        else:
+            for key, expected_value in expected_metadata.items():
+                if meta.get(key) != expected_value:
+                    report.add(
+                        "error",
+                        "cache_metadata_mismatch",
+                        f"meta.{key}={meta.get(key)!r}, expected {expected_value!r}.",
+                    )
 
     cache_episode_indices: set[int] = set()
     for cache_key, record in payload["episodes"].items():
@@ -643,18 +719,52 @@ def validate_against_conversion_progress(
                 episode_key=str(cache_key),
             )
 
-    if require_complete:
-        missing_indices = sorted(set(progress_by_index) - cache_episode_indices)
-        for index in missing_indices:
-            report.add(
-                "error",
-                "episode_missing_from_cache",
-                f"Conversion episode {index} ({progress_by_index[index]['raw_episode_key']}) is missing from cache.",
-                episode_key=str(index),
-            )
+    expected_indices = (
+        None
+        if expected_episode_indices is None
+        else {int(index) for index in expected_episode_indices}
+    )
+    target_indices = set(progress_by_index) if expected_indices is None else expected_indices
+    report.expected_episode_count = len(target_indices)
+    missing_from_progress = sorted(target_indices - set(progress_by_index))
+    if missing_from_progress:
+        report.add(
+            "error",
+            "expected_episode_missing_from_progress",
+            f"{len(missing_from_progress)} expected episode(s) are absent from conversion progress; "
+            f"first={missing_from_progress[:10]}.",
+        )
+    unexpected_indices = (
+        []
+        if expected_indices is None
+        else sorted(cache_episode_indices - expected_indices)
+    )
+    missing_indices = sorted(target_indices - cache_episode_indices)
+    report.missing_episode_count = len(missing_indices)
+    report.unexpected_episode_count = len(unexpected_indices)
+    if unexpected_indices:
+        report.add(
+            "error",
+            "unexpected_episode_in_cache",
+            f"Cache contains {len(unexpected_indices)} episode(s) outside the expected set; "
+            f"first={unexpected_indices[:10]}.",
+        )
+    if require_complete and missing_indices:
+        report.add(
+            "error",
+            "episode_missing_from_cache",
+            f"Cache is missing {len(missing_indices)} expected episode(s); "
+            f"first={missing_indices[:10]}.",
+        )
     # A structurally valid partial cache is useful for smoke tests, but it must
     # not be advertised as training-ready without an explicit completeness gate.
-    report.training_eligible = report.is_valid and require_complete
+    report.training_eligible = (
+        report.is_valid
+        and require_complete
+        and not missing_indices
+        and not unexpected_indices
+        and not missing_from_progress
+    )
     return report
 
 
