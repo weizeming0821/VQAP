@@ -155,6 +155,30 @@ def parse_args() -> argparse.Namespace:
         help="Upper-bound test: replay demo next-frame poses through the same "
         "8D->10D->8D conversion and step pipeline, without loading any policy.",
     )
+    parser.add_argument(
+        "--replay-delta",
+        action="store_true",
+        help="Diagnostic: replay the GROUND-TRUTH delta actions (stride-3, computed "
+        "with the exact training-data function state_pair_to_delta_action) through the "
+        "policy's delta synthesis path (delta_action10_to_rlbench_action8). Isolates "
+        "whether the delta eval path can execute tasks when fed correct actions "
+        "(vs --replay-demo which validates the absolute path). No policy loaded.",
+    )
+    parser.add_argument(
+        "--predict-diag",
+        action="store_true",
+        help="Diagnostic: teacher-forced prediction accuracy. Keeps the arm ON the demo "
+        "trajectory (absolute replay) and at each stride-3 frame compares the policy's "
+        "predicted delta to the ground-truth delta, split into xyz/rot6d/grip and tagged "
+        "by gripper-transition (grasp/release) frames. Measures pure prediction accuracy "
+        "with no rollout drift. Loads the policy; writes error stats to --summary-json.",
+    )
+    parser.add_argument(
+        "--predict-diag-episodes",
+        type=int,
+        default=3,
+        help="Episodes per task for --predict-diag (default 3).",
+    )
     # ---- Exp0（原子动作动机实验，Exp_Design.md §三）----
     parser.add_argument(
         "--atom-mode",
@@ -1117,6 +1141,8 @@ def rollout_replay_episode(
     local_episode: int,
     gripper_threshold: float,
     recorder: EpisodeVideoRecorder | None = None,
+    use_delta: bool = False,
+    action_stride: int = 3,
 ) -> dict[str, Any]:
     from openpi.policies.rlbench_policy import _pose8_to_pose10
 
@@ -1129,17 +1155,35 @@ def rollout_replay_episode(
             local_episode=local_episode,
         )
 
-    # 与数据转换脚本一致：action[t] = demo 中 t+1 帧的 gripper_pose + gripper_open。
-    action10_sequence: list[np.ndarray] = []
-    for step_obs in list(demo)[1:]:
-        pose8 = np.concatenate(
+    def demo_pose8(step_obs) -> np.ndarray:
+        return np.concatenate(
             [
                 np.asarray(step_obs.gripper_pose, dtype=np.float32),
                 np.asarray([float(step_obs.gripper_open)], dtype=np.float32),
             ],
             axis=0,
         )
-        action10_sequence.append(_pose8_to_pose10(pose8))
+
+    # action10_sequence: 每步要下发的 10D 动作。
+    #  - absolute(默认): action[t] = demo t+1 帧的位姿(rot6d),经 policy_action10_to_rlbench_action8 直接下发。
+    #  - delta 诊断: 用训练数据同款 state_pair_to_delta_action 在 stride-3 保留帧间算真值 delta,
+    #    经 delta_action10_to_rlbench_action8(delta, 当前实际位姿) 合成——与 policy 评测路径完全一致。
+    action10_sequence: list[np.ndarray] = []
+    if use_delta:
+        from tools.convert_rlbench_data_to_lerobot import state_pair_to_delta_action
+
+        all_states = [demo_pose8(o) for o in list(demo)]
+        num_obs = len(all_states)
+        kept_indices = list(range(0, num_obs, max(1, action_stride)))
+        if kept_indices[-1] != num_obs - 1:
+            kept_indices.append(num_obs - 1)  # 补末帧,与转换脚本一致
+        kept_states = [all_states[i] for i in kept_indices]
+        for i in range(len(kept_states) - 1):
+            delta8 = state_pair_to_delta_action(kept_states[i], kept_states[i + 1])
+            action10_sequence.append(_pose8_to_pose10(delta8))  # [dxyz, rot6d(dquat), grip]
+    else:
+        for step_obs in list(demo)[1:]:
+            action10_sequence.append(_pose8_to_pose10(demo_pose8(step_obs)))
 
     error_type: str | None = None
     error_count = 0
@@ -1150,7 +1194,12 @@ def rollout_replay_episode(
     episode_start = time.monotonic()
 
     for step_index, action10 in enumerate(action10_sequence):
-        action8 = policy_action10_to_rlbench_action8(action10, gripper_threshold)
+        if use_delta:
+            action8 = delta_action10_to_rlbench_action8(
+                action10, np.asarray(obs.gripper_pose, dtype=np.float32), gripper_threshold
+            )
+        else:
+            action8 = policy_action10_to_rlbench_action8(action10, gripper_threshold)
         steps_taken = step_index + 1
         try:
             obs, reward, terminal = runtime.step(action8)
@@ -1530,9 +1579,83 @@ def rollout_atom_episode(
     }
 
 
+"""教师强制预测精度诊断：用 demo 绝对位姿让机械臂始终在轨(teacher forcing),
+在每个 stride-3 帧比较 policy 预测的 delta 与真值 delta。因手臂不偏离 demo 轨迹,
+测的是**纯预测精度**(无 rollout 累积漂移),用于定位"哪一阶段预测不准"。"""
+def rollout_predict_diag_episode(
+    policy,
+    runtime: RLBenchEvalRuntime,
+    *,
+    task_name: str,
+    variation: int,
+    local_episode: int,
+    gripper_threshold: float,
+    action_stride: int = 3,
+) -> dict[str, Any]:
+    from openpi.policies.rlbench_policy import _pose8_to_pose10
+    from tools.convert_rlbench_data_to_lerobot import state_pair_to_delta_action
+
+    obs, prompt, used_variation, demo = runtime.reset_to_demo(task_name, variation, local_episode)
+    all_states = [
+        np.concatenate(
+            [np.asarray(o.gripper_pose, dtype=np.float32), np.asarray([float(o.gripper_open)], dtype=np.float32)]
+        )
+        for o in list(demo)
+    ]
+    num_obs = len(all_states)
+    kept = list(range(0, num_obs, max(1, action_stride)))
+    if kept[-1] != num_obs - 1:
+        kept.append(num_obs - 1)
+
+    records: list[dict[str, Any]] = []
+    for ki in range(len(kept) - 1):
+        t, t_next = kept[ki], kept[ki + 1]
+        policy_obs = make_policy_observation(obs, prompt)
+        pred10 = np.asarray(policy.infer(policy_obs)["actions"], dtype=np.float32)[0]
+        gt10 = _pose8_to_pose10(state_pair_to_delta_action(all_states[t], all_states[t_next]))
+        grip_now = all_states[t][7] > 0.5
+        grip_next = all_states[t_next][7] > 0.5
+        records.append(
+            {
+                "frame": int(t),
+                "xyz_err": float(np.linalg.norm(pred10[:3] - gt10[:3])),
+                "rot6d_err": float(np.linalg.norm(pred10[3:9] - gt10[3:9])),
+                "grip_err": float(abs(float(pred10[9]) - float(gt10[9]))),
+                "is_grip_transition": bool(grip_now != grip_next),
+                "gt_xyz_mag": float(np.linalg.norm(gt10[:3])),
+            }
+        )
+        # 教师强制: 用 demo 绝对位姿逐帧推进到 t_next,让手臂回到 demo 轨迹。
+        broke = False
+        for tt in range(t + 1, t_next + 1):
+            action8 = policy_action10_to_rlbench_action8(_pose8_to_pose10(all_states[tt]), gripper_threshold)
+            try:
+                obs, _reward, terminal = runtime.step(action8)
+            except runtime.step_exceptions:
+                broke = True
+                break
+            if terminal:
+                break
+        if broke:
+            break
+    return {
+        "task": task_name,
+        "variation": used_variation,
+        "local_episode": local_episode,
+        "records": records,
+    }
+
+
 """主流程：解析配置、加载 policy、逐任务评测并写单日志汇总。"""
 def main() -> int:
     args = parse_args()
+    # --replay-delta 复用 --replay-demo 的全部分支(不加载 policy、checkpoint_source=replay 等),
+    # 仅在 rollout 时切到 delta 路径。二者不可同时指定。
+    if args.replay_delta and args.replay_demo:
+        raise ValueError("--replay-demo and --replay-delta are mutually exclusive.")
+    replay_use_delta = bool(args.replay_delta)
+    if args.replay_delta:
+        args.replay_demo = True
     config = apply_cli_overrides(load_yaml_config(args.config), args)
     if args.replay_demo:
         checkpoint_source = "replay"
@@ -1630,11 +1753,12 @@ def main() -> int:
             logger=logger,
         )
     else:
+        plan_eps = int(args.predict_diag_episodes) if args.predict_diag else episodes_per_task
         for task_name in task_names:
             task_root = split_root / task_name
             if not task_root.is_dir():
                 raise FileNotFoundError(f"Task raw data directory does not exist: {task_root}")
-            task_plans[task_name] = select_demo_subset(task_root, start_episode, episodes_per_task)
+            task_plans[task_name] = select_demo_subset(task_root, start_episode, plan_eps)
 
     logger.info("bash> %s", " ".join(sys.argv))
     logger.info("Log file: %s", log_path)
@@ -1844,6 +1968,85 @@ def main() -> int:
         logger.info("Next: watch the videos and fill human_success in %s", manifest_path)
         return 0
 
+    if args.predict_diag:
+        import numpy as _np
+
+        all_records: list[dict[str, Any]] = []
+        try:
+            runtime.launch()
+            for task_index, task_name in enumerate(task_names, start=1):
+                logger.info(
+                    "===== Predict-diag task %d/%d | %s =====", task_index, len(task_names), task_name
+                )
+                for (variation, local_episode) in task_plans[task_name]:
+                    ep = rollout_predict_diag_episode(
+                        policy,
+                        runtime,
+                        task_name=task_name,
+                        variation=variation,
+                        local_episode=local_episode,
+                        gripper_threshold=gripper_threshold,
+                        action_stride=3,
+                    )
+                    for r in ep["records"]:
+                        r["task"] = task_name
+                        all_records.append(r)
+        finally:
+            runtime.shutdown()
+
+        # 聚合: 逐任务 + 抓取/释放帧 vs 普通帧 的预测误差。
+        def agg(recs: list[dict[str, Any]]) -> dict[str, float]:
+            if not recs:
+                return {"n": 0}
+            return {
+                "n": len(recs),
+                "xyz_err": float(_np.mean([r["xyz_err"] for r in recs])),
+                "rot6d_err": float(_np.mean([r["rot6d_err"] for r in recs])),
+                "grip_err": float(_np.mean([r["grip_err"] for r in recs])),
+                "xyz_err_rel": float(
+                    _np.mean([r["xyz_err"] for r in recs]) / (_np.mean([r["gt_xyz_mag"] for r in recs]) + 1e-6)
+                ),
+            }
+
+        per_task = {}
+        for task_name in task_names:
+            recs = [r for r in all_records if r["task"] == task_name]
+            per_task[task_name] = {
+                "all": agg(recs),
+                "grip_transition": agg([r for r in recs if r["is_grip_transition"]]),
+                "non_transition": agg([r for r in recs if not r["is_grip_transition"]]),
+            }
+        summary = {
+            "checkpoint_dir": str(checkpoint_info["checkpoint_dir"]),
+            "episodes_per_task": int(args.predict_diag_episodes),
+            "note": (
+                "Teacher-forced 1-step prediction error (arm kept on demo trajectory). "
+                "xyz_err in meters, rot6d_err L2 on 6D rotation, grip_err on gripper scalar. "
+                "grip_transition = frames where gripper opens/closes (grasp/release moments)."
+            ),
+            "per_task": per_task,
+        }
+        summary_path = args.summary_json or (log_path.with_name(log_path.stem + "_predict_diag.json"))
+        with Path(summary_path).open("w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=2, ensure_ascii=True)
+        logger.info("Predict-diag summary written: %s", summary_path)
+        for task_name in task_names:
+            a = per_task[task_name]["all"]
+            g = per_task[task_name]["grip_transition"]
+            logger.info(
+                "predict-diag | %-28s all: xyz=%.4f rot6d=%.4f grip=%.3f (n=%d) | grasp-frames: xyz=%.4f rot6d=%.4f grip=%.3f (n=%d)",
+                task_name,
+                a.get("xyz_err", float("nan")),
+                a.get("rot6d_err", float("nan")),
+                a.get("grip_err", float("nan")),
+                a.get("n", 0),
+                g.get("xyz_err", float("nan")),
+                g.get("rot6d_err", float("nan")),
+                g.get("grip_err", float("nan")),
+                g.get("n", 0),
+            )
+        return 0
+
     eval_env_broken: EvalEnvironmentBroken | None = None
     try:
         runtime.launch()
@@ -1876,6 +2079,8 @@ def main() -> int:
                             local_episode=local_episode,
                             gripper_threshold=gripper_threshold,
                             recorder=recorder,
+                            use_delta=replay_use_delta,
+                            action_stride=3,  # 训练数据 convert --action-stride 3,delta 真值须同 stride
                         )
                     else:
                         result = rollout_episode(
