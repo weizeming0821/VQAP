@@ -4,13 +4,13 @@ REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "${REPO_ROOT}"
 
 export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-${REPO_ROOT}/openpi_cache}"
-export HF_LEROBOT_HOME="${HF_LEROBOT_HOME:-${REPO_ROOT}/LeRobot_RLBench_Dataset}"
+export HF_LEROBOT_HOME="${HF_LEROBOT_HOME:-${REPO_ROOT}/LeRobot_RLBench_Waypoint}"
 export HF_HOME="${HF_HOME:-${REPO_ROOT}/.cache/huggingface}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${REPO_ROOT}/.cache/huggingface/datasets}"
 
 
 
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1,2,3,4}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2,3,5,7}"
 export CUDA_VISIBLE_DEVICES
 NPROC=$(echo "${CUDA_VISIBLE_DEVICES}" | awk -F, '{print NF}')
 
