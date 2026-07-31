@@ -30,3 +30,5 @@ tools/
 tools/*
 !tools/verify_planner_cache.py
 ATTEMPTS_LOG.md
+LeRobot_RLBench_Waypoint/
+manifests/
