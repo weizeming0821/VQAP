@@ -1,0 +1,51 @@
+checkpoint:
+  # best | latest | official
+  which: best
+  # ===== Waypoint POC 评测(ATTEMPTS_LOG 尝试3)=====
+  # 与 dense 评测隔离：独立 train_config / checkpoint 目录 / waypoint norm stats。
+  train_config_name: pi05_rlbench_waypoint_h1_poc4_pt
+  finetuned_root_dir: checkpoints/pi05_rlbench_waypoint_poc4_train
+  official_dir: openpi_cache/openpi-assets/checkpoints/pi05_base_pytorch
+  rlbench_norm_stats_dir: openpi-vqap/assets/pi05_rlbench_waypoint/poc4_waypoint
+  # waypoint 评测走 --waypoint-eval 闭环路径(预测 rotvec7 绝对关键帧→规划器)，
+  # 不使用 action_space；此处填 absolute 仅为通过校验。
+  action_space: absolute
+
+dataset:
+  raw_root: RLBench_Raw_Dataset
+  split: val               # 在留出的 val demo 上评测(泛化到新场景配置)
+  variation_mode: demo_replay
+  start_episode: 0
+  episodes_per_task: 10
+
+environment:
+  headless: true
+  image_size: 224
+  max_steps: 400           # waypoint 用 --waypoint-max-waypoints 控制,该值不直接生效
+  replan_steps: 10
+  gripper_threshold: 0.5
+  # 稀疏关键帧间位移大,须 planning(与 keyframe replay 天花板一致)。
+  arm_action_mode: planning
+
+runtime:
+  device: auto
+  seed: 42
+
+logging:
+  log_root: log
+  log_name_prefix: pi05_rlbench_waypoint_eval
+
+recording:
+  enabled: false
+  videos_per_task: 1
+  save_dir: result
+  resolution: [640, 480]
+  fps: 30
+  rotate_speed: 0.005
+
+tasks:
+  names:
+    - open_drawer
+    - push_buttons
+    - slide_block_to_target
+    - stack_wine
