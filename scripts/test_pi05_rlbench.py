@@ -165,6 +165,22 @@ def parse_args() -> argparse.Namespace:
         "(vs --replay-demo which validates the absolute path). No policy loaded.",
     )
     parser.add_argument(
+        "--replay-keyframes",
+        action="store_true",
+        help="Waypoint paradigm ceiling test: replay ONLY the heuristic keyframe poses "
+        "(TAVP keypoint_discovery on the loaded demo) through the planner, absolute pose "
+        "per keyframe. Measures whether ground-truth waypoints + planner reach task "
+        "success (upper bound for the waypoint model). No policy loaded.",
+    )
+    parser.add_argument(
+        "--keyframe-max-seg",
+        type=int,
+        default=0,
+        help="For --replay-keyframes: if >0, densify keyframes by subdividing any segment "
+        "longer than this many frames (same data-side densification as the training "
+        "manifest). 0 = standard heuristic keyframes only.",
+    )
+    parser.add_argument(
         "--predict-diag",
         action="store_true",
         help="Diagnostic: teacher-forced prediction accuracy. Keeps the arm ON the demo "
@@ -1245,6 +1261,119 @@ def rollout_replay_episode(
     }
 
 
+def rollout_replay_keyframes_episode(
+    runtime: RLBenchEvalRuntime,
+    *,
+    task_name: str,
+    variation: int,
+    local_episode: int,
+    gripper_threshold: float,
+    recorder: EpisodeVideoRecorder | None = None,
+    stopping_delta: float = 0.1,
+    max_seg: int = 0,
+) -> dict[str, Any]:
+    """Waypoint-paradigm ceiling: execute only the heuristic keyframe poses of the
+    loaded demo through the planner. Keyframes come from TAVP keypoint_discovery on
+    the demo (same algorithm as the training-data manifest); with max_seg>0 long
+    segments are subdivided (same data-side densification as the manifest). Each
+    keyframe's absolute pose is sent as one planner target — mirroring how the waypoint
+    model will act, but with ground-truth waypoints instead of predictions."""
+    import sys as _sys
+    _wp_dir = str(Path(__file__).resolve().parent.parent / "tools" / "waypoint")
+    if _wp_dir not in _sys.path:
+        _sys.path.insert(0, _wp_dir)
+    from keyframe import densify_waypoints, keypoint_discovery
+    from openpi.policies.rlbench_policy import _pose8_to_pose10
+
+    obs, prompt, used_variation, demo = runtime.reset_to_demo(task_name, variation, local_episode)
+    if recorder is not None:
+        recorder.start_episode(
+            task_name=task_name,
+            prompt=prompt,
+            variation=used_variation,
+            local_episode=local_episode,
+        )
+
+    demo_obs = list(demo)
+    keyframes = keypoint_discovery(demo_obs, stopping_delta=stopping_delta)
+    if max_seg and max_seg > 0:
+        keyframes = densify_waypoints(keyframes, max_seg)
+
+    def demo_pose8(step_obs) -> np.ndarray:
+        return np.concatenate(
+            [
+                np.asarray(step_obs.gripper_pose, dtype=np.float32),
+                np.asarray([float(step_obs.gripper_open)], dtype=np.float32),
+            ],
+            axis=0,
+        )
+
+    action10_sequence = [_pose8_to_pose10(demo_pose8(demo_obs[k])) for k in keyframes]
+
+    error_type: str | None = None
+    error_count = 0
+    consecutive_errors = 0
+    max_consecutive_errors = 10
+    success = False
+    steps_taken = 0
+    episode_start = time.monotonic()
+
+    for step_index, action10 in enumerate(action10_sequence):
+        action8 = policy_action10_to_rlbench_action8(action10, gripper_threshold)
+        steps_taken = step_index + 1
+        try:
+            obs, reward, terminal = runtime.step(action8)
+        except runtime.step_exceptions as exc:
+            error_type = type(exc).__name__
+            error_count += 1
+            consecutive_errors += 1
+            logging.getLogger("pi05_rlbench_eval").warning(
+                "Keyframe replay step rejected (%s) at keyframe=%d/%d consecutive=%d action8=%s",
+                error_type,
+                steps_taken,
+                len(action10_sequence),
+                consecutive_errors,
+                np.array2string(action8, precision=4, suppress_small=True),
+            )
+            if consecutive_errors >= max_consecutive_errors:
+                break
+            continue
+
+        consecutive_errors = 0
+        success = bool(reward >= 1.0)
+        if success or terminal:
+            break
+
+    wall_time_s = time.monotonic() - episode_start
+    video_path = None
+    if recorder is not None:
+        video_path = recorder.end_episode(success=success, error_type=error_type)
+    logging.getLogger("pi05_rlbench_eval").info(
+        "Keyframe replay | task=%s ep=%d keyframes=%d executed=%d success=%d",
+        task_name,
+        local_episode,
+        len(keyframes),
+        steps_taken,
+        int(success),
+    )
+    return {
+        "task": task_name,
+        "prompt": prompt,
+        "variation": used_variation,
+        "local_episode": local_episode,
+        "success": success,
+        "video_path": str(video_path) if video_path is not None else None,
+        "steps": steps_taken,
+        "policy_calls": 0,
+        "infer_ms_mean": float("nan"),
+        "infer_ms_last": float("nan"),
+        "wall_time_s": wall_time_s,
+        "error_type": error_type,
+        "error_count": error_count,
+        "num_keyframes": len(keyframes),
+    }
+
+
 """Exp0：从 planner-cache 读取 val split 的原子分段。
 
 只依赖 cache 的 JSON 字段，不 import data/planner_cache.py —— 那个模块的校验器要求
@@ -1653,8 +1782,14 @@ def main() -> int:
     # 仅在 rollout 时切到 delta 路径。二者不可同时指定。
     if args.replay_delta and args.replay_demo:
         raise ValueError("--replay-demo and --replay-delta are mutually exclusive.")
+    if args.replay_keyframes and (args.replay_demo or args.replay_delta):
+        raise ValueError("--replay-keyframes is mutually exclusive with --replay-demo/--replay-delta.")
     replay_use_delta = bool(args.replay_delta)
     if args.replay_delta:
+        args.replay_demo = True
+    # --replay-keyframes 复用 --replay-demo 的无 policy 分支(checkpoint_source=replay 等),
+    # 仅在 rollout 时切到关键帧执行路径。
+    if args.replay_keyframes:
         args.replay_demo = True
     config = apply_cli_overrides(load_yaml_config(args.config), args)
     if args.replay_demo:
@@ -1763,7 +1898,9 @@ def main() -> int:
     logger.info("bash> %s", " ".join(sys.argv))
     logger.info("Log file: %s", log_path)
     logger.info("Checkpoint source: %s", checkpoint_source)
-    if args.replay_demo:
+    if args.replay_keyframes:
+        logger.info("Replay mode: executing heuristic KEYFRAME poses through planner, no policy is loaded.")
+    elif args.replay_demo:
         logger.info("Replay mode: executing demo next-frame poses, no policy is loaded.")
     else:
         logger.info("Resolved checkpoint dir: %s", checkpoint_info["checkpoint_dir"])
@@ -2071,7 +2208,17 @@ def main() -> int:
                 # 丢失已完成任务的结果。可恢复异常记为 errored 局并继续；连续失败超限视为
                 # 环境已损坏(如 CoppeliaSim 崩溃),提前结束但保证 summary 落盘。
                 try:
-                    if args.replay_demo:
+                    if args.replay_keyframes:
+                        result = rollout_replay_keyframes_episode(
+                            runtime,
+                            task_name=task_name,
+                            variation=variation,
+                            local_episode=local_episode,
+                            gripper_threshold=gripper_threshold,
+                            recorder=recorder,
+                            max_seg=int(args.keyframe_max_seg),
+                        )
+                    elif args.replay_demo:
                         result = rollout_replay_episode(
                             runtime,
                             task_name=task_name,
