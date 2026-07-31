@@ -181,6 +181,19 @@ def parse_args() -> argparse.Namespace:
         "manifest). 0 = standard heuristic keyframes only.",
     )
     parser.add_argument(
+        "--waypoint-eval",
+        action="store_true",
+        help="Waypoint model eval: closed-loop rollout where the policy predicts the next "
+        "absolute waypoint pose (rotvec7) each step, executed via the planner (3-view + "
+        "ee_rotvec state + first-description prompt). For the pi05_rlbench_waypoint config.",
+    )
+    parser.add_argument(
+        "--waypoint-max-waypoints",
+        type=int,
+        default=30,
+        help="Max predicted waypoints per episode for --waypoint-eval (default 30).",
+    )
+    parser.add_argument(
         "--predict-diag",
         action="store_true",
         help="Diagnostic: teacher-forced prediction accuracy. Keeps the arm ON the demo "
@@ -663,6 +676,26 @@ def make_policy_observation(obs: Any, prompt: str) -> dict[str, Any]:
     }
 
 
+"""把当前 live observation 整理成 waypoint policy(RlbenchWaypointInputs) 需要的输入。
+3 视角 front/left_shoulder/right_shoulder + ee_rotvec state(7)，与训练数据构造完全一致。"""
+def make_waypoint_policy_observation(obs: Any, prompt: str) -> dict[str, Any]:
+    import sys as _sys
+
+    _wp_dir = str(Path(__file__).resolve().parent.parent / "tools" / "waypoint")
+    if _wp_dir not in _sys.path:
+        _sys.path.insert(0, _wp_dir)
+    from rlbench_pi05_waypoint.common import obs_to_state  # 与训练同一函数,保证 state 一致
+
+    state = np.asarray(obs_to_state(obs, mode="ee_rotvec"), dtype=np.float32)  # [xyz, rotvec, grip]
+    return {
+        "observation/front_image": ensure_uint8_image(obs.front_rgb),
+        "observation/left_shoulder_image": ensure_uint8_image(obs.left_shoulder_rgb),
+        "observation/right_shoulder_image": ensure_uint8_image(obs.right_shoulder_rgb),
+        "observation/state": state,
+        "prompt": prompt,
+    }
+
+
 """把 6D 旋转表示恢复成 3x3 旋转矩阵。"""
 def rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
     rot6d = np.asarray(rot6d, dtype=np.float32)
@@ -1004,7 +1037,9 @@ class RLBenchEvalRuntime:
         self._task = self._env.get_task(self._task_file_to_task_class(task_name))
         self._active_task_name = task_name
 
-    def reset_to_demo(self, task_name: str, variation: int, local_episode: int) -> tuple[Any, str, int, Any]:
+    def reset_to_demo(
+        self, task_name: str, variation: int, local_episode: int, prompt_strategy: str = "longest"
+    ) -> tuple[Any, str, int, Any]:
         self.set_task(task_name)
         assert self._task is not None
         episode_path = (
@@ -1031,7 +1066,9 @@ class RLBenchEvalRuntime:
         candidates = [text.strip() for text in (descriptions or self._task.get_task_descriptions()) if text and text.strip()]
         if not candidates:
             raise ValueError(f"No task descriptions available for {task_name} variation {demo_variation}.")
-        prompt = max(candidates, key=len)
+        # dense 训练用 longest；waypoint 训练的 manifest task_instruction=descs[0]（首条），
+        # 故 waypoint 评测须用 "first" 以对齐语言分布。
+        prompt = candidates[0] if prompt_strategy == "first" else max(candidates, key=len)
         return obs, prompt, demo_variation, demo
 
     def step(self, action: np.ndarray):
@@ -1371,6 +1408,105 @@ def rollout_replay_keyframes_episode(
         "error_type": error_type,
         "error_count": error_count,
         "num_keyframes": len(keyframes),
+    }
+
+
+def rollout_waypoint_episode(
+    policy,
+    runtime: RLBenchEvalRuntime,
+    *,
+    task_name: str,
+    variation: int,
+    local_episode: int,
+    gripper_threshold: float,
+    max_waypoints: int = 30,
+    recorder: EpisodeVideoRecorder | None = None,
+) -> dict[str, Any]:
+    """Waypoint 模型闭环评测：每步用 policy 预测下一个绝对关键帧位姿(rotvec7)，转成
+    RLBench 8D 动作经规划器执行，再重新观测预测下一个，直到成功/终止/达到 max_waypoints。
+    与训练一致：3 视角 + ee_rotvec state + 首条描述 prompt。"""
+    import sys as _sys
+
+    _wp_dir = str(Path(__file__).resolve().parent.parent / "tools" / "waypoint")
+    if _wp_dir not in _sys.path:
+        _sys.path.insert(0, _wp_dir)
+    from rlbench_pi05_waypoint.common import rotvec_to_quat
+
+    obs, prompt, used_variation, _demo = runtime.reset_to_demo(
+        task_name, variation, local_episode, prompt_strategy="first"
+    )
+    if recorder is not None:
+        recorder.start_episode(
+            task_name=task_name, prompt=prompt, variation=used_variation, local_episode=local_episode
+        )
+
+    infer_ms_values: list[float] = []
+    error_type: str | None = None
+    error_count = 0
+    consecutive_errors = 0
+    max_consecutive_errors = 5
+    success = False
+    steps_taken = 0
+    policy_calls = 0
+    episode_start = time.monotonic()
+
+    for wp_index in range(max_waypoints):
+        policy_obs = make_waypoint_policy_observation(obs, prompt)
+        policy_output = policy.infer(policy_obs)
+        act = np.asarray(policy_output["actions"], dtype=np.float32)
+        if act.ndim == 2:  # [horizon=1, 7]
+            act = act[0]
+        act = act[:7]
+        xyz = act[:3]
+        quat_xyzw = np.asarray(rotvec_to_quat(act[3:6]), dtype=np.float32)
+        grip = float(act[6] > gripper_threshold)
+        action8 = np.concatenate([xyz, quat_xyzw, np.asarray([grip], dtype=np.float32)], axis=0).astype(np.float32)
+        policy_calls += 1
+        steps_taken = wp_index + 1
+        infer_ms = policy_output.get("policy_timing", {}).get("infer_ms")
+        if infer_ms is not None:
+            infer_ms_values.append(float(infer_ms))
+
+        try:
+            obs, reward, terminal = runtime.step(action8)
+        except runtime.step_exceptions as exc:
+            error_type = type(exc).__name__
+            error_count += 1
+            consecutive_errors += 1
+            logging.getLogger("pi05_rlbench_eval").warning(
+                "Waypoint step rejected (%s) at waypoint=%d consecutive=%d action8=%s",
+                error_type,
+                steps_taken,
+                consecutive_errors,
+                np.array2string(action8, precision=4, suppress_small=True),
+            )
+            if consecutive_errors >= max_consecutive_errors:
+                break
+            continue
+
+        consecutive_errors = 0
+        success = bool(reward >= 1.0)
+        if success or terminal:
+            break
+
+    wall_time_s = time.monotonic() - episode_start
+    video_path = None
+    if recorder is not None:
+        video_path = recorder.end_episode(success=success, error_type=error_type)
+    return {
+        "task": task_name,
+        "prompt": prompt,
+        "variation": used_variation,
+        "local_episode": local_episode,
+        "success": success,
+        "video_path": str(video_path) if video_path is not None else None,
+        "steps": steps_taken,
+        "policy_calls": policy_calls,
+        "infer_ms_mean": float(np.mean(infer_ms_values)) if infer_ms_values else float("nan"),
+        "infer_ms_last": float(infer_ms_values[-1]) if infer_ms_values else float("nan"),
+        "wall_time_s": wall_time_s,
+        "error_type": error_type,
+        "error_count": error_count,
     }
 
 
@@ -1784,6 +1920,8 @@ def main() -> int:
         raise ValueError("--replay-demo and --replay-delta are mutually exclusive.")
     if args.replay_keyframes and (args.replay_demo or args.replay_delta):
         raise ValueError("--replay-keyframes is mutually exclusive with --replay-demo/--replay-delta.")
+    if args.waypoint_eval and (args.replay_demo or args.replay_delta or args.replay_keyframes or args.predict_diag or args.atom_mode):
+        raise ValueError("--waypoint-eval is mutually exclusive with replay/predict-diag/atom modes.")
     replay_use_delta = bool(args.replay_delta)
     if args.replay_delta:
         args.replay_demo = True
@@ -2228,6 +2366,17 @@ def main() -> int:
                             recorder=recorder,
                             use_delta=replay_use_delta,
                             action_stride=3,  # 训练数据 convert --action-stride 3,delta 真值须同 stride
+                        )
+                    elif args.waypoint_eval:
+                        result = rollout_waypoint_episode(
+                            policy,
+                            runtime,
+                            task_name=task_name,
+                            variation=variation,
+                            local_episode=local_episode,
+                            gripper_threshold=gripper_threshold,
+                            max_waypoints=int(args.waypoint_max_waypoints),
+                            recorder=recorder,
                         )
                     else:
                         result = rollout_episode(
